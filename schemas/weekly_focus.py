@@ -1,11 +1,13 @@
 from __future__ import annotations
-from typing import  List
+from typing import List
 from pydantic import BaseModel
 
 class DayPointsOut(BaseModel):
     date: str
     points: int
     workouts: int
+    yoga: int
+    meditation: int
 
 
 class ActivityBreakdownOut(BaseModel):
@@ -27,6 +29,7 @@ class WeeklyFocusOut(BaseModel):
     total_points: int
     remaining_points: int
     progress: float
+    streak_days: int
     breakdown: WeeklyFocusBreakdownOut
     days: List[DayPointsOut]
 

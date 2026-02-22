@@ -57,7 +57,12 @@ class AchievementDef(BaseDoc):
 class UserAchievement(BaseDoc):
     user_id: PydanticObjectId
     achievement_code: str
-    progress: int = 0
+    category: str = Field(default="general", min_length=1, max_length=32)
+    name: str = Field(default="achievement", min_length=1, max_length=120)
+    logic: Optional[str] = Field(default=None, max_length=1000)
+    progress: float = Field(default=0, ge=0)
+    max_progress: float = Field(default=100, ge=1)
+    points: int = Field(default=0, ge=0)
     unlocked_at: Optional[datetime] = None
 
     class Settings:

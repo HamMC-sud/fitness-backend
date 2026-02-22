@@ -42,3 +42,8 @@ venv/
 .venv/
 __pycache__/
 *.py[cod]
+
+# Misc
+*.bak
+*.tmp
+requirements.txt

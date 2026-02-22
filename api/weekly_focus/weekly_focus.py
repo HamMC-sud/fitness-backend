@@ -39,9 +39,9 @@ def week_bounds_utc(tz_name: Optional[str]) -> tuple[datetime, datetime, str]:
 
     now_local = ensure_aware_utc(utcnow()).astimezone(tz)
     start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_local.weekday())
-    end_local = start_local + timedelta(days=7)
+    # Only current week up to "now" (Monday -> today), not future days.
+    end_local = now_local
 
-    # store as naive UTC for Mongo queries (as you do elsewhere)
     start_utc = start_local.astimezone(timezone.utc).replace(tzinfo=None)
     end_utc = end_local.astimezone(timezone.utc).replace(tzinfo=None)
     return start_utc, end_utc, tz_used
@@ -66,7 +66,6 @@ async def get_weekly_focus(current_user=Depends(get_current_user)):
         }
     ).to_list()
 
-    # ✅ also require completed_at != None
     meditation_runs = await MeditationRun.find(
         {
             "user_id": current_user.id,
@@ -82,7 +81,6 @@ async def get_weekly_focus(current_user=Depends(get_current_user)):
     yoga_count = len(yoga_runs)
     meditation_count = len(meditation_only_runs)
 
-    # ✅ fixed points per spec
     points_workouts = workouts_count * POINTS_WORKOUT
     points_yoga = yoga_count * POINTS_YOGA
     points_meditation = meditation_count * POINTS_MEDITATION
@@ -129,24 +127,37 @@ async def get_weekly_focus(current_user=Depends(get_current_user)):
             pts = POINTS_MEDITATION
             day_meditation[day_str] = day_meditation.get(day_str, 0) + 1
         else:
-            pts = 0  # ignore unknown types for weekly focus
+            pts = 0
 
         day_points[day_str] = day_points.get(day_str, 0) + pts
 
     days: List[DayPointsOut] = []
     start_local_date = ensure_aware_utc(start_utc).astimezone(tz).date()
+    today_local = ensure_aware_utc(utcnow()).astimezone(tz).date()
+    active_dates = set()
 
-    for i in range(7):
-        di = (start_local_date + timedelta(days=i)).isoformat()
+    days_count = (today_local - start_local_date).days + 1
+    for i in range(max(0, days_count)):
+        di_date = start_local_date + timedelta(days=i)
+        di = di_date.isoformat()
+        pts = day_points.get(di, 0)
+        if pts > 0:
+            active_dates.add(di_date)
         days.append(
             DayPointsOut(
                 date=di,
-                points=day_points.get(di, 0),
+                points=pts,
                 workouts=day_workouts.get(di, 0),
                 yoga=day_yoga.get(di, 0),
                 meditation=day_meditation.get(di, 0),
             )
         )
+
+    streak_days = 0
+    d = today_local
+    while d >= start_local_date and d in active_dates:
+        streak_days += 1
+        d = d - timedelta(days=1)
 
     return WeeklyFocusOut(
         week_start_utc=start_utc.replace(tzinfo=timezone.utc).isoformat(),
@@ -156,6 +167,7 @@ async def get_weekly_focus(current_user=Depends(get_current_user)):
         total_points=total_points,
         remaining_points=remaining,
         progress=progress,
+        streak_days=streak_days,
         breakdown=WeeklyFocusBreakdownOut(
             workouts=ActivityBreakdownOut(count=workouts_count, points=points_workouts),
             yoga=ActivityBreakdownOut(count=yoga_count, points=points_yoga),

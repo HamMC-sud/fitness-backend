@@ -1,7 +1,7 @@
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI , WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from beanie import init_beanie
@@ -33,10 +33,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/statics", StaticFiles(directory="statics"), name="statics")
 
 app.include_router(api_router)
 
 @app.get("/healthcheck", status_code=200)
 async def healthcheck():
     return {"status": "ok"} 
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        await websocket.send_text(message)
+
+    async def broadcast(self, message: str):
+        dead_connections = []
+
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception:
+                dead_connections.append(connection)
+
+        for conn in dead_connections:
+            self.disconnect(conn)
+
+
+manager = ConnectionManager()
+
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+
+    try:
+        await manager.send_personal_message("Connected to WebSocket", websocket)
+
+        while True:
+            data = await websocket.receive_text()
+            await manager.send_personal_message(f"You sent: {data}", websocket)
+            await manager.broadcast(f"Broadcast: {data}")
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        await manager.broadcast("A client disconnected")
+    except Exception:
+        manager.disconnect(websocket)

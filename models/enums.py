@@ -28,6 +28,7 @@ class Location(str, Enum):
 class Gender(str, Enum):
     male = "male"
     female = "female"
+    prefer_not_to_say = "prefer_not_to_say"
 
 
 class ActivityLevel(str, Enum):

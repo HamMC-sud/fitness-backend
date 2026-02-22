@@ -101,26 +101,27 @@ def verify_code(code: str, code_hash: str) -> bool:
         return False
 
 
-async def get_current_user(token: Optional[str] = Depends(oauth2_scheme)) -> Optional[User]:
-    if not token:
-        return None
-
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
     decoded = decode_token(token)
     if not decoded or decoded.get("type") != "access":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     sub = decoded.get("sub")
-    if not sub:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    if isinstance(sub, dict):
+        sub = sub.get("sub")
+
+    if not sub or not isinstance(sub, str):
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     try:
         user_id = PydanticObjectId(sub)
     except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     user = await User.get(user_id)
     if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+        raise HTTPException(status_code=401, detail="User not found")
 
     return user
 
