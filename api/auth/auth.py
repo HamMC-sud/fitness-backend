@@ -15,6 +15,7 @@ from schemas.register import (
     LogoutIn,
     ForgotPasswordIn,
     ResetPasswordIn,
+    ChangePasswordIn,
 )
 from models import User, AuthSession, EmailOTP
 from api.auth.config import (
@@ -54,6 +55,9 @@ def generate_otp(length: int = 6) -> str:
     return "".join(secrets.choice("0123456789") for _ in range(length))
 
 
+def validate_password_requirements(password: str) -> None:
+    if len(password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters long")
 async def _get_user_by_identifier(ident: str) -> Optional[User]:
     if "@" in ident:
         return await User.find_one(User.email == ident.lower())
@@ -197,8 +201,7 @@ async def reset_password(payload: ResetPasswordIn):
     email = payload.email.lower().strip()
     new_password = payload.new_password
 
-    if len(new_password) < 8:
-        raise HTTPException(400, "Password must be at least 8 characters long")
+    validate_password_requirements(new_password)
 
     otp = await EmailOTP.find_one({"email": email, "purpose": "reset_password"})
     if not otp:
@@ -223,6 +226,38 @@ async def reset_password(payload: ResetPasswordIn):
 
     await AuthSession.find(
         AuthSession.user_id == user.id
+    ).update({"$set": {"revoked_at": utcnow()}})
+
+    return {"status": "success"}
+
+
+@router.post("/change-password", status_code=200)
+async def change_password(
+    payload: ChangePasswordIn,
+    current_user: User = Depends(get_current_user),
+):
+    if not current_user or not current_user.password_hash:
+        raise HTTPException(400, "Password login is not available for this account")
+
+    if not verify_password(payload.current_password, current_user.password_hash):
+        raise HTTPException(400, "Current password is incorrect")
+
+    if (
+        payload.confirm_new_password is not None
+        and payload.new_password != payload.confirm_new_password
+    ):
+        raise HTTPException(400, "New password and confirm password do not match")
+
+    validate_password_requirements(payload.new_password)
+
+    if verify_password(payload.new_password, current_user.password_hash):
+        raise HTTPException(400, "New password must be different from current password")
+
+    current_user.password_hash = hash_password(payload.new_password)
+    await current_user.save()
+
+    await AuthSession.find(
+        AuthSession.user_id == current_user.id
     ).update({"$set": {"revoked_at": utcnow()}})
 
     return {"status": "success"}

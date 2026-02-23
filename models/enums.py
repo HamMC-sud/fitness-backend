@@ -12,6 +12,16 @@ class Language(str, Enum):
     en = "en"
 
 
+class UnitSystem(str, Enum):
+    metric = "metric"
+    imperial = "imperial"
+
+
+class HealthProvider(str, Enum):
+    apple_health = "apple_health"
+    google_fit = "google_fit"
+
+
 class Platform(str, Enum):
     ios = "ios"
     android = "android"

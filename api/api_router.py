@@ -13,6 +13,7 @@ from .subscription.subscription     import router as subscription_router
 from .auth.social                   import router as social_router
 from .engagement.engagement         import router as engagement_router
 from .measurements.measurements     import router as measurements_router
+from .health.health                 import router as health_router
 
 
 api_router = APIRouter(prefix="/api/v1")
@@ -31,3 +32,4 @@ api_router.include_router(subscription_router)
 api_router.include_router(social_router)
 api_router.include_router(engagement_router)
 api_router.include_router(measurements_router)
+api_router.include_router(health_router)

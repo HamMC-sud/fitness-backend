@@ -31,6 +31,11 @@ class ResetPasswordIn(BaseModel):
     new_password: str
 
 
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
 class RegisterStartIn(BaseModel):
     email: str
     password: str

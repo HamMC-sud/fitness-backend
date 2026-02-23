@@ -9,7 +9,7 @@ from pymongo import IndexModel, ASCENDING
 
 from .base import BaseDoc
 from .enums import (
-    Region, Language, Gender, ActivityLevel, Goal, Preference, Equipment, Injury
+    Region, Language, UnitSystem, Gender, ActivityLevel, Goal, Preference, Equipment, Injury
 )
 
 
@@ -27,6 +27,7 @@ class UserProfile(BaseModel):
 
     height_cm: int = Field(ge=50, le=250)
     weight_kg: float = Field(ge=20, le=300)
+    target_weight_kg: Optional[float] = Field(default=None, ge=20, le=300)
 
     activity_level: ActivityLevel
 
@@ -64,6 +65,8 @@ class User(BaseDoc):
     region: Region = Region.INTL
     country: str = "US"
     language: Language = Language.en
+    unit_system: UnitSystem = UnitSystem.metric
+    training_rest_seconds: int = Field(default=60, ge=10, le=600)
     timezone: str = "UTC"
     profile: Optional[UserProfile] = None
     flags: UserFlags = Field(default_factory=UserFlags)

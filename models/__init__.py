@@ -25,6 +25,7 @@ from .notifications import Notification, ReminderSettings
 from .admin import AdminUser, AdminAuditLog
 from .password_reset import PasswordReset
 from .social import SocialAccount
+from .health import UserHealthIntegration, UserHealthStepDaily
 ALL_MODELS = [
     User,
     VerificationCode,
@@ -50,6 +51,7 @@ ALL_MODELS = [
     AdminUser, AdminAuditLog,
     PasswordReset,
     SocialAccount,
+    UserHealthIntegration, UserHealthStepDaily,
 ]
 
 
