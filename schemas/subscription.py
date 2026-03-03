@@ -64,6 +64,8 @@ class PurchaseOut(BaseModel):
 class PurchaseInitOut(BaseModel):
     transaction_id: str
     transaction_status: str
+    payment_url: Optional[str] = None
+    payment_provider: Optional[str] = None
     subscription: Optional[SubscriptionOut] = None
     is_active: bool
     in_grace: bool

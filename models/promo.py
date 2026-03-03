@@ -17,6 +17,7 @@ def utcnow() -> datetime:
 
 class PromoCodeBatch(BaseDoc):
     name: str
+    discount_percent: int = Field(default=0, ge=0, le=95)
     duration_days: int = Field(ge=1, le=3650, validation_alias=AliasChoices("duration_days", "days"), serialization_alias="duration_days")
     max_uses_per_code: int = Field(ge=1, le=1_000_000)
     codes_count: int = Field(ge=1)
@@ -33,6 +34,7 @@ class PromoCodeBatch(BaseDoc):
 class PromoCode(BaseDoc):
     batch_id: Optional[PydanticObjectId] = None
     code: str
+    discount_percent: int = Field(default=0, ge=0, le=95)
 
     duration_days: int = Field(ge=1, le=3650, validation_alias=AliasChoices("duration_days", "days"), serialization_alias="duration_days")
     max_uses: int = Field(ge=1)

@@ -1,38 +1,46 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Optional
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
+import httpx
 from beanie.odm.fields import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.auth.config import get_current_user
 from models import (
-    AiUsageMonthly,
+    AiChatMessage,
+    AiChatThread,
     AiPlan,
     AiRequest,
-    AiChatThread,
-    AiChatMessage,
+    AiUsageMonthly,
     RewardedGrant,
     Subscription,
 )
-from models.enums import AiRequestType, AiRequestStatus, SubscriptionStatus
+from models.enums import AiRequestStatus, AiRequestType, SubscriptionStatus
 from schemas.ai import (
     AiAdjustIn,
     AiAdjustOut,
-    AiLimitsOut,
-    AiGenerateIn,
-    AiGenerateOut,
-    AiRerollIn,
-    AiRerollOut,
     AiChatIn,
     AiChatOut,
+    AiGenerateIn,
+    AiGenerateOut,
+    AiLimitsOut,
+    AiPlanDayOut,
     AiPlanOut,
+    AiRerollIn,
+    AiRerollOut,
     RewardedGrantIn,
     RewardedGrantOut,
 )
 
 router = APIRouter(tags=["ai"])
+
+# Yandex GPT optional runtime wiring.
+YC_API_KEY_SECRET = (os.getenv("YC_API_KEY_SECRET") or "").strip()
+YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or "").strip()
+YC_GPT_MODEL_URI = (os.getenv("YC_GPT_MODEL_URI") or "").strip()
 
 
 # ============================================================
@@ -123,18 +131,15 @@ async def get_or_create_usage(user_id: PydanticObjectId, period: str) -> AiUsage
     return rec
 
 
-async def free_reroll_used_in_period(
-    user_id: PydanticObjectId,
-    start_utc: datetime,
-    end_utc: datetime,
-) -> bool:
-    return await AiRequest.find_one(
-        {
-            "user_id": user_id,
-            "type": AiRequestType.reroll,
-            "created_at": {"$gte": start_utc, "$lt": end_utc},
-        }
-    ) is not None
+async def has_child_reroll(parent_plan_id: PydanticObjectId) -> bool:
+    return await AiPlan.find_one(AiPlan.reroll_of_plan_id == parent_plan_id) is not None
+
+
+async def get_active_plan(user_id: PydanticObjectId) -> Optional[AiPlan]:
+    return await AiPlan.find_one(
+        AiPlan.user_id == user_id,
+        AiPlan.status == "active",
+    ).sort("-created_at")
 
 
 def plan_to_out(plan: AiPlan) -> AiPlanOut:
@@ -143,18 +148,147 @@ def plan_to_out(plan: AiPlan) -> AiPlanOut:
         status=plan.status,
         version=plan.version,
         reroll_of_plan_id=str(plan.reroll_of_plan_id) if plan.reroll_of_plan_id else None,
-        days=[d.model_dump() for d in (plan.days or [])],
+        days=[AiPlanDayOut.model_validate(d.model_dump()) for d in (plan.days or [])],
         created_at=plan.created_at,
     )
+
+
+def _coerce_int(v: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(v)
+    except Exception:
+        n = default
+    return max(lo, min(hi, n))
+
+
+def build_plan_days(prompt_meta: Dict[str, Any], total_days: int = 30) -> list[Dict[str, Any]]:
+    workouts_per_week = _coerce_int(
+        prompt_meta.get("workouts_per_week") or prompt_meta.get("days_per_week"),
+        default=4,
+        lo=1,
+        hi=7,
+    )
+    duration_min = _coerce_int(prompt_meta.get("duration_min"), default=35, lo=10, hi=120)
+    intensity = str(prompt_meta.get("intensity") or "moderate")
+
+    goal = prompt_meta.get("goal")
+    if isinstance(goal, list):
+        primary_goal = str(goal[0]) if goal else "get_fitter"
+    else:
+        primary_goal = str(goal or "get_fitter")
+
+    start = utcnow().date()
+    days: list[Dict[str, Any]] = []
+
+    for i in range(total_days):
+        d = start + timedelta(days=i)
+        weekday_slot = i % 7
+        is_workout = weekday_slot < workouts_per_week
+
+        if is_workout:
+            days.append(
+                {
+                    "date": d.isoformat(),
+                    "type": "workout",
+                    "workout_template": {
+                        "title": f"AI {primary_goal} session",
+                        "duration_min": duration_min,
+                        "intensity": intensity,
+                    },
+                }
+            )
+        else:
+            days.append(
+                {
+                    "date": d.isoformat(),
+                    "type": "recovery",
+                    "workout_template": None,
+                }
+            )
+
+    return days
+
+
+async def archive_active_plans(user_id: PydanticObjectId) -> None:
+    await AiPlan.find(
+        AiPlan.user_id == user_id,
+        AiPlan.status == "active",
+    ).update({"$set": {"status": "archived"}})
+
+
+async def create_ai_request(
+    user_id: PydanticObjectId,
+    req_type: AiRequestType,
+    prompt_meta: Dict[str, Any],
+) -> AiRequest:
+    req = AiRequest(
+        user_id=user_id,
+        type=req_type,
+        status=AiRequestStatus.ok,
+        prompt_meta=prompt_meta,
+    )
+    await req.insert()
+    return req
+
+
+async def yandex_chat_completion(text: str, meta: Dict[str, Any]) -> str:
+    """
+    Best-effort Yandex GPT call.
+    Falls back to a deterministic local message if env is incomplete or API fails.
+    """
+    if not YC_API_KEY_SECRET:
+        return "AI assistant is configured in stub mode. Add YC_API_KEY_SECRET to enable Yandex GPT."
+
+    model_uri = YC_GPT_MODEL_URI or (f"gpt://{YC_FOLDER_ID}/yandexgpt/latest" if YC_FOLDER_ID else "")
+    if not model_uri:
+        return "AI assistant is configured in stub mode. Add YC_FOLDER_ID or YC_GPT_MODEL_URI for Yandex GPT."
+
+    body = {
+        "modelUri": model_uri,
+        "completionOptions": {
+            "stream": False,
+            "temperature": 0.6,
+            "maxTokens": 600,
+        },
+        "messages": [
+            {
+                "role": "system",
+                "text": "You are a fitness assistant. Give safe, concise, actionable advice.",
+            },
+            {
+                "role": "user",
+                "text": text,
+            },
+        ],
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(
+                "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+                headers={"Authorization": f"Api-Key {YC_API_KEY_SECRET}"},
+                json=body,
+            )
+    except httpx.HTTPError:
+        return "AI service is temporarily unavailable. Please try again."
+
+    if r.status_code != 200:
+        return "AI service is temporarily unavailable. Please try again."
+
+    data = r.json()
+    try:
+        return str(data["result"]["alternatives"][0]["message"]["text"]).strip()
+    except Exception:
+        return "AI service returned an unexpected response. Please try again."
 
 
 async def build_limits(user_id: PydanticObjectId) -> AiLimitsOut:
     now = utcnow()
     period = period_yyyy_mm(now)
-    start_utc, end_utc = month_bounds_utc(now)
 
     premium = await is_premium_user(user_id)
-    reroll_used = await free_reroll_used_in_period(user_id, start_utc, end_utc)
+    active_plan = await get_active_plan(user_id)
+    reroll_used = bool(active_plan and await has_child_reroll(active_plan.id))
 
     if premium:
         return AiLimitsOut(
@@ -204,6 +338,9 @@ async def ai_rewarded_grant(payload: RewardedGrantIn, current_user=Depends(get_c
     if not current_user:
         raise HTTPException(401, "Unauthorized")
 
+    if await is_premium_user(current_user.id):
+        raise HTTPException(403, "Rewarded is available for free users only")
+
     nonce = (payload.nonce or "").strip()
     provider = (payload.provider or "").strip()
 
@@ -224,11 +361,10 @@ async def ai_rewarded_grant(payload: RewardedGrantIn, current_user=Depends(get_c
         granted_at=now,
     ).insert()
 
-    if not await is_premium_user(current_user.id):
-        period = period_yyyy_mm(now)
-        usage = await get_or_create_usage(current_user.id, period)
-        usage.extra_from_rewarded += 1
-        await usage.save()
+    period = period_yyyy_mm(now)
+    usage = await get_or_create_usage(current_user.id, period)
+    usage.extra_from_rewarded += 1
+    await usage.save()
 
     return RewardedGrantOut(granted=True, limits=await build_limits(current_user.id))
 
@@ -249,24 +385,25 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
         usage.used += 1
         await usage.save()
 
-    await AiRequest(
+    req = await create_ai_request(
         user_id=current_user.id,
-        type=AiRequestType.generate_plan,
-        status=AiRequestStatus.ok,
+        req_type=AiRequestType.generate_plan,
         prompt_meta=payload.prompt_meta or {},
-    ).insert()
+    )
+
+    await archive_active_plans(current_user.id)
 
     plan = AiPlan(
         user_id=current_user.id,
         status="active",
         created_from=payload.prompt_meta or {},
-        days=[],
+        days=build_plan_days(payload.prompt_meta or {}, total_days=30),
         version=1,
         reroll_of_plan_id=None,
     )
     await plan.insert()
 
-    return AiGenerateOut(plan=plan_to_out(plan))
+    return AiGenerateOut(request_id=str(req.id), plan=plan_to_out(plan))
 
 
 @router.post("/ai/reroll-plan", response_model=AiRerollOut)
@@ -274,35 +411,40 @@ async def ai_reroll_plan(payload: AiRerollIn, current_user=Depends(get_current_u
     if not current_user:
         raise HTTPException(401, "Unauthorized")
 
-    now = utcnow()
-    start_utc, end_utc = month_bounds_utc(now)
+    try:
+        plan_id = PydanticObjectId(payload.plan_id)
+    except Exception:
+        raise HTTPException(400, "Invalid plan_id")
 
-    if not await is_premium_user(current_user.id):
-        if await free_reroll_used_in_period(current_user.id, start_utc, end_utc):
-            raise HTTPException(403, "Free reroll already used")
-
-    plan = await AiPlan.get(PydanticObjectId(payload.plan_id))
+    plan = await AiPlan.get(plan_id)
     if not plan or plan.user_id != current_user.id:
         raise HTTPException(404, "Plan not found")
 
-    await AiRequest(
+    if await has_child_reroll(plan.id):
+        raise HTTPException(403, "Free reroll already used for this plan")
+
+    req = await create_ai_request(
         user_id=current_user.id,
-        type=AiRequestType.reroll,
-        status=AiRequestStatus.ok,
+        req_type=AiRequestType.reroll,
         prompt_meta=payload.prompt_meta or {},
-    ).insert()
+    )
+
+    await archive_active_plans(current_user.id)
+
+    merged_meta = dict(plan.created_from or {})
+    merged_meta.update(payload.prompt_meta or {})
 
     new_plan = AiPlan(
         user_id=current_user.id,
         status="active",
-        created_from=payload.prompt_meta or {},
-        days=[],
-        version=plan.version + 1,
+        created_from=merged_meta,
+        days=build_plan_days(merged_meta, total_days=30),
+        version=int(plan.version or 1) + 1,
         reroll_of_plan_id=plan.id,
     )
     await new_plan.insert()
 
-    return AiRerollOut(plan=plan_to_out(new_plan))
+    return AiRerollOut(request_id=str(req.id), plan=plan_to_out(new_plan))
 
 
 @router.get("/ai/plan", response_model=AiPlanOut)
@@ -310,11 +452,7 @@ async def get_current_plan(current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
 
-    plan = await AiPlan.find_one(
-        AiPlan.user_id == current_user.id,
-        AiPlan.status == "active",
-    ).sort("-created_at")
-
+    plan = await get_active_plan(current_user.id)
     if not plan:
         raise HTTPException(404, "No active plan")
 
@@ -329,12 +467,11 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     if not await is_premium_user(current_user.id):
         raise HTTPException(403, "Premium required")
 
-    await AiRequest(
+    req = await create_ai_request(
         user_id=current_user.id,
-        type=AiRequestType.chat,
-        status=AiRequestStatus.ok,
+        req_type=AiRequestType.chat,
         prompt_meta=payload.meta or {},
-    ).insert()
+    )
 
     thread = None
     if payload.thread_id:
@@ -347,24 +484,28 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
         thread = AiChatThread(user_id=current_user.id)
         await thread.insert()
 
-    await AiChatMessage(
+    user_message = AiChatMessage(
         thread_id=thread.id,
         user_id=current_user.id,
         role="user",
         text=payload.text,
-    ).insert()
+    )
+    await user_message.insert()
 
-    assistant_text = "AI stub: connect Yandex GPT here"
+    assistant_text = await yandex_chat_completion(payload.text, payload.meta or {})
 
-    await AiChatMessage(
+    assistant_message = AiChatMessage(
         thread_id=thread.id,
         user_id=current_user.id,
         role="assistant",
         text=assistant_text,
-    ).insert()
+    )
+    await assistant_message.insert()
 
     return AiChatOut(
         thread_id=str(thread.id),
+        user_message_id=str(user_message.id),
+        assistant_message_id=str(assistant_message.id),
         assistant_text=assistant_text,
     )
 
@@ -377,21 +518,40 @@ async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_u
     if not await is_premium_user(current_user.id):
         raise HTTPException(403, "Premium required")
 
-    await AiRequest(
-        user_id=current_user.id,
-        type=AiRequestType.adjust,
-        status=AiRequestStatus.ok,
-        prompt_meta=payload.prompt_meta or {},
-    ).insert()
+    try:
+        plan_id = PydanticObjectId(payload.plan_id)
+    except Exception:
+        raise HTTPException(400, "Invalid plan_id")
 
-    plan = AiPlan(
+    base_plan = await AiPlan.get(plan_id)
+    if not base_plan or base_plan.user_id != current_user.id:
+        raise HTTPException(404, "Plan not found")
+
+    prompt_meta = dict(base_plan.created_from or {})
+    prompt_meta.update(payload.prompt_meta or {})
+
+    # Keep adjustment intent in metadata for auditability / re-generation.
+    if payload.adjustments:
+        prompt_meta["adjustments"] = payload.adjustments
+    if payload.note:
+        prompt_meta["adjust_note"] = payload.note
+
+    req = await create_ai_request(
+        user_id=current_user.id,
+        req_type=AiRequestType.adjust,
+        prompt_meta=prompt_meta,
+    )
+
+    await archive_active_plans(current_user.id)
+
+    adjusted_plan = AiPlan(
         user_id=current_user.id,
         status="active",
-        created_from=payload.prompt_meta or {},
-        days=[],
-        version=1,
-        reroll_of_plan_id=None,
+        created_from=prompt_meta,
+        days=build_plan_days(prompt_meta, total_days=30),
+        version=int(base_plan.version or 1) + 1,
+        reroll_of_plan_id=base_plan.id,
     )
-    await plan.insert()
+    await adjusted_plan.insert()
 
-    return AiAdjustOut(plan=plan_to_out(plan))
+    return AiAdjustOut(request_id=str(req.id), plan=plan_to_out(adjusted_plan))

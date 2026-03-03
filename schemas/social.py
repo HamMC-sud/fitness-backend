@@ -6,7 +6,7 @@ from models.enums import Region, Language
 
 class VkSocialIn(BaseModel):
     access_token: str
-    email: EmailStr
+    email: Optional[EmailStr] = None
     region: Region = Region.RU
     language: Language = Language.ru
     timezone: str = "UTC"

@@ -26,6 +26,7 @@ from .admin import AdminUser, AdminAuditLog
 from .password_reset import PasswordReset
 from .social import SocialAccount
 from .health import UserHealthIntegration, UserHealthStepDaily
+from .content_library import ContentAsset
 ALL_MODELS = [
     User,
     VerificationCode,
@@ -52,6 +53,7 @@ ALL_MODELS = [
     PasswordReset,
     SocialAccount,
     UserHealthIntegration, UserHealthStepDaily,
+    ContentAsset,
 ]
 
 

@@ -126,7 +126,6 @@ async def get_meditation(item_id: PydanticObjectId):
     return MeditationItemOut(**d)
 
 
-@router.post("/meditations", response_model=MeditationItemOut)
 async def create_meditation(payload: MeditationCreateIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -148,7 +147,6 @@ async def create_meditation(payload: MeditationCreateIn, current_user=Depends(ge
 
 
 
-@router.put("/meditations/{item_id}", response_model=MeditationItemOut)
 async def update_meditation(item_id: PydanticObjectId, payload: MeditationUpdateIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -171,7 +169,6 @@ async def update_meditation(item_id: PydanticObjectId, payload: MeditationUpdate
     return MeditationItemOut(**d)
 
 
-@router.delete("/meditations/{item_id}")
 async def delete_meditation(item_id: PydanticObjectId, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")

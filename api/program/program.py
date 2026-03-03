@@ -96,14 +96,12 @@ async def get_template(template_id: PydanticObjectId):
         raise HTTPException(status_code=404, detail="Template not found")
     return t
 
-@router.post("/templates")
 async def create_template(payload: WorkoutTemplateCreateIn, user=Depends(get_current_user)):
     require_auth(user)
     doc = WorkoutTemplate(**payload.model_dump())
     await doc.insert()
     return doc
 
-@router.put("/templates/{template_id}")
 async def update_template(template_id: PydanticObjectId, payload: WorkoutTemplateUpdateIn, user=Depends(get_current_user)):
     require_auth(user)
     doc = await WorkoutTemplate.get(template_id)
@@ -116,7 +114,6 @@ async def update_template(template_id: PydanticObjectId, payload: WorkoutTemplat
     await doc.save()
     return doc
 
-@router.delete("/templates/{template_id}")
 async def delete_template(template_id: PydanticObjectId, user=Depends(get_current_user)):
     require_auth(user)
     doc = await WorkoutTemplate.get(template_id)
@@ -181,7 +178,6 @@ async def get_program(id_or_slug: str, expand: bool = False):
 
     return await expand_templates(p) if expand else p
 
-@router.post("/programs")
 async def create_program(payload: WorkoutProgramCreateIn, user=Depends(get_current_user)):
     require_auth(user)
 
@@ -195,7 +191,6 @@ async def create_program(payload: WorkoutProgramCreateIn, user=Depends(get_curre
     await doc.insert()
     return doc
 
-@router.put("/programs/{program_id}")
 async def update_program(program_id: PydanticObjectId, payload: WorkoutProgramUpdateIn, user=Depends(get_current_user)):
     require_auth(user)
     doc = await WorkoutProgram.get(program_id)
@@ -213,7 +208,6 @@ async def update_program(program_id: PydanticObjectId, payload: WorkoutProgramUp
     await doc.save()
     return doc
 
-@router.delete("/programs/{program_id}")
 async def delete_program(program_id: PydanticObjectId, user=Depends(get_current_user)):
     require_auth(user)
     doc = await WorkoutProgram.get(program_id)

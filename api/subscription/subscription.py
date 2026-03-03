@@ -258,6 +258,26 @@ def webhook_token_ok(x_webhook_token: Optional[str]) -> bool:
     return (x_webhook_token or "").strip() == expected
 
 
+def expected_provider_for_source(source: SubscriptionSource) -> Optional[str]:
+    mapping = {
+        SubscriptionSource.appstore: "apple",
+        SubscriptionSource.googleplay: "google",
+        SubscriptionSource.rustore: "rustore",
+        SubscriptionSource.web: "yookassa",
+        SubscriptionSource.promo: None,
+    }
+    return mapping.get(source)
+
+
+def build_web_checkout_url(transaction_id: str) -> Optional[str]:
+    base = (os.getenv("PAYMENT_WEB_CHECKOUT_URL") or "").strip()
+    if not base:
+        return None
+
+    sep = "&" if "?" in base else "?"
+    return f"{base}{sep}transaction_id={transaction_id}"
+
+
 @router.get("/subscription", response_model=SubscriptionGetOut)
 async def get_subscription(current_user=Depends(get_current_user)):
     require_auth(current_user)
@@ -281,7 +301,6 @@ async def list_plans(status: str = Query(default="active"), skip: int = 0, limit
     return SubscriptionPlansOut(items=[plan_to_out(p) for p in items], total=int(total), skip=int(skip), limit=int(limit))
 
 
-@router.post("/subscription/plans", response_model=SubscriptionPlanOut)
 async def create_plan(payload: SubscriptionPlanCreateIn, current_user=Depends(get_current_user)):
     require_auth(current_user)
 
@@ -307,22 +326,41 @@ async def purchase(payload: PurchaseIn, current_user=Depends(get_current_user)):
     store["status"] = "pending"
     store["created_at"] = utcnow().isoformat()
 
+    price = {}
+    if isinstance(plan.prices, dict):
+        price = dict(plan.prices.get(str(payload.source), {}) or {})
+    resolved_amount = price.get("amount", payload.amount)
+    resolved_currency = price.get("currency", payload.currency)
+
     tx = SubscriptionTransaction(
         user_id=current_user.id,
         source=payload.source,
         plan_code=plan.code,
-        amount=payload.amount,
-        currency=payload.currency,
+        amount=resolved_amount,
+        currency=resolved_currency,
         store=store,
         promo={},
     )
     await tx.insert()
+
+    payment_url = None
+    payment_provider = None
+    if payload.source == SubscriptionSource.web:
+        payment_provider = "yookassa"
+        payment_url = build_web_checkout_url(str(tx.id))
+        store["payment_provider"] = payment_provider
+        if payment_url:
+            store["payment_url"] = payment_url
+        tx.store = store
+        await tx.save()
 
     sub = await Subscription.find_one(Subscription.user_id == current_user.id)
     if not sub:
         return PurchaseInitOut(
             transaction_id=str(tx.id),
             transaction_status="pending",
+            payment_url=payment_url,
+            payment_provider=payment_provider,
             subscription=None,
             is_active=False,
             in_grace=False,
@@ -335,6 +373,8 @@ async def purchase(payload: PurchaseIn, current_user=Depends(get_current_user)):
     return PurchaseInitOut(
         transaction_id=str(tx.id),
         transaction_status="pending",
+        payment_url=payment_url,
+        payment_provider=payment_provider,
         subscription=out,
         is_active=is_active,
         in_grace=in_grace,
@@ -385,9 +425,27 @@ async def verify_purchase(payload: PurchaseVerifyIn, current_user=Depends(get_cu
     if not provider or len(provider) > 32:
         raise HTTPException(status_code=400, detail="Invalid provider")
 
+    expected_provider = expected_provider_for_source(tx.source)
+    if expected_provider and provider != expected_provider:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider/source mismatch. Expected '{expected_provider}' for source '{tx.source.value}'",
+        )
+
     receipt = dict(payload.receipt or {})
     if not receipt:
         raise HTTPException(status_code=400, detail="Receipt required")
+
+    if payload.provider_tx_id:
+        dup = await SubscriptionTransaction.find_one(
+            {
+                "store.provider": provider,
+                "store.provider_tx_id": payload.provider_tx_id,
+                "_id": {"$ne": tx.id},
+            }
+        )
+        if dup:
+            raise HTTPException(status_code=409, detail="provider_tx_id already used")
 
     plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == tx.plan_code, SubscriptionPlan.status == "active")
     if not plan:
@@ -452,6 +510,7 @@ async def yookassa_webhook(body: YooKassaWebhookIn, x_webhook_token: Optional[st
         plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == tx.plan_code, SubscriptionPlan.status == "active")
         store["status"] = "verified"
         store["verified_at"] = utcnow().isoformat()
+        store["provider"] = "yookassa"
         tx.store = store
         await tx.save()
         if plan:
@@ -588,7 +647,6 @@ async def cancel_subscription(current_user=Depends(get_current_user)):
     return CancelOut(status="ok")
 
 
-@router.get("/subscription/promos", response_model=PromoCodesOut)
 async def list_promos(
     status: Optional[PromoStatus] = None,
     skip: int = 0,
@@ -612,7 +670,6 @@ async def list_promos(
     return PromoCodesOut(items=[promo_to_out(p) for p in items], total=int(total), skip=int(skip), limit=int(limit))
 
 
-@router.post("/subscription/promos", response_model=PromoCodeOut)
 async def create_promo(payload: PromoCodeCreateIn, current_user=Depends(get_current_user)):
     require_auth(current_user)
 
@@ -633,7 +690,6 @@ async def create_promo(payload: PromoCodeCreateIn, current_user=Depends(get_curr
     return promo_to_out(doc)
 
 
-@router.post("/subscription/promo-batches", response_model=PromoBatchCreateOut)
 async def create_promo_batch(payload: PromoBatchCreateIn, current_user=Depends(get_current_user)):
     require_auth(current_user)
 
@@ -686,7 +742,6 @@ async def create_promo_batch(payload: PromoBatchCreateIn, current_user=Depends(g
     )
 
 
-@router.get("/subscription/promo-batches/{batch_id}/export")
 async def export_promo_batch_csv(batch_id: str, current_user=Depends(get_current_user)):
     require_auth(current_user)
 
@@ -726,7 +781,6 @@ async def export_promo_batch_csv(batch_id: str, current_user=Depends(get_current
     filename = f"promo_batch_{batch.name}.csv".replace(" ", "_")
     return StreamingResponse(gen(), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
-@router.get("/subscription/promos/stats", response_model=PromoStatsOut)
 async def promo_stats(
     batch_id: Optional[str] = None,
     promo_code_id: Optional[str] = None,
