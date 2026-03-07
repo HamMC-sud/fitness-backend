@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from api.auth.config import get_current_user
 from models import User, UserProfile
 from schemas.profile import ProfileUpdateIn, ProfileSettingsUpdateIn, ProfileSettingsOut
+from utils.profile_image import normalize_profile_photo_value
 
 router = APIRouter(tags=["profile"])
 
@@ -51,6 +52,9 @@ async def update_profile(payload: ProfileUpdateIn, current_user: User = Depends(
     if "schedule" in patch:
         base_schedule = base_profile.get("schedule", {}) if isinstance(base_profile.get("schedule"), dict) else {}
         patch["schedule"] = {**base_schedule, **patch["schedule"]}
+
+    if "photo_url" in patch and patch["photo_url"]:
+        patch["photo_url"] = normalize_profile_photo_value(patch["photo_url"])
 
     try:
         merged_profile = UserProfile(**{**base_profile, **patch})

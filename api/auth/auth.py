@@ -17,7 +17,7 @@ from schemas.register import (
     ResetPasswordIn,
     ChangePasswordIn,
 )
-from models import User, AuthSession, EmailOTP
+from models import User, AuthSession, EmailOTP, SocialAccount, OAuthAccount
 from api.auth.config import (
     create_access_token,
     create_refresh_token,
@@ -271,6 +271,14 @@ async def delete_account(current_user=Depends(get_current_user)):
     await AuthSession.find(
         AuthSession.user_id == current_user.id
     ).update({"$set": {"revoked_at": utcnow()}})
+
+    # Remove all local social links for this user.
+    await SocialAccount.find(
+        SocialAccount.user_id == current_user.id
+    ).delete()
+    await OAuthAccount.find(
+        OAuthAccount.user_id == current_user.id
+    ).delete()
 
     await current_user.delete()
     return {"status": "ok"}

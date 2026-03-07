@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
-from datetime import datetime, timedelta, timezone
+import random
+import re
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import httpx
@@ -15,6 +18,7 @@ from models import (
     AiPlan,
     AiRequest,
     AiUsageMonthly,
+    Exercise,
     RewardedGrant,
     Subscription,
 )
@@ -37,53 +41,78 @@ from schemas.ai import (
 
 router = APIRouter(tags=["ai"])
 
-# Yandex GPT optional runtime wiring.
 YC_API_KEY_SECRET = (os.getenv("YC_API_KEY_SECRET") or "").strip()
 YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or "").strip()
 YC_GPT_MODEL_URI = (os.getenv("YC_GPT_MODEL_URI") or "").strip()
+YC_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
 
-
-# ============================================================
-# Time helpers
-# ============================================================
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def period_yyyy_mm(dt: datetime) -> str:
-    """
-    AI limits are calculated per UTC month.
-    This is intentional and MUST stay stable.
-    """
     return dt.strftime("%Y-%m")
 
 
-def month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
-    start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    if start.month == 12:
-        end = start.replace(year=start.year + 1, month=1)
-    else:
-        end = start.replace(month=start.month + 1)
-    return start, end
+def _coerce_int(v: Any, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(v)
+    except Exception:
+        n = default
+    return max(lo, min(hi, n))
 
 
-# ============================================================
-# Subscription / Premium
-# ============================================================
+def _as_str(v: Any) -> str:
+    if v is None:
+        return ""
+    if hasattr(v, "value"):
+        return str(getattr(v, "value"))
+    return str(v)
+
+
+def _as_str_list(v: Any) -> list[str]:
+    if v is None:
+        return []
+    if isinstance(v, (list, tuple)):
+        return [_as_str(x).strip() for x in v if _as_str(x).strip()]
+    s = _as_str(v).strip()
+    return [s] if s else []
+
+
+def _pick_i18n_name(name_obj: Any, language: str) -> str:
+    lang = (language or "en").lower()
+    if not name_obj:
+        return "Exercise"
+
+    seq = getattr(name_obj, lang, None)
+    if isinstance(seq, list) and seq:
+        return str(seq[0])
+    if isinstance(seq, str) and seq:
+        return seq
+
+    for fallback in ("en", "ru"):
+        seq = getattr(name_obj, fallback, None)
+        if isinstance(seq, list) and seq:
+            return str(seq[0])
+        if isinstance(seq, str) and seq:
+            return seq
+    return "Exercise"
+
+
+def _weekly_slots(workouts_per_week: int) -> set[int]:
+    k = _coerce_int(workouts_per_week, default=4, lo=1, hi=7)
+    if k >= 7:
+        return set(range(7))
+    return {min(6, round(i * (6 / max(1, k - 1)))) for i in range(k)}
+
 
 async def is_premium_user(user_id: PydanticObjectId) -> bool:
-    """
-    Premium if:
-    - active subscription
-    - grace period is still valid
-    """
     sub = await Subscription.find_one(Subscription.user_id == user_id)
     if not sub:
         return False
 
     now = utcnow()
-
     grace_until = getattr(sub, "grace_until", None)
     if grace_until:
         if grace_until.tzinfo is None:
@@ -104,15 +133,7 @@ async def is_premium_user(user_id: PydanticObjectId) -> bool:
     )
 
 
-# ============================================================
-# Usage & limits
-# ============================================================
-
 async def get_or_create_usage(user_id: PydanticObjectId, period: str) -> AiUsageMonthly:
-    """
-    Free users only.
-    Premium users must NOT create usage rows.
-    """
     rec = await AiUsageMonthly.find_one(
         AiUsageMonthly.user_id == user_id,
         AiUsageMonthly.period == period,
@@ -136,10 +157,10 @@ async def has_child_reroll(parent_plan_id: PydanticObjectId) -> bool:
 
 
 async def get_active_plan(user_id: PydanticObjectId) -> Optional[AiPlan]:
-    return await AiPlan.find_one(
+    return await AiPlan.find(
         AiPlan.user_id == user_id,
         AiPlan.status == "active",
-    ).sort("-created_at")
+    ).sort("-created_at").first_or_none()
 
 
 def plan_to_out(plan: AiPlan) -> AiPlanOut:
@@ -153,67 +174,487 @@ def plan_to_out(plan: AiPlan) -> AiPlanOut:
     )
 
 
-def _coerce_int(v: Any, default: int, lo: int, hi: int) -> int:
-    try:
-        n = int(v)
-    except Exception:
-        n = default
-    return max(lo, min(hi, n))
+def _goal_to_types(goals: list[str], preferences: list[str]) -> list[str]:
+    types: list[str] = []
+    mapping = {
+        "build_muscle": ["strength"],
+        "lose_weight": ["cardio", "hiit"],
+        "endurance": ["cardio", "hiit"],
+        "flexibility": ["stretching", "yoga"],
+        "get_fitter": ["strength", "cardio"],
+    }
+    pref_mapping = {
+        "strength": ["strength"],
+        "cardio": ["cardio", "hiit"],
+        "stretching": ["stretching", "yoga"],
+        "meditation_yoga": ["yoga", "stretching"],
+    }
+    for g in goals:
+        types.extend(mapping.get(g, []))
+    for p in preferences:
+        types.extend(pref_mapping.get(p, []))
+    if not types:
+        return ["strength", "cardio", "hiit"]
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in types:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
-def build_plan_days(prompt_meta: Dict[str, Any], total_days: int = 30) -> list[Dict[str, Any]]:
-    workouts_per_week = _coerce_int(
-        prompt_meta.get("workouts_per_week") or prompt_meta.get("days_per_week"),
+def _difficulty_to_intensity(diff: str) -> str:
+    d = (diff or "").lower()
+    if d == "advanced":
+        return "high"
+    if d == "intermediate":
+        return "moderate"
+    return "low"
+
+
+def _merge_prompt_with_profile(current_user: Any, prompt_meta: Dict[str, Any]) -> Dict[str, Any]:
+    profile = getattr(current_user, "profile", None)
+    schedule = getattr(profile, "schedule", None) if profile else None
+
+    goals = _as_str_list(prompt_meta.get("goals") or prompt_meta.get("goal"))
+    if not goals and profile:
+        goals = _as_str_list(getattr(profile, "goals", []))
+
+    preferences = _as_str_list(prompt_meta.get("preferences"))
+    if not preferences and profile:
+        preferences = _as_str_list(getattr(profile, "preferences", []))
+
+    equipment = _as_str_list(prompt_meta.get("equipment"))
+    if not equipment and profile:
+        equipment = _as_str_list(getattr(profile, "equipment", []))
+
+    injuries = _as_str_list(prompt_meta.get("injuries"))
+    if not injuries and profile:
+        injuries = _as_str_list(getattr(profile, "injuries", []))
+
+    level = (_as_str(prompt_meta.get("activity_level"))).lower().strip()
+    if not level and profile:
+        level = _as_str(getattr(profile, "activity_level", "")).lower().strip()
+    if level not in {"beginner", "intermediate", "advanced"}:
+        level = "beginner"
+
+    days_per_week = _coerce_int(
+        prompt_meta.get("workouts_per_week")
+        or prompt_meta.get("days_per_week")
+        or (getattr(schedule, "days_per_week", None) if schedule else None),
         default=4,
         lo=1,
         hi=7,
     )
-    duration_min = _coerce_int(prompt_meta.get("duration_min"), default=35, lo=10, hi=120)
-    intensity = str(prompt_meta.get("intensity") or "moderate")
+    duration_min = _coerce_int(
+        prompt_meta.get("duration_min")
+        or prompt_meta.get("session_minutes")
+        or (getattr(schedule, "session_minutes", None) if schedule else None),
+        default=35,
+        lo=10,
+        hi=120,
+    )
+    intensity = _as_str(prompt_meta.get("intensity")).strip().lower()
+    if not intensity:
+        intensity = _difficulty_to_intensity(level)
 
-    goal = prompt_meta.get("goal")
-    if isinstance(goal, list):
-        primary_goal = str(goal[0]) if goal else "get_fitter"
-    else:
-        primary_goal = str(goal or "get_fitter")
+    return {
+        "goals": goals,
+        "preferences": preferences,
+        "equipment": equipment,
+        "injuries": injuries,
+        "level": level,
+        "days_per_week": days_per_week,
+        "duration_min": duration_min,
+        "intensity": intensity,
+        "language": _as_str(getattr(current_user, "language", "en")) or "en",
+        "country": _as_str(getattr(current_user, "country", "INTL")) or "INTL",
+        "timezone": _as_str(getattr(current_user, "timezone", "UTC")) or "UTC",
+    }
+
+
+def _exercise_is_allowed(ex: Exercise, injuries: set[str], equipment: set[str]) -> bool:
+    contraindications = {_as_str(x) for x in (ex.contraindications or [])}
+    if injuries and contraindications.intersection(injuries):
+        return False
+
+    required = {_as_str(x) for x in (ex.equipment or [])}
+    if not required:
+        return True
+
+    required.discard("bodyweight")
+    if not required:
+        return True
+
+    return required.issubset(equipment)
+
+
+def _exercise_match_type(ex: Exercise, target_types: set[str]) -> bool:
+    wtypes = {_as_str(x) for x in (ex.workout_type or [])}
+    return not target_types or bool(wtypes.intersection(target_types))
+
+
+def _progression_note(week_idx: int, intensity: str) -> str:
+    level = (intensity or "moderate").lower()
+    if week_idx == 0:
+        return "Week 1: build technique and consistency."
+    if week_idx == 1:
+        return "Week 2: add 1 set to key exercises if recovery is good."
+    if week_idx == 2:
+        return "Week 3: increase reps/time by 10-15% with strict form."
+    if level == "high":
+        return "Week 4+: add load carefully and keep 1-2 reps in reserve."
+    return "Week 4+: keep progressive overload with at least one easier day."
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        snippet = raw[start : end + 1]
+        try:
+            obj = json.loads(snippet)
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+async def yandex_completion(
+    messages: list[dict[str, str]],
+    *,
+    temperature: float = 0.4,
+    max_tokens: int = 1400,
+) -> Optional[str]:
+    if not YC_API_KEY_SECRET:
+        return None
+
+    model_uri = YC_GPT_MODEL_URI or (f"gpt://{YC_FOLDER_ID}/yandexgpt/latest" if YC_FOLDER_ID else "")
+    if not model_uri:
+        return None
+
+    body = {
+        "modelUri": model_uri,
+        "completionOptions": {
+            "stream": False,
+            "temperature": temperature,
+            "maxTokens": max_tokens,
+        },
+        "messages": messages,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                YC_COMPLETION_URL,
+                headers={"Authorization": f"Api-Key {YC_API_KEY_SECRET}"},
+                json=body,
+            )
+    except httpx.HTTPError:
+        return None
+
+    if r.status_code != 200:
+        return None
+
+    try:
+        data = r.json()
+        return str(data["result"]["alternatives"][0]["message"]["text"]).strip()
+    except Exception:
+        return None
+
+
+async def _load_exercises_for_planning(
+    injuries: set[str],
+    equipment: set[str],
+    target_types: set[str],
+) -> list[Exercise]:
+    active = await Exercise.find(Exercise.status == "active").limit(1200).to_list()
+    if not active:
+        return []
+
+    filtered = [
+        ex
+        for ex in active
+        if _exercise_is_allowed(ex, injuries=injuries, equipment=equipment)
+        and _exercise_match_type(ex, target_types=target_types)
+    ]
+    if filtered:
+        return filtered
+
+    safe_only = [ex for ex in active if _exercise_is_allowed(ex, injuries=injuries, equipment=set())]
+    return safe_only or active
+
+
+def _build_workout_template(
+    *,
+    day_date: date,
+    week_idx: int,
+    day_idx: int,
+    inputs: Dict[str, Any],
+    exercises: list[Exercise],
+    target_types: list[str],
+    rng_seed: str,
+) -> Dict[str, Any]:
+    duration_min = _coerce_int(inputs.get("duration_min"), default=35, lo=10, hi=120)
+    intensity = str(inputs.get("intensity") or "moderate").lower()
+    level = str(inputs.get("level") or "beginner").lower()
+    language = str(inputs.get("language") or "en").lower()
+    goals = _as_str_list(inputs.get("goals"))
+
+    target_type = target_types[(day_idx + week_idx) % len(target_types)] if target_types else "strength"
+    type_pool = [
+        ex
+        for ex in exercises
+        if target_type in {_as_str(x) for x in (ex.workout_type or [])}
+    ]
+    pool = type_pool if len(type_pool) >= 3 else exercises
+
+    rng = random.Random(f"{rng_seed}:{day_date.isoformat()}:{target_type}")
+    pool_shuffled = list(pool)
+    rng.shuffle(pool_shuffled)
+
+    exercise_count = max(4, min(8, duration_min // 6))
+    selected = pool_shuffled[:exercise_count] if len(pool_shuffled) >= exercise_count else pool_shuffled
+    if not selected:
+        return {
+            "title": "AI session",
+            "duration_min": duration_min,
+            "intensity": intensity,
+            "focus": target_type,
+            "progression_note": _progression_note(week_idx, intensity),
+            "exercises": [],
+            "safety": ["Stop if sharp pain appears.", "Keep technique strict before increasing load."],
+        }
+
+    base_sets = {"beginner": 2, "intermediate": 3, "advanced": 4}.get(level, 2)
+    sets = min(5, base_sets + (1 if week_idx >= 2 else 0))
+    rest_seconds = 75 if intensity == "low" else 45 if intensity == "high" else 60
+
+    exercise_items: list[dict[str, Any]] = []
+    for ex in selected:
+        mode = _as_str(ex.mode)
+        default_reps = getattr(ex.defaults, "reps", None) if ex.defaults else None
+        default_dur = getattr(ex.defaults, "duration_seconds", None) if ex.defaults else None
+
+        item: dict[str, Any] = {
+            "exercise_id": str(ex.id),
+            "exercise_code": ex.code,
+            "name": _pick_i18n_name(ex.name, language),
+            "mode": mode,
+            "sets": sets,
+            "rest_seconds": rest_seconds,
+        }
+        if mode == "time":
+            item["duration_seconds"] = int(default_dur or 30)
+        else:
+            item["reps"] = int(default_reps or (10 if intensity == "low" else 12 if intensity == "moderate" else 14))
+        exercise_items.append(item)
+
+    goal_label = goals[0] if goals else "get_fitter"
+    return {
+        "title": f"AI {goal_label} session",
+        "duration_min": duration_min,
+        "intensity": intensity,
+        "focus": target_type,
+        "progression_note": _progression_note(week_idx, intensity),
+        "exercises": exercise_items,
+        "safety": [
+            "Stop if sharp pain appears.",
+            "Prioritize form over speed or load.",
+        ],
+    }
+
+
+async def build_plan_days(
+    current_user: Any,
+    prompt_meta: Dict[str, Any],
+    *,
+    total_days: int = 30,
+    seed_nonce: Optional[str] = None,
+) -> list[Dict[str, Any]]:
+    inputs = _merge_prompt_with_profile(current_user, prompt_meta or {})
+    target_types = _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
+
+    injuries = set(_as_str_list(inputs.get("injuries")))
+    equipment = set(_as_str_list(inputs.get("equipment")))
+    exercises = await _load_exercises_for_planning(
+        injuries=injuries,
+        equipment=equipment,
+        target_types=set(target_types),
+    )
 
     start = utcnow().date()
-    days: list[Dict[str, Any]] = []
+    slots = _weekly_slots(_coerce_int(inputs.get("days_per_week"), default=4, lo=1, hi=7))
+    nonce = seed_nonce or str(prompt_meta.get("_reroll_nonce") or "")
 
+    days: list[Dict[str, Any]] = []
+    workout_day_idx = 0
     for i in range(total_days):
         d = start + timedelta(days=i)
-        weekday_slot = i % 7
-        is_workout = weekday_slot < workouts_per_week
-
-        if is_workout:
+        weekday = i % 7
+        if weekday in slots:
+            week_idx = i // 7
+            workout_template = _build_workout_template(
+                day_date=d,
+                week_idx=week_idx,
+                day_idx=workout_day_idx,
+                inputs=inputs,
+                exercises=exercises,
+                target_types=target_types,
+                rng_seed=f"{start.isoformat()}:{nonce}",
+            )
             days.append(
                 {
                     "date": d.isoformat(),
                     "type": "workout",
-                    "workout_template": {
-                        "title": f"AI {primary_goal} session",
-                        "duration_min": duration_min,
-                        "intensity": intensity,
-                    },
+                    "workout_template": workout_template,
                 }
             )
+            workout_day_idx += 1
         else:
             days.append(
                 {
                     "date": d.isoformat(),
                     "type": "recovery",
-                    "workout_template": None,
+                    "workout_template": {
+                        "title": "Recovery day",
+                        "recommendation": "Mobility + light walk 20-30 min.",
+                    },
                 }
             )
-
     return days
 
 
-async def archive_active_plans(user_id: PydanticObjectId) -> None:
-    await AiPlan.find(
-        AiPlan.user_id == user_id,
-        AiPlan.status == "active",
-    ).update({"$set": {"status": "archived"}})
+async def _try_generate_plan_with_yandex(
+    current_user: Any,
+    prompt_meta: Dict[str, Any],
+    *,
+    total_days: int = 30,
+) -> Optional[list[Dict[str, Any]]]:
+    inputs = _merge_prompt_with_profile(current_user, prompt_meta or {})
+    target_types = _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
+    injuries = set(_as_str_list(inputs.get("injuries")))
+    equipment = set(_as_str_list(inputs.get("equipment")))
+    catalog = await _load_exercises_for_planning(
+        injuries=injuries,
+        equipment=equipment,
+        target_types=set(target_types),
+    )
+    if not catalog:
+        return None
+
+    language = str(inputs.get("language") or "en")
+    preview = []
+    for ex in catalog[:80]:
+        preview.append(
+            {
+                "id": str(ex.id),
+                "code": ex.code,
+                "name": _pick_i18n_name(ex.name, language),
+                "mode": _as_str(ex.mode),
+                "workout_type": [_as_str(x) for x in (ex.workout_type or [])],
+                "equipment": [_as_str(x) for x in (ex.equipment or [])],
+                "contraindications": [_as_str(x) for x in (ex.contraindications or [])],
+            }
+        )
+
+    start = utcnow().date().isoformat()
+    system_prompt = (
+        "You are a fitness planner. Return strict JSON only. "
+        "Build a safe 30-day plan with workout/recovery distribution, concrete exercises "
+        "with sets and reps/duration, and progression notes."
+    )
+    user_prompt = {
+        "start_date": start,
+        "days": total_days,
+        "user_context": inputs,
+        "allowed_exercises": preview,
+        "required_output_schema": {
+            "days": [
+                {
+                    "date": "YYYY-MM-DD",
+                    "type": "workout|recovery",
+                    "workout_template": {
+                        "title": "string",
+                        "duration_min": 35,
+                        "intensity": "low|moderate|high",
+                        "focus": "string",
+                        "progression_note": "string",
+                        "exercises": [
+                            {
+                                "exercise_id": "must be from allowed_exercises.id",
+                                "exercise_code": "string",
+                                "name": "string",
+                                "mode": "reps|time",
+                                "sets": 3,
+                                "reps": 12,
+                                "duration_seconds": 30,
+                                "rest_seconds": 60,
+                            }
+                        ],
+                    },
+                }
+            ]
+        },
+        "rules": [
+            "Use only allowed exercise ids.",
+            "Respect injuries and equipment constraints.",
+            "If mode is reps, include reps; if mode is time, include duration_seconds.",
+            "Return only JSON object, without markdown.",
+        ],
+    }
+
+    text = await yandex_completion(
+        [
+            {"role": "system", "text": system_prompt},
+            {"role": "user", "text": json.dumps(user_prompt, ensure_ascii=True)},
+        ],
+        temperature=0.2,
+        max_tokens=3000,
+    )
+    if not text:
+        return None
+
+    obj = _extract_json(text)
+    if not obj:
+        return None
+    raw_days = obj.get("days")
+    if not isinstance(raw_days, list) or len(raw_days) != total_days:
+        return None
+
+    normalized: list[dict[str, Any]] = []
+    for i, d in enumerate(raw_days):
+        if not isinstance(d, dict):
+            return None
+        d_type = str(d.get("type") or "recovery").lower()
+        day_date = str(d.get("date") or (utcnow().date() + timedelta(days=i)).isoformat())
+        if d_type not in {"workout", "recovery"}:
+            d_type = "recovery"
+        wt = d.get("workout_template")
+        if wt is not None and not isinstance(wt, dict):
+            wt = None
+        normalized.append(
+            {
+                "date": day_date,
+                "type": d_type,
+                "workout_template": wt,
+            }
+        )
+    return normalized
 
 
 async def create_ai_request(
@@ -231,11 +672,18 @@ async def create_ai_request(
     return req
 
 
-async def yandex_chat_completion(text: str, meta: Dict[str, Any]) -> str:
-    """
-    Best-effort Yandex GPT call.
-    Falls back to a deterministic local message if env is incomplete or API fails.
-    """
+async def archive_active_plans(user_id: PydanticObjectId) -> None:
+    await AiPlan.find(
+        AiPlan.user_id == user_id,
+        AiPlan.status == "active",
+    ).update({"$set": {"status": "archived"}})
+
+
+async def yandex_chat_completion(
+    text: str,
+    meta: Dict[str, Any],
+    history: Optional[list[dict[str, str]]] = None,
+) -> str:
     if not YC_API_KEY_SECRET:
         return "AI assistant is configured in stub mode. Add YC_API_KEY_SECRET to enable Yandex GPT."
 
@@ -243,43 +691,22 @@ async def yandex_chat_completion(text: str, meta: Dict[str, Any]) -> str:
     if not model_uri:
         return "AI assistant is configured in stub mode. Add YC_FOLDER_ID or YC_GPT_MODEL_URI for Yandex GPT."
 
-    body = {
-        "modelUri": model_uri,
-        "completionOptions": {
-            "stream": False,
-            "temperature": 0.6,
-            "maxTokens": 600,
-        },
-        "messages": [
-            {
-                "role": "system",
-                "text": "You are a fitness assistant. Give safe, concise, actionable advice.",
-            },
-            {
-                "role": "user",
-                "text": text,
-            },
-        ],
-    }
+    sys_text = (
+        "You are a fitness assistant. Give safe, concise, actionable advice. "
+        "If user asks medical-risk topic, recommend consulting a professional."
+    )
+    if meta:
+        sys_text += f" Context meta: {json.dumps(meta, ensure_ascii=True)}"
 
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(
-                "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
-                headers={"Authorization": f"Api-Key {YC_API_KEY_SECRET}"},
-                json=body,
-            )
-    except httpx.HTTPError:
-        return "AI service is temporarily unavailable. Please try again."
+    messages: list[dict[str, str]] = [{"role": "system", "text": sys_text}]
+    if history:
+        messages.extend(history[-12:])
+    messages.append({"role": "user", "text": text})
 
-    if r.status_code != 200:
-        return "AI service is temporarily unavailable. Please try again."
-
-    data = r.json()
-    try:
-        return str(data["result"]["alternatives"][0]["message"]["text"]).strip()
-    except Exception:
-        return "AI service returned an unexpected response. Please try again."
+    res = await yandex_completion(messages, temperature=0.6, max_tokens=800)
+    if res:
+        return res
+    return "AI service is temporarily unavailable. Please try again."
 
 
 async def build_limits(user_id: PydanticObjectId) -> AiLimitsOut:
@@ -321,10 +748,6 @@ async def build_limits(user_id: PydanticObjectId) -> AiLimitsOut:
         free_reroll_used=reroll_used,
     )
 
-
-# ============================================================
-# Endpoints
-# ============================================================
 
 @router.get("/ai/limits", response_model=AiLimitsOut)
 async def ai_limits(current_user=Depends(get_current_user)):
@@ -385,19 +808,24 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
         usage.used += 1
         await usage.save()
 
+    meta = payload.prompt_meta or {}
     req = await create_ai_request(
         user_id=current_user.id,
         req_type=AiRequestType.generate_plan,
-        prompt_meta=payload.prompt_meta or {},
+        prompt_meta=meta,
     )
 
     await archive_active_plans(current_user.id)
 
+    days = await _try_generate_plan_with_yandex(current_user, meta, total_days=30)
+    if not days:
+        days = await build_plan_days(current_user, meta, total_days=30)
+
     plan = AiPlan(
         user_id=current_user.id,
         status="active",
-        created_from=payload.prompt_meta or {},
-        days=build_plan_days(payload.prompt_meta or {}, total_days=30),
+        created_from=meta,
+        days=days,
         version=1,
         reroll_of_plan_id=None,
     )
@@ -423,22 +851,32 @@ async def ai_reroll_plan(payload: AiRerollIn, current_user=Depends(get_current_u
     if await has_child_reroll(plan.id):
         raise HTTPException(403, "Free reroll already used for this plan")
 
+    merged_meta = dict(plan.created_from or {})
+    merged_meta.update(payload.prompt_meta or {})
+    merged_meta["_reroll_nonce"] = utcnow().isoformat()
+
     req = await create_ai_request(
         user_id=current_user.id,
         req_type=AiRequestType.reroll,
-        prompt_meta=payload.prompt_meta or {},
+        prompt_meta=merged_meta,
     )
 
     await archive_active_plans(current_user.id)
 
-    merged_meta = dict(plan.created_from or {})
-    merged_meta.update(payload.prompt_meta or {})
+    days = await _try_generate_plan_with_yandex(current_user, merged_meta, total_days=30)
+    if not days:
+        days = await build_plan_days(
+            current_user,
+            merged_meta,
+            total_days=30,
+            seed_nonce=merged_meta["_reroll_nonce"],
+        )
 
     new_plan = AiPlan(
         user_id=current_user.id,
         status="active",
         created_from=merged_meta,
-        days=build_plan_days(merged_meta, total_days=30),
+        days=days,
         version=int(plan.version or 1) + 1,
         reroll_of_plan_id=plan.id,
     )
@@ -455,7 +893,6 @@ async def get_current_plan(current_user=Depends(get_current_user)):
     plan = await get_active_plan(current_user.id)
     if not plan:
         raise HTTPException(404, "No active plan")
-
     return plan_to_out(plan)
 
 
@@ -463,7 +900,6 @@ async def get_current_plan(current_user=Depends(get_current_user)):
 async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
-
     if not await is_premium_user(current_user.id):
         raise HTTPException(403, "Premium required")
 
@@ -479,10 +915,18 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
             thread = await AiChatThread.get(PydanticObjectId(payload.thread_id))
         except Exception:
             thread = None
-
     if not thread or thread.user_id != current_user.id:
         thread = AiChatThread(user_id=current_user.id)
         await thread.insert()
+
+    history_rows = await AiChatMessage.find(AiChatMessage.thread_id == thread.id).sort("-created_at").limit(12).to_list()
+    history_rows = list(reversed(history_rows))
+    history: list[dict[str, str]] = []
+    for m in history_rows:
+        role = str(m.role).lower()
+        if role not in {"user", "assistant"}:
+            continue
+        history.append({"role": role, "text": str(m.text)})
 
     user_message = AiChatMessage(
         thread_id=thread.id,
@@ -492,7 +936,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     )
     await user_message.insert()
 
-    assistant_text = await yandex_chat_completion(payload.text, payload.meta or {})
+    assistant_text = await yandex_chat_completion(payload.text, payload.meta or {}, history=history)
 
     assistant_message = AiChatMessage(
         thread_id=thread.id,
@@ -501,6 +945,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
         text=assistant_text,
     )
     await assistant_message.insert()
+    await thread.touch()
 
     return AiChatOut(
         thread_id=str(thread.id),
@@ -510,11 +955,42 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     )
 
 
+def _apply_adjustments_to_meta(base: Dict[str, Any], adjustments: Dict[str, Any], note: Optional[str]) -> Dict[str, Any]:
+    merged = dict(base)
+    adj = adjustments or {}
+
+    if "days_per_week" in adj:
+        merged["days_per_week"] = _coerce_int(adj.get("days_per_week"), default=4, lo=1, hi=7)
+    if "workouts_per_week" in adj:
+        merged["days_per_week"] = _coerce_int(adj.get("workouts_per_week"), default=4, lo=1, hi=7)
+    if "duration_min" in adj:
+        merged["duration_min"] = _coerce_int(adj.get("duration_min"), default=35, lo=10, hi=120)
+    if "session_minutes" in adj:
+        merged["duration_min"] = _coerce_int(adj.get("session_minutes"), default=35, lo=10, hi=120)
+    if "intensity" in adj:
+        merged["intensity"] = str(adj.get("intensity") or "moderate").lower()
+    if "goals" in adj:
+        merged["goals"] = _as_str_list(adj.get("goals"))
+    if "preferences" in adj:
+        merged["preferences"] = _as_str_list(adj.get("preferences"))
+    if "equipment" in adj:
+        merged["equipment"] = _as_str_list(adj.get("equipment"))
+    if "injuries" in adj:
+        merged["injuries"] = _as_str_list(adj.get("injuries"))
+
+    if adj:
+        merged["adjustments"] = adj
+    if note:
+        merged["adjust_note"] = note
+
+    merged["_reroll_nonce"] = utcnow().isoformat()
+    return merged
+
+
 @router.post("/ai/adjust-plan", response_model=AiAdjustOut)
 async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
-
     if not await is_premium_user(current_user.id):
         raise HTTPException(403, "Premium required")
 
@@ -529,12 +1005,7 @@ async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_u
 
     prompt_meta = dict(base_plan.created_from or {})
     prompt_meta.update(payload.prompt_meta or {})
-
-    # Keep adjustment intent in metadata for auditability / re-generation.
-    if payload.adjustments:
-        prompt_meta["adjustments"] = payload.adjustments
-    if payload.note:
-        prompt_meta["adjust_note"] = payload.note
+    prompt_meta = _apply_adjustments_to_meta(prompt_meta, payload.adjustments or {}, payload.note)
 
     req = await create_ai_request(
         user_id=current_user.id,
@@ -544,11 +1015,20 @@ async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_u
 
     await archive_active_plans(current_user.id)
 
+    days = await _try_generate_plan_with_yandex(current_user, prompt_meta, total_days=30)
+    if not days:
+        days = await build_plan_days(
+            current_user,
+            prompt_meta,
+            total_days=30,
+            seed_nonce=prompt_meta.get("_reroll_nonce"),
+        )
+
     adjusted_plan = AiPlan(
         user_id=current_user.id,
         status="active",
         created_from=prompt_meta,
-        days=build_plan_days(prompt_meta, total_days=30),
+        days=days,
         version=int(base_plan.version or 1) + 1,
         reroll_of_plan_id=base_plan.id,
     )

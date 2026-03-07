@@ -59,6 +59,9 @@ class PurchaseIn(BaseModel):
 
 class PurchaseOut(BaseModel):
     subscription: SubscriptionOut
+    promo_code: Optional[str] = None
+    promo_duration_days: Optional[int] = None
+    promo_discount_percent: Optional[int] = None
 
 
 class PurchaseInitOut(BaseModel):
@@ -92,6 +95,18 @@ class PromoActivateIn(BaseModel):
     code: str
 
 
+class PromoPreviewOut(BaseModel):
+    valid: bool
+    code: str
+    discount_percent: int
+    duration_days: int
+    max_uses: int
+    used_count: int
+    remaining_uses: int
+    expires_at: Optional[datetime] = None
+    status: PromoStatus
+
+
 class CancelOut(BaseModel):
     status: str
 
@@ -99,6 +114,7 @@ class CancelOut(BaseModel):
 class PromoCodeOut(BaseModel):
     id: str
     code: str
+    discount_percent: int
     duration_days: int
     max_uses: int
     used_count: int
@@ -115,6 +131,7 @@ class PromoCodesOut(BaseModel):
 
 class PromoCodeCreateIn(BaseModel):
     code: str
+    discount_percent: int = Field(default=0, ge=0, le=95)
     duration_days: int = Field(ge=1, le=3650)
     max_uses: int = Field(default=1, ge=1, le=10_000_000)
     expires_at: Optional[datetime] = None
@@ -123,6 +140,7 @@ class PromoCodeCreateIn(BaseModel):
 
 class PromoBatchCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
+    discount_percent: int = Field(default=0, ge=0, le=95)
     duration_days: int = Field(ge=1, le=3650)
     max_uses_per_code: int = Field(ge=1, le=1_000_000)
     codes_count: int = Field(ge=1, le=5000)
@@ -132,6 +150,7 @@ class PromoBatchCreateIn(BaseModel):
 class PromoBatchOut(BaseModel):
     id: str
     name: str
+    discount_percent: int
     duration_days: int
     max_uses_per_code: int
     codes_count: int

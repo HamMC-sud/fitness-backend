@@ -3,6 +3,8 @@ from __future__ import annotations
 import inspect
 import csv
 import io
+import json
+import re
 import uuid
 import secrets
 import string
@@ -10,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from beanie.odm.fields import PydanticObjectId
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
@@ -119,6 +122,17 @@ MAX_VIDEO_BYTES = 300 * 1024 * 1024
 MAX_AUDIO_BYTES = 100 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 CONTENT_UPLOAD_DIR = Path("statics/uploads/content")
+SAFE_UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+ALLOWED_MEDIA_EXTS = {
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".webm",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+}
 
 
 def normalize_asset_type(value: str) -> str:
@@ -168,6 +182,125 @@ async def save_upload_file(file: UploadFile, category: str, max_bytes: int, requ
     base = str(request.base_url).rstrip("/")
     url = f"{base}/statics/uploads/content/{fname}"
     return url, fname
+
+
+def _normalize_desired_name(desired_name: Optional[str], file: UploadFile) -> Optional[str]:
+    if not desired_name:
+        return None
+
+    name = desired_name.strip()
+    if not name:
+        return None
+
+    # Prevent path traversal and disallow unsafe characters in user-provided file names.
+    if Path(name).name != name or not SAFE_UPLOAD_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file name. Use only letters, numbers, dot, dash, underscore.",
+        )
+
+    if "." not in name:
+        name += _guess_ext(file.content_type, file.filename)
+
+    return name
+
+
+async def save_upload_file_with_name(
+    file: UploadFile,
+    category: str,
+    max_bytes: int,
+    request: Request,
+    desired_name: Optional[str] = None,
+    overwrite_existing: bool = False,
+) -> tuple[str, str]:
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail=f"{category} file is empty")
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"{category} file exceeds size limit")
+
+    CONTENT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    normalized_name = _normalize_desired_name(desired_name, file)
+    if normalized_name:
+        fname = normalized_name
+    else:
+        ext = _guess_ext(file.content_type, file.filename)
+        fname = f"{category}_{uuid.uuid4().hex}{ext}"
+
+    out_path = CONTENT_UPLOAD_DIR / fname
+    if out_path.exists() and not overwrite_existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"File '{fname}' already exists. Set overwrite_existing=true to replace it.",
+        )
+
+    out_path.write_bytes(data)
+    base = str(request.base_url).rstrip("/")
+    url = f"{base}/statics/uploads/content/{fname}"
+    return url, fname
+
+
+def _extract_uploaded_name(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    try:
+        path = urlparse(url).path or ""
+        return Path(path).name or None
+    except Exception:
+        return None
+
+
+def _parse_form_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    return v in {"1", "true", "yes", "y", "on"}
+
+
+def _validate_existing_media_filename(raw_name: Optional[str]) -> Optional[str]:
+    if raw_name is None:
+        return None
+    name = str(raw_name).strip()
+    if not name:
+        return None
+    if Path(name).name != name or not SAFE_UPLOAD_NAME_RE.match(name):
+        raise ValueError("unsafe file name")
+    ext = Path(name).suffix.lower()
+    if ext and ext not in ALLOWED_MEDIA_EXTS:
+        raise ValueError("unsupported file extension")
+    file_path = CONTENT_UPLOAD_DIR / name
+    if not file_path.exists():
+        raise ValueError("file not found in upload directory")
+    return name
+
+
+def _uploaded_content_url(request: Request, file_name: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/statics/uploads/content/{file_name}"
+
+
+def _parse_media_mapping_rows(raw_bytes: bytes, source_name: str) -> list[dict]:
+    name = (source_name or "").lower()
+    text = raw_bytes.decode("utf-8-sig", errors="replace")
+
+    if name.endswith(".json"):
+        payload = json.loads(text or "[]")
+        if not isinstance(payload, list):
+            raise HTTPException(status_code=400, detail="JSON must be an array of rows")
+        out: list[dict] = []
+        for idx, item in enumerate(payload):
+            if not isinstance(item, dict):
+                raise HTTPException(status_code=400, detail=f"JSON row {idx + 1} must be an object")
+            out.append(item)
+        return out
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV has no header")
+    return [dict(r or {}) for r in reader]
 
 
 def parse_duration_mmss(value: Optional[str]) -> Optional[int]:
@@ -1133,6 +1266,10 @@ async def admin_get_content_asset(asset_id: PydanticObjectId, admin_user=Depends
 async def admin_upload_content_files(
     request: Request,
     asset_type: str = Form(...),
+    overwrite_existing: bool = Form(default=False),
+    video_file_name: Optional[str] = Form(default=None),
+    audio_file_name: Optional[str] = Form(default=None),
+    image_file_name: Optional[str] = Form(default=None),
     video_file: Optional[UploadFile] = File(default=None),
     audio_file: Optional[UploadFile] = File(default=None),
     image_file: Optional[UploadFile] = File(default=None),
@@ -1151,7 +1288,14 @@ async def admin_upload_content_files(
             raise HTTPException(status_code=400, detail="video_file is required for video content")
         if not (video_file.content_type or "").lower().startswith("video/"):
             raise HTTPException(status_code=400, detail="video_file must be a video/* file")
-        video_url, video_name = await save_upload_file(video_file, "video", MAX_VIDEO_BYTES, request)
+        video_url, video_name = await save_upload_file_with_name(
+            video_file,
+            "video",
+            MAX_VIDEO_BYTES,
+            request,
+            desired_name=video_file_name,
+            overwrite_existing=overwrite_existing,
+        )
         primary_file_url = video_url
         primary_file_name = video_name
 
@@ -1160,32 +1304,67 @@ async def admin_upload_content_files(
             raise HTTPException(status_code=400, detail="audio_file is required for audio content")
         if not (audio_file.content_type or "").lower().startswith("audio/"):
             raise HTTPException(status_code=400, detail="audio_file must be an audio/* file")
-        audio_url, audio_name = await save_upload_file(audio_file, "audio", MAX_AUDIO_BYTES, request)
+        audio_url, audio_name = await save_upload_file_with_name(
+            audio_file,
+            "audio",
+            MAX_AUDIO_BYTES,
+            request,
+            desired_name=audio_file_name,
+            overwrite_existing=overwrite_existing,
+        )
         primary_file_url = audio_url
         primary_file_name = audio_name
 
         if video_file:
             if not (video_file.content_type or "").lower().startswith("video/"):
                 raise HTTPException(status_code=400, detail="video_file must be a video/* file")
-            video_url, _ = await save_upload_file(video_file, "video", MAX_VIDEO_BYTES, request)
+            video_url, _ = await save_upload_file_with_name(
+                video_file,
+                "video",
+                MAX_VIDEO_BYTES,
+                request,
+                desired_name=video_file_name,
+                overwrite_existing=overwrite_existing,
+            )
         if image_file:
             if not (image_file.content_type or "").lower().startswith("image/"):
                 raise HTTPException(status_code=400, detail="image_file must be an image/* file")
-            image_url, _ = await save_upload_file(image_file, "image", MAX_IMAGE_BYTES, request)
+            image_url, _ = await save_upload_file_with_name(
+                image_file,
+                "image",
+                MAX_IMAGE_BYTES,
+                request,
+                desired_name=image_file_name,
+                overwrite_existing=overwrite_existing,
+            )
 
     elif t == "image":
         if not image_file:
             raise HTTPException(status_code=400, detail="image_file is required for image content")
         if not (image_file.content_type or "").lower().startswith("image/"):
             raise HTTPException(status_code=400, detail="image_file must be an image/* file")
-        image_url, image_name = await save_upload_file(image_file, "image", MAX_IMAGE_BYTES, request)
+        image_url, image_name = await save_upload_file_with_name(
+            image_file,
+            "image",
+            MAX_IMAGE_BYTES,
+            request,
+            desired_name=image_file_name,
+            overwrite_existing=overwrite_existing,
+        )
         primary_file_url = image_url
         primary_file_name = image_name
 
         if audio_file:
             if not (audio_file.content_type or "").lower().startswith("audio/"):
                 raise HTTPException(status_code=400, detail="audio_file must be an audio/* file")
-            audio_url, _ = await save_upload_file(audio_file, "audio", MAX_AUDIO_BYTES, request)
+            audio_url, _ = await save_upload_file_with_name(
+                audio_file,
+                "audio",
+                MAX_AUDIO_BYTES,
+                request,
+                desired_name=audio_file_name,
+                overwrite_existing=overwrite_existing,
+            )
 
     return AdminContentUploadOut(
         video_url=video_url,
@@ -1194,6 +1373,200 @@ async def admin_upload_content_files(
         primary_file_url=primary_file_url,
         primary_file_name=primary_file_name,
     )
+
+
+@router.post("/content-library/assets/{asset_id}/replace-media", response_model=AdminContentAssetOut)
+@router.post("/content-library/{asset_id}/replace-media", response_model=AdminContentAssetOut)
+async def admin_replace_content_asset_media(
+    asset_id: PydanticObjectId,
+    request: Request,
+    overwrite_existing: bool = Form(default=True),
+    video_file: Optional[UploadFile] = File(default=None),
+    audio_file: Optional[UploadFile] = File(default=None),
+    image_file: Optional[UploadFile] = File(default=None),
+    admin_user=Depends(require_admin_user),
+):
+    doc = await ContentAsset.get(asset_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Content asset not found")
+
+    if not any([video_file, audio_file, image_file]):
+        raise HTTPException(status_code=400, detail="At least one file is required")
+
+    if video_file:
+        if not (video_file.content_type or "").lower().startswith("video/"):
+            raise HTTPException(status_code=400, detail="video_file must be a video/* file")
+        desired_name = _extract_uploaded_name(doc.video_url) or (
+            doc.file_name if doc.asset_type == "video" else None
+        )
+        video_url, video_name = await save_upload_file_with_name(
+            video_file,
+            "video",
+            MAX_VIDEO_BYTES,
+            request,
+            desired_name=desired_name,
+            overwrite_existing=overwrite_existing,
+        )
+        doc.video_url = video_url
+        if doc.asset_type == "video":
+            doc.file_url = video_url
+            doc.file_name = video_name
+
+    if audio_file:
+        if not (audio_file.content_type or "").lower().startswith("audio/"):
+            raise HTTPException(status_code=400, detail="audio_file must be an audio/* file")
+        desired_name = _extract_uploaded_name(doc.audio_url) or (
+            doc.file_name if doc.asset_type == "audio" else None
+        )
+        audio_url, audio_name = await save_upload_file_with_name(
+            audio_file,
+            "audio",
+            MAX_AUDIO_BYTES,
+            request,
+            desired_name=desired_name,
+            overwrite_existing=overwrite_existing,
+        )
+        doc.audio_url = audio_url
+        if doc.asset_type == "audio":
+            doc.file_url = audio_url
+            doc.file_name = audio_name
+
+    if image_file:
+        if not (image_file.content_type or "").lower().startswith("image/"):
+            raise HTTPException(status_code=400, detail="image_file must be an image/* file")
+        desired_name = _extract_uploaded_name(doc.image_url) or (
+            doc.file_name if doc.asset_type == "image" else None
+        )
+        image_url, image_name = await save_upload_file_with_name(
+            image_file,
+            "image",
+            MAX_IMAGE_BYTES,
+            request,
+            desired_name=desired_name,
+            overwrite_existing=overwrite_existing,
+        )
+        doc.image_url = image_url
+        if doc.asset_type == "image":
+            doc.file_url = image_url
+            doc.file_name = image_name
+
+    await doc.save()
+    return content_asset_to_out(doc)
+
+
+@router.post("/content-library/exercises/media-mapping/import")
+async def admin_import_exercise_media_mapping(
+    request: Request,
+    mapping_file: UploadFile = File(...),
+    dry_run: str = Form(default="true"),
+    strict: str = Form(default="false"),
+    admin_user=Depends(require_admin_user),
+):
+    raw = await mapping_file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="mapping_file is empty")
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="mapping_file exceeds 5MB")
+
+    rows = _parse_media_mapping_rows(raw, mapping_file.filename or "")
+    if not rows:
+        return {
+            "dry_run": _parse_form_bool(dry_run, True),
+            "strict": _parse_form_bool(strict, False),
+            "total_rows": 0,
+            "updated": 0,
+            "skipped": 0,
+            "errors": 0,
+            "results": [],
+        }
+
+    dry_run_bool = _parse_form_bool(dry_run, True)
+    strict_bool = _parse_form_bool(strict, False)
+
+    results: list[dict] = []
+    updated = 0
+    skipped = 0
+    errors = 0
+
+    for i, row in enumerate(rows, start=1):
+        row_result: dict[str, Any] = {"row": i}
+        try:
+            code = (row.get("exercise_code") or row.get("code") or "").strip()
+            if not code:
+                raise ValueError("exercise_code is required")
+            row_result["exercise_code"] = code
+
+            video_name = _validate_existing_media_filename(
+                row.get("video_file_name") or row.get("video") or row.get("video_filename")
+            )
+            thumb_name = _validate_existing_media_filename(
+                row.get("thumbnail_file_name")
+                or row.get("thumbnail")
+                or row.get("thumbnail_filename")
+                or row.get("image_file_name")
+                or row.get("image")
+            )
+
+            duration_raw = row.get("duration_seconds")
+            duration_seconds = None
+            if duration_raw not in (None, ""):
+                duration_seconds = int(duration_raw)
+                if duration_seconds <= 0 or duration_seconds > 3600:
+                    raise ValueError("duration_seconds must be in range 1..3600")
+
+            if not any([video_name, thumb_name, duration_seconds is not None]):
+                raise ValueError("nothing to update for this row")
+
+            doc = await Exercise.find_one(Exercise.code == code)
+            if not doc:
+                raise ValueError("exercise not found")
+
+            changes: dict[str, Any] = {}
+            if video_name:
+                changes["video_url"] = _uploaded_content_url(request, video_name)
+            if thumb_name:
+                changes["thumbnail_url"] = _uploaded_content_url(request, thumb_name)
+            if duration_seconds is not None:
+                changes["duration_seconds"] = duration_seconds
+
+            if not dry_run_bool:
+                media = doc.media
+                if "video_url" in changes:
+                    media.video_url = changes["video_url"]
+                if "thumbnail_url" in changes:
+                    media.thumbnail_url = changes["thumbnail_url"]
+                if "duration_seconds" in changes:
+                    media.duration_seconds = changes["duration_seconds"]
+                doc.media = media
+                await doc.save()
+
+            row_result["status"] = "updated"
+            row_result["changes"] = changes
+            updated += 1
+        except Exception as e:
+            msg = str(e)
+            row_result["status"] = "error"
+            row_result["error"] = msg if msg else "unknown error"
+            errors += 1
+            if strict_bool:
+                results.append(row_result)
+                break
+        results.append(row_result)
+
+    if errors:
+        skipped = len(rows) - (updated + errors)
+    else:
+        skipped = len(rows) - updated
+
+    return {
+        "dry_run": dry_run_bool,
+        "strict": strict_bool,
+        "total_rows": len(rows),
+        "updated": updated,
+        "skipped": max(0, skipped),
+        "errors": errors,
+        "results": results,
+    }
 
 
 @router.post("/content-library/assets", response_model=AdminContentAssetOut)

@@ -215,7 +215,41 @@ async def has_activity_today(user_id: PydanticObjectId, start_utc: datetime, end
 
 
 async def get_tokens(user_id: PydanticObjectId) -> List[DevicePushToken]:
-    return await DevicePushToken.find(DevicePushToken.user_id == user_id).sort("-last_used_at").limit(10).to_list()
+    return await DevicePushToken.find(
+        DevicePushToken.user_id == user_id,
+        DevicePushToken.is_active == True,
+    ).sort("-last_used_at").limit(10).to_list()
+
+
+def should_deactivate_token(error_text: str) -> bool:
+    s = (error_text or "").lower()
+    if not s:
+        return False
+    markers = [
+        "unregistered",
+        "notregistered",
+        "registration token is not a valid",
+        "invalid registration token",
+        "requested entity was not found",
+        "mismatched sender id",
+        "third-party auth error",
+    ]
+    return any(m in s for m in markers)
+
+
+async def mark_push_result(token_doc: DevicePushToken, ok: bool, err: str) -> None:
+    now = utcnow()
+    token_doc.last_used_at = now
+    if ok:
+        token_doc.is_active = True
+        token_doc.last_error = None
+        token_doc.last_error_at = None
+    else:
+        token_doc.last_error = (err or "send failed")[:500]
+        token_doc.last_error_at = now
+        if should_deactivate_token(err):
+            token_doc.is_active = False
+    await token_doc.save()
 
 
 def streak_text(lang: str) -> Tuple[str, str]:
@@ -265,6 +299,7 @@ async def push_register(payload: PushRegisterIn, current_user=Depends(get_curren
     if not token:
         raise HTTPException(status_code=400, detail="Invalid token")
 
+    # 1) Token-first upsert: supports ownership transfer and reinstall.
     doc = await DevicePushToken.find_one(DevicePushToken.token == token)
     if doc:
         doc.user_id = current_user.id
@@ -275,8 +310,31 @@ async def push_register(payload: PushRegisterIn, current_user=Depends(get_curren
         doc.timezone = payload.timezone
         doc.app_version = payload.app_version
         doc.last_used_at = utcnow()
+        doc.is_active = True
+        doc.last_error = None
+        doc.last_error_at = None
         await doc.save()
         return PushRegisterOut(status="ok", token_id=str(doc.id))
+
+    # 2) Stable device upsert for token rotation on same physical device.
+    if payload.device_id:
+        doc = await DevicePushToken.find_one(
+            DevicePushToken.user_id == current_user.id,
+            DevicePushToken.device_id == payload.device_id,
+        )
+        if doc:
+            doc.provider = payload.provider
+            doc.platform = payload.platform
+            doc.token = token
+            doc.locale = payload.locale
+            doc.timezone = payload.timezone
+            doc.app_version = payload.app_version
+            doc.last_used_at = utcnow()
+            doc.is_active = True
+            doc.last_error = None
+            doc.last_error_at = None
+            await doc.save()
+            return PushRegisterOut(status="ok", token_id=str(doc.id))
 
     doc = DevicePushToken(
         user_id=current_user.id,
@@ -288,6 +346,9 @@ async def push_register(payload: PushRegisterIn, current_user=Depends(get_curren
         timezone=payload.timezone,
         app_version=payload.app_version,
         last_used_at=utcnow(),
+        is_active=True,
+        last_error=None,
+        last_error_at=None,
     )
     await doc.insert()
     return PushRegisterOut(status="ok", token_id=str(doc.id))
@@ -305,14 +366,19 @@ async def push_unregister(payload: PushUnregisterIn, current_user=Depends(get_cu
     if doc.user_id != current_user.id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    await doc.delete()
+    doc.is_active = False
+    doc.last_used_at = utcnow()
+    await doc.save()
     return PushRegisterOut(status="ok", token_id=str(doc.id))
 
 
 @router.get("/push/me", response_model=PushTokensOut)
 async def push_me(current_user=Depends(get_current_user)):
     require_auth(current_user)
-    items = await DevicePushToken.find(DevicePushToken.user_id == current_user.id).sort("-last_used_at").to_list()
+    items = await DevicePushToken.find(
+        DevicePushToken.user_id == current_user.id,
+        DevicePushToken.is_active == True,
+    ).sort("-last_used_at").to_list()
     return PushTokensOut(items=[to_push_out(x) for x in items])
 
 
@@ -330,6 +396,7 @@ async def push_send_test(payload: PushSendIn, current_user=Depends(get_current_u
 
     for t in tokens:
         ok, err = send_push(t.provider, t.token, payload.title, payload.body, payload.data or {})
+        await mark_push_result(t, ok, err)
         if ok:
             sent += 1
         else:
@@ -417,6 +484,7 @@ async def push_streak_run(x_internal_token: Optional[str] = Header(default=None)
 
         for t in tokens:
             ok, err = send_push(t.provider, t.token, title, body, data)
+            await mark_push_result(t, ok, err)
             if ok:
                 any_ok = True
             else:
@@ -781,6 +849,7 @@ async def push_reminders_run(x_internal_token: Optional[str] = Header(default=No
 
         for t in tokens:
             ok, err = send_push(t.provider, t.token, title, body, data)
+            await mark_push_result(t, ok, err)
             if ok:
                 any_ok = True
             else:

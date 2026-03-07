@@ -28,6 +28,7 @@ from schemas.subscription import (
     PromoCodeCreateIn,
     PromoCodeOut,
     PromoCodesOut,
+    PromoPreviewOut,
     PromoStatsOut,
     PurchaseIn,
     PurchaseInitOut,
@@ -77,12 +78,22 @@ def promo_to_out(p: PromoCode) -> PromoCodeOut:
     return PromoCodeOut(
         id=str(p.id),
         code=p.code,
+        discount_percent=int(getattr(p, "discount_percent", 0) or 0),
         duration_days=int(p.duration_days),
         max_uses=int(p.max_uses),
         used_count=int(p.used_count),
         expires_at=p.expires_at,
         status=p.status,
     )
+
+
+def _promo_is_expired(promo: PromoCode) -> bool:
+    if promo.expires_at is None:
+        return False
+    exp = promo.expires_at
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return utcnow() >= exp
 
 
 def compute_subscription_status(sub: Subscription) -> Tuple[SubscriptionStatus, bool, bool]:
@@ -535,6 +546,38 @@ async def yookassa_webhook(body: YooKassaWebhookIn, x_webhook_token: Optional[st
     return YooKassaWebhookOut(ok=True)
 
 
+@router.post("/subscription/promo/preview", response_model=PromoPreviewOut)
+async def preview_promo(payload: PromoActivateIn, current_user=Depends(get_current_user)):
+    require_auth(current_user)
+
+    code = normalize_code(payload.code)
+    promo = await PromoCode.find_one(PromoCode.code == code)
+    if not promo:
+        raise HTTPException(status_code=400, detail="Invalid promo code")
+
+    if promo.status != PromoStatus.active:
+        raise HTTPException(status_code=400, detail="Promo code disabled")
+
+    if _promo_is_expired(promo):
+        raise HTTPException(status_code=400, detail="Promo code expired")
+
+    remaining = max(0, int(promo.max_uses) - int(promo.used_count))
+    if remaining <= 0:
+        raise HTTPException(status_code=400, detail="Promo code limit reached or expired")
+
+    return PromoPreviewOut(
+        valid=True,
+        code=promo.code,
+        discount_percent=int(getattr(promo, "discount_percent", 0) or 0),
+        duration_days=int(promo.duration_days),
+        max_uses=int(promo.max_uses),
+        used_count=int(promo.used_count),
+        remaining_uses=remaining,
+        expires_at=promo.expires_at,
+        status=promo.status,
+    )
+
+
 @router.post("/subscription/activate-promo", response_model=PurchaseOut)
 async def activate_promo(payload: PromoActivateIn, current_user=Depends(get_current_user)):
     require_auth(current_user)
@@ -547,12 +590,8 @@ async def activate_promo(payload: PromoActivateIn, current_user=Depends(get_curr
     if promo.status != PromoStatus.active:
         raise HTTPException(status_code=400, detail="Promo code disabled")
 
-    if promo.expires_at is not None:
-        exp = promo.expires_at
-        if exp.tzinfo is None:
-            exp = exp.replace(tzinfo=timezone.utc)
-        if utcnow() >= exp:
-            raise HTTPException(status_code=400, detail="Promo code expired")
+    if _promo_is_expired(promo):
+        raise HTTPException(status_code=400, detail="Promo code expired")
 
     if int(promo.duration_days) <= 0:
         raise HTTPException(status_code=400, detail="Promo code invalid duration")
@@ -564,7 +603,12 @@ async def activate_promo(payload: PromoActivateIn, current_user=Depends(get_curr
         amount=None,
         currency=None,
         store={"status": "verified", "verified_at": utcnow().isoformat(), "promo": True},
-        promo={"code": code, "promo_id": str(promo.id), "duration_days": int(promo.duration_days)},
+        promo={
+            "code": code,
+            "promo_id": str(promo.id),
+            "duration_days": int(promo.duration_days),
+            "discount_percent": int(getattr(promo, "discount_percent", 0) or 0),
+        },
     )
     await tx.insert()
 
@@ -619,7 +663,13 @@ async def activate_promo(payload: PromoActivateIn, current_user=Depends(get_curr
             add_days=duration_days,
             tx_id=tx.id,
         )
-        return PurchaseOut(subscription=sub_to_out(sub))
+        promo_discount_percent = int(claimed.get("discount_percent", getattr(promo, "discount_percent", 0)) or 0)
+        return PurchaseOut(
+            subscription=sub_to_out(sub),
+            promo_code=code,
+            promo_duration_days=duration_days,
+            promo_discount_percent=promo_discount_percent,
+        )
     except Exception:
         await promo_atomic_rollback(code)
         try:
@@ -680,6 +730,7 @@ async def create_promo(payload: PromoCodeCreateIn, current_user=Depends(get_curr
 
     doc = PromoCode(
         code=code,
+        discount_percent=int(payload.discount_percent),
         duration_days=payload.duration_days,
         max_uses=payload.max_uses,
         used_count=0,
@@ -695,6 +746,7 @@ async def create_promo_batch(payload: PromoBatchCreateIn, current_user=Depends(g
 
     batch = PromoCodeBatch(
         name=payload.name,
+        discount_percent=int(payload.discount_percent),
         duration_days=payload.duration_days,
         max_uses_per_code=payload.max_uses_per_code,
         codes_count=payload.codes_count,
@@ -714,6 +766,7 @@ async def create_promo_batch(payload: PromoBatchCreateIn, current_user=Depends(g
         c = PromoCode(
             batch_id=batch.id,
             code=code_random(int(payload.code_length)),
+            discount_percent=int(payload.discount_percent),
             duration_days=payload.duration_days,
             max_uses=payload.max_uses_per_code,
             used_count=0,
@@ -733,6 +786,7 @@ async def create_promo_batch(payload: PromoBatchCreateIn, current_user=Depends(g
         batch=PromoBatchOut(
             id=str(batch.id),
             name=batch.name,
+            discount_percent=int(getattr(batch, "discount_percent", 0) or 0),
             duration_days=int(batch.duration_days),
             max_uses_per_code=int(batch.max_uses_per_code),
             codes_count=int(batch.codes_count),
@@ -759,7 +813,7 @@ async def export_promo_batch_csv(batch_id: str, current_user=Depends(get_current
     def gen():
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["code", "duration_days", "max_uses", "used_count", "status", "expires_at"])
+        w.writerow(["code", "discount_percent", "duration_days", "max_uses", "used_count", "status", "expires_at"])
         yield buf.getvalue()
         buf.seek(0)
         buf.truncate(0)
@@ -767,6 +821,7 @@ async def export_promo_batch_csv(batch_id: str, current_user=Depends(get_current
             w.writerow(
                 [
                     c.code,
+                    int(getattr(c, "discount_percent", 0) or 0),
                     int(c.duration_days),
                     int(c.max_uses),
                     int(c.used_count),

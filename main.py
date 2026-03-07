@@ -8,8 +8,9 @@ from beanie import init_beanie
 
 from models import db, client, ALL_MODELS
 from api.api_router import api_router
-os.makedirs("static", exist_ok=True)
-os.makedirs("static/uploads/profile", exist_ok=True)
+
+# Keep startup directories aligned with mounted static path (/statics -> statics/*).
+os.makedirs("statics", exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

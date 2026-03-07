@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Set
 
 import httpx
@@ -12,7 +12,8 @@ from pydantic import EmailStr
 from pymongo.errors import DuplicateKeyError
 
 from api.auth.config import create_access_token, create_refresh_token, decode_token
-from models import AuthSession, SocialAccount, User
+from api.auth.config import generate_numeric_code, hash_code, now_utc
+from models import AuthSession, SocialAccount, User, VerificationCode
 from schemas.register import TokenOut
 from schemas.social import AppleSocialIn, GoogleSocialIn, VkSocialIn
 
@@ -143,7 +144,7 @@ def apple_verify_id_token(id_token: str) -> Dict[str, Any]:
     return claims
 
 
-async def get_or_create_social_user(
+async def get_or_link_social_user(
     provider: str,
     provider_user_id: str,
     email: Optional[EmailStr],
@@ -152,7 +153,7 @@ async def get_or_create_social_user(
     language: str,
     timezone: str,
     email_verified: bool,
-) -> User:
+) -> Optional[User]:
     link = await SocialAccount.find_one(
         SocialAccount.provider == provider,
         SocialAccount.provider_user_id == provider_user_id,
@@ -171,20 +172,7 @@ async def get_or_create_social_user(
         user = await User.find_one(User.email == email_lc)
 
     if not user:
-        if not email_lc:
-            raise HTTPException(status_code=400, detail="Email required to create account")
-
-        user = User(
-            email=email_lc,
-            email_verified=email_verified,
-            password_hash=None,
-            region=region,
-            country=country,
-            language=language,
-            timezone=timezone,
-            profile=None,
-        )
-        await user.insert()
+        return None
     elif email_verified and not user.email_verified:
         user.email_verified = True
         await user.save()
@@ -217,10 +205,37 @@ async def get_or_create_social_user(
     return user
 
 
+async def mark_social_email_verified_for_complete(email: str) -> None:
+    email_lc = email.lower().strip()
+    record = await VerificationCode.find_one(VerificationCode.email == email_lc)
+    expires_at = now_utc() + timedelta(days=7)
+    social_code_hash = hash_code(generate_numeric_code(6))
+
+    if record:
+        record.verified = True
+        record.password_hash = "__SOCIAL__"
+        record.code_hash = social_code_hash
+        record.attempts = 0
+        record.expires_at = expires_at
+        record.last_resend = None
+        await record.save()
+    else:
+        await VerificationCode(
+            email=email_lc,
+            password_hash="__SOCIAL__",
+            code_hash=social_code_hash,
+            attempts=0,
+            verified=True,
+            created_at=now_utc(),
+            expires_at=expires_at,
+            last_resend=None,
+        ).insert()
+
+
 @router.post("/auth/social/vk", response_model=TokenOut)
 async def vk_login(payload: VkSocialIn, request: Request):
     uid = await vk_fetch_user_id(payload.access_token)
-    user = await get_or_create_social_user(
+    user = await get_or_link_social_user(
         provider="vk",
         provider_user_id=uid,
         email=payload.email,
@@ -230,7 +245,21 @@ async def vk_login(payload: VkSocialIn, request: Request):
         timezone=payload.timezone,
         email_verified=False,
     )
-    return await issue_tokens_for_user(user, request)
+    if user:
+        return await issue_tokens_for_user(user, request)
+
+    email = str(payload.email).lower().strip() if payload.email else ""
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required to complete profile")
+    await mark_social_email_verified_for_complete(email)
+    raise HTTPException(
+        status_code=428,
+        detail={
+            "code": "PROFILE_REQUIRED",
+            "email": email,
+            "message": "Complete profile using /register/complete",
+        },
+    )
 
 
 @router.post("/auth/social/google", response_model=TokenOut)
@@ -243,7 +272,7 @@ async def google_login(payload: GoogleSocialIn, request: Request):
     if not sub:
         raise HTTPException(status_code=401, detail="Google token invalid")
 
-    user = await get_or_create_social_user(
+    user = await get_or_link_social_user(
         provider="google",
         provider_user_id=str(sub),
         email=email,
@@ -253,7 +282,21 @@ async def google_login(payload: GoogleSocialIn, request: Request):
         timezone=payload.timezone,
         email_verified=email_verified,
     )
-    return await issue_tokens_for_user(user, request)
+    if user:
+        return await issue_tokens_for_user(user, request)
+
+    email_lc = str(email).lower().strip() if email else ""
+    if not email_lc:
+        raise HTTPException(status_code=400, detail="Email required to complete profile")
+    await mark_social_email_verified_for_complete(email_lc)
+    raise HTTPException(
+        status_code=428,
+        detail={
+            "code": "PROFILE_REQUIRED",
+            "email": email_lc,
+            "message": "Complete profile using /register/complete",
+        },
+    )
 
 
 @router.post("/auth/social/apple", response_model=TokenOut)
@@ -265,7 +308,7 @@ async def apple_login(payload: AppleSocialIn, request: Request):
     if not sub:
         raise HTTPException(status_code=401, detail="Apple token invalid")
 
-    user = await get_or_create_social_user(
+    user = await get_or_link_social_user(
         provider="apple",
         provider_user_id=str(sub),
         email=email,
@@ -275,4 +318,18 @@ async def apple_login(payload: AppleSocialIn, request: Request):
         timezone=payload.timezone,
         email_verified=True if email else False,
     )
-    return await issue_tokens_for_user(user, request)
+    if user:
+        return await issue_tokens_for_user(user, request)
+
+    email_lc = str(email).lower().strip() if email else ""
+    if not email_lc:
+        raise HTTPException(status_code=400, detail="Email required to complete profile")
+    await mark_social_email_verified_for_complete(email_lc)
+    raise HTTPException(
+        status_code=428,
+        detail={
+            "code": "PROFILE_REQUIRED",
+            "email": email_lc,
+            "message": "Complete profile using /register/complete",
+        },
+    )

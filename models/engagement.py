@@ -25,11 +25,19 @@ class DevicePushToken(BaseDoc):
     app_version: Optional[str] = Field(default=None, max_length=32)
     last_used_at: Optional[datetime] = None
     is_active: bool = Field(default=True)
+    last_error: Optional[str] = Field(default=None, max_length=500)
+    last_error_at: Optional[datetime] = None
     class Settings:
         name = "device_push_tokens"
         indexes = [
             IndexModel([("token", ASCENDING)], unique=True),
+            IndexModel(
+                [("user_id", ASCENDING), ("device_id", ASCENDING)],
+                unique=True,
+                partialFilterExpression={"device_id": {"$type": "string"}},
+            ),
             IndexModel([("user_id", ASCENDING), ("provider", ASCENDING), ("platform", ASCENDING)]),
+            IndexModel([("user_id", ASCENDING), ("is_active", ASCENDING), ("last_used_at", DESCENDING)]),
             IndexModel([("user_id", ASCENDING), ("last_used_at", DESCENDING)]),
         ]
 
