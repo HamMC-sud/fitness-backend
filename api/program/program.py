@@ -126,7 +126,7 @@ async def delete_template(template_id: PydanticObjectId, user=Depends(get_curren
 async def list_programs(
     q: Optional[str] = None,
     level: Optional[Difficulty] = None,
-    location: Optional[str] = None,
+    interest: Optional[str] = None,
     equipment: Optional[Equipment] = None,
     status: str = "active",
     skip: int = 0,
@@ -137,8 +137,8 @@ async def list_programs(
 
     if level:
         filters.append(WorkoutProgram.level == level)
-    if location:
-        filters.append(WorkoutProgram.location == location)
+    if interest:
+        filters.append(WorkoutProgram.interest == interest)
     if equipment:
         filters.append(WorkoutProgram.equipment_required == equipment)
 

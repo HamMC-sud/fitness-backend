@@ -64,6 +64,33 @@ class AiChatOut(BaseModel):
     assistant_text: str
 
 
+class AiChatMessageOut(BaseModel):
+    id: str
+    role: str
+    text: str
+    created_at: Optional[datetime] = None
+
+
+class AiChatHistoryOut(BaseModel):
+    thread_id: str
+    items: List[AiChatMessageOut] = Field(default_factory=list)
+
+
+class AiDailyRecommendationOut(BaseModel):
+    id: str
+    date: str
+    text: str
+    saved: bool
+    opened_at: Optional[datetime] = None
+    saved_at: Optional[datetime] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AiDailyRecommendationSaveIn(BaseModel):
+    recommendation_id: Optional[str] = None
+    saved: Optional[bool] = None
+
+
 class RewardedGrantIn(BaseModel):
     nonce: str = Field(min_length=1, max_length=128)
     provider: str = Field(min_length=1, max_length=32)
@@ -84,3 +111,58 @@ class AiAdjustIn(BaseModel):
 class AiAdjustOut(BaseModel):
     request_id: str
     plan: AiPlanOut
+
+
+class AiPlanDayCardOut(BaseModel):
+    date: str
+    weekday: str
+    type: str
+    title: str
+    duration_min: Optional[int] = None
+    intensity: Optional[str] = None
+    focus: Optional[str] = None
+
+
+class AiPlanWeekOut(BaseModel):
+    week_index: int
+    days: List[AiPlanDayCardOut] = Field(default_factory=list)
+
+
+class AiPlanWeeksOut(BaseModel):
+    plan_id: str
+    weeks: List[AiPlanWeekOut] = Field(default_factory=list)
+
+
+class AiPlanDayDetailOut(BaseModel):
+    plan_id: str
+    date: str
+    type: str
+    workout_template: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AiPlanDayEditIn(BaseModel):
+    duration_min: Optional[int] = Field(default=None, ge=10, le=120)
+    intensity: Optional[str] = None  # low|moderate|high or beginner|intermediate|advanced
+    mark_rest_day: Optional[bool] = None
+    delete_session: Optional[bool] = None
+    title: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    focus: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+class AiSwapOptionOut(BaseModel):
+    swap_id: str
+    title: str
+    duration_min: int
+    intensity: str
+    focus: str
+    workout_template: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AiSwapOptionsOut(BaseModel):
+    plan_id: str
+    date: str
+    items: List[AiSwapOptionOut] = Field(default_factory=list)
+
+
+class AiApplySwapIn(BaseModel):
+    swap_id: str = Field(min_length=1, max_length=64)

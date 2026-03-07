@@ -31,7 +31,7 @@ class WorkoutProgramOut(BaseModel):
     slug: str
     title: LocalizedText
     level: Difficulty
-    location: Optional[str] = None
+    interest: Optional[str] = None
     equipment_required: List[Equipment]
     status: str
     schedule: Optional[List[Dict[str, Any]]] = None
@@ -127,18 +127,18 @@ class WorkoutProgramCreateIn(BaseModel):
     session_minutes: int = Field(ge=15, le=120)
     level: Difficulty
     goals: List[str] = Field(default_factory=list)
-    location: str = "home"
+    interest: str = "home"
     equipment_required: List[Equipment] = Field(default_factory=list)
     preview: Dict[str, Optional[str]] = Field(default_factory=dict)
     schedule: List[ProgramScheduleItemIn] = Field(default_factory=list)
     status: str = "active"
 
-    @field_validator("location")
+    @field_validator("interest")
     @classmethod
-    def validate_location(cls, v: str) -> str:
+    def validate_interest(cls, v: str) -> str:
         v = (v or "").lower().strip()
         if v not in ("home", "gym"):
-            raise ValueError("location must be 'home' or 'gym'")
+            raise ValueError("interest must be 'home' or 'gym'")
         return v
 
 
@@ -151,7 +151,7 @@ class WorkoutProgramUpdateIn(BaseModel):
     session_minutes: Optional[int] = Field(default=None, ge=15, le=120)
     level: Optional[Difficulty] = None
     goals: Optional[List[str]] = None
-    location: Optional[str] = None
+    interest: Optional[str] = None
     equipment_required: Optional[List[Equipment]] = None
     preview: Optional[Dict[str, Optional[str]]] = None
     schedule: Optional[List[ProgramScheduleItemIn]] = None

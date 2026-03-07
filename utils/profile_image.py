@@ -6,6 +6,7 @@ import os
 import uuid
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
@@ -49,7 +50,42 @@ def _public_base_url() -> str:
     return "http://26.214.57.127:8000"
 
 
-def save_base64_profile_image(base64_value: str) -> str:
+def _extract_managed_folder(existing_photo_url: Optional[str]) -> Optional[Path]:
+    if not existing_photo_url:
+        return None
+
+    raw = existing_photo_url.strip()
+    if not raw:
+        return None
+
+    if raw.startswith("http://") or raw.startswith("https://"):
+        path = urlparse(raw).path or ""
+    else:
+        path = raw
+
+    if not path.startswith("/statics/"):
+        return None
+
+    rel = path[len("/statics/") :].strip("/")
+    parts = Path(rel).parts
+    if len(parts) < 2:
+        return None
+
+    folder_name = parts[0]
+    if Path(folder_name).name != folder_name:
+        return None
+
+    folder_path = (STATICS_DIR / folder_name).resolve()
+    statics_root = STATICS_DIR.resolve()
+    try:
+        folder_path.relative_to(statics_root)
+    except ValueError:
+        return None
+
+    return folder_path
+
+
+def save_base64_profile_image(base64_value: str, existing_photo_url: Optional[str] = None) -> str:
     mime_type, b64_data = _parse_data_uri_base64(base64_value)
 
     try:
@@ -85,9 +121,19 @@ def save_base64_profile_image(base64_value: str) -> str:
     if ext_from_mime and ext_from_bytes and ext_from_mime != ext_from_bytes:
         raise HTTPException(status_code=400, detail="Image MIME type does not match file content")
 
-    folder_name = uuid.uuid4().hex
-    folder_path = STATICS_DIR / folder_name
+    managed_folder = _extract_managed_folder(existing_photo_url)
+    if managed_folder is not None:
+        folder_path = managed_folder
+        folder_name = folder_path.name
+    else:
+        folder_name = uuid.uuid4().hex
+        folder_path = STATICS_DIR / folder_name
+
     folder_path.mkdir(parents=True, exist_ok=True)
+
+    for child in folder_path.iterdir():
+        if child.is_file():
+            child.unlink()
 
     filename = f"image{ext}"
     file_path = folder_path / filename
@@ -97,7 +143,7 @@ def save_base64_profile_image(base64_value: str) -> str:
     return f"{_public_base_url()}/statics/{folder_name}/{filename}"
 
 
-def normalize_profile_photo_value(photo_value: Optional[str]) -> Optional[str]:
+def normalize_profile_photo_value(photo_value: Optional[str], existing_photo_url: Optional[str] = None) -> Optional[str]:
     if not photo_value:
         return photo_value
     raw = photo_value.strip()
@@ -105,5 +151,4 @@ def normalize_profile_photo_value(photo_value: Optional[str]) -> Optional[str]:
     if raw.startswith("http://") or raw.startswith("https://") or raw.startswith("/statics/"):
         return raw
     # Otherwise treat as base64/image data and store into statics.
-    return save_base64_profile_image(raw)
-
+    return save_base64_profile_image(raw, existing_photo_url=existing_photo_url)

@@ -19,7 +19,7 @@ from .subscription import SubscriptionPlan, Subscription, SubscriptionTransactio
 from .promo import PromoCodeBatch, PromoCode, PromoRedemption
 from .ai import (
     AiUsageMonthly, AiPlan, AiRequest,
-    AiChatThread, AiChatMessage, RewardedGrant
+    AiChatThread, AiChatMessage, AiDailyRecommendation, RewardedGrant
 )
 from .notifications import Notification, ReminderSettings
 from .admin import AdminUser, AdminAuditLog
@@ -45,7 +45,7 @@ ALL_MODELS = [
     PromoCodeBatch, PromoCode, PromoRedemption,
 
     AiUsageMonthly, AiPlan, AiRequest,
-    AiChatThread, AiChatMessage, RewardedGrant,
+    AiChatThread, AiChatMessage, AiDailyRecommendation, RewardedGrant,
 
     Notification, ReminderSettings,
 

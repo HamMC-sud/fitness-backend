@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from beanie.odm.fields import PydanticObjectId
@@ -15,6 +17,7 @@ from api.auth.config import get_current_user
 from models import (
     AiChatMessage,
     AiChatThread,
+    AiDailyRecommendation,
     AiPlan,
     AiRequest,
     AiUsageMonthly,
@@ -27,12 +30,24 @@ from schemas.ai import (
     AiAdjustIn,
     AiAdjustOut,
     AiChatIn,
+    AiChatHistoryOut,
+    AiChatMessageOut,
     AiChatOut,
+    AiDailyRecommendationOut,
+    AiDailyRecommendationSaveIn,
     AiGenerateIn,
     AiGenerateOut,
     AiLimitsOut,
     AiPlanDayOut,
+    AiPlanDayCardOut,
+    AiPlanDayDetailOut,
+    AiPlanDayEditIn,
     AiPlanOut,
+    AiPlanWeekOut,
+    AiPlanWeeksOut,
+    AiSwapOptionOut,
+    AiSwapOptionsOut,
+    AiApplySwapIn,
     AiRerollIn,
     AiRerollOut,
     RewardedGrantIn,
@@ -40,6 +55,7 @@ from schemas.ai import (
 )
 
 router = APIRouter(tags=["ai"])
+logger = logging.getLogger(__name__)
 
 YC_API_KEY_SECRET = (os.getenv("YC_API_KEY_SECRET") or "").strip()
 YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or "").strip()
@@ -174,6 +190,74 @@ def plan_to_out(plan: AiPlan) -> AiPlanOut:
     )
 
 
+def _today_iso_for_user(current_user: Any) -> str:
+    tz_name = _as_str(getattr(current_user, "timezone", "UTC")) or "UTC"
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+    return utcnow().astimezone(tz).date().isoformat()
+
+
+def _daily_rec_to_out(rec: AiDailyRecommendation) -> AiDailyRecommendationOut:
+    return AiDailyRecommendationOut(
+        id=str(rec.id),
+        date=rec.date,
+        text=rec.text,
+        saved=bool(rec.saved),
+        opened_at=rec.opened_at,
+        saved_at=rec.saved_at,
+        meta=rec.meta or {},
+    )
+
+
+async def _build_daily_recommendation(current_user: Any, day_iso: str) -> tuple[str, Dict[str, Any]]:
+    plan = await get_active_plan(current_user.id)
+    if plan:
+        for d in (plan.days or []):
+            if str(getattr(d, "date", "")) != day_iso:
+                continue
+            d_type = str(getattr(d, "type", "recovery"))
+            wt = getattr(d, "workout_template", None) or {}
+            if d_type == "workout":
+                title = str(wt.get("title") or "Workout session")
+                duration = wt.get("duration_min")
+                focus = wt.get("focus")
+                chunks = [f"Today: {title}."]
+                if duration:
+                    chunks.append(f"Duration: {duration} min.")
+                if focus:
+                    chunks.append(f"Focus: {focus}.")
+                chunks.append("Keep strict form and finish with light stretching.")
+                return " ".join(chunks), {
+                    "source": "active_plan",
+                    "plan_id": str(plan.id),
+                    "type": d_type,
+                    "date": day_iso,
+                }
+            recovery_text = str(wt.get("recommendation") or "Mobility + light walk 20-30 min.")
+            return recovery_text, {
+                "source": "active_plan",
+                "plan_id": str(plan.id),
+                "type": d_type,
+                "date": day_iso,
+            }
+
+    return (
+        "Daily recommendation: 20-30 min brisk walk, 5 min mobility, and drink enough water.",
+        {"source": "fallback", "date": day_iso},
+    )
+
+
+def _is_unsaved_expired(rec: AiDailyRecommendation, now: datetime) -> bool:
+    if rec.saved or rec.removed_at is not None or rec.opened_at is None:
+        return False
+    opened = rec.opened_at
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    return (now - opened) >= timedelta(days=1)
+
+
 def _goal_to_types(goals: list[str], preferences: list[str]) -> list[str]:
     types: list[str] = []
     mapping = {
@@ -212,6 +296,21 @@ def _difficulty_to_intensity(diff: str) -> str:
     if d == "intermediate":
         return "moderate"
     return "low"
+
+
+def _normalize_intensity(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    mapping = {
+        "beginner": "low",
+        "intermediate": "moderate",
+        "advanced": "high",
+        "low": "low",
+        "moderate": "moderate",
+        "high": "high",
+    }
+    return mapping.get(v)
 
 
 def _merge_prompt_with_profile(current_user: Any, prompt_meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -341,10 +440,12 @@ async def yandex_completion(
     max_tokens: int = 1400,
 ) -> Optional[str]:
     if not YC_API_KEY_SECRET:
+        logger.warning("Yandex completion skipped: YC_API_KEY_SECRET is empty")
         return None
 
     model_uri = YC_GPT_MODEL_URI or (f"gpt://{YC_FOLDER_ID}/yandexgpt/latest" if YC_FOLDER_ID else "")
     if not model_uri:
+        logger.warning("Yandex completion skipped: model URI is empty (YC_GPT_MODEL_URI/YC_FOLDER_ID)")
         return None
 
     body = {
@@ -364,16 +465,30 @@ async def yandex_completion(
                 headers={"Authorization": f"Api-Key {YC_API_KEY_SECRET}"},
                 json=body,
             )
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        logger.error("Yandex completion HTTP error: %s", str(exc))
         return None
 
     if r.status_code != 200:
+        response_preview = (r.text or "")[:1000]
+        logger.warning(
+            "Yandex completion non-200 response: status=%s model_uri=%s body=%s",
+            r.status_code,
+            model_uri,
+            response_preview,
+        )
         return None
 
     try:
         data = r.json()
         return str(data["result"]["alternatives"][0]["message"]["text"]).strip()
-    except Exception:
+    except Exception as exc:
+        response_preview = (r.text or "")[:1000]
+        logger.error(
+            "Yandex completion parse error: %s; response=%s",
+            str(exc),
+            response_preview,
+        )
         return None
 
 
@@ -896,6 +1011,178 @@ async def get_current_plan(current_user=Depends(get_current_user)):
     return plan_to_out(plan)
 
 
+@router.get("/ai/recommendation/daily", response_model=AiDailyRecommendationOut)
+async def ai_daily_recommendation(mark_opened: bool = True, current_user=Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    now = utcnow()
+    # Lazy cleanup: remove unsaved opened recommendations older than 1 day.
+    stale = await AiDailyRecommendation.find(
+        AiDailyRecommendation.user_id == current_user.id,
+        AiDailyRecommendation.saved == False,  # noqa: E712
+        AiDailyRecommendation.opened_at != None,  # noqa: E711
+        AiDailyRecommendation.removed_at == None,  # noqa: E711
+    ).to_list()
+    for s in stale:
+        if _is_unsaved_expired(s, now):
+            s.removed_at = now
+            await s.save()
+
+    day_iso = _today_iso_for_user(current_user)
+    rec = await AiDailyRecommendation.find_one(
+        AiDailyRecommendation.user_id == current_user.id,
+        AiDailyRecommendation.date == day_iso,
+        AiDailyRecommendation.removed_at == None,  # noqa: E711
+    )
+
+    if not rec:
+        text, meta = await _build_daily_recommendation(current_user, day_iso)
+        rec = AiDailyRecommendation(
+            user_id=current_user.id,
+            date=day_iso,
+            text=text,
+            meta=meta,
+            saved=False,
+        )
+        await rec.insert()
+
+    if mark_opened:
+        if rec.opened_at is None:
+            rec.opened_at = now
+            await rec.save()
+
+    return _daily_rec_to_out(rec)
+
+
+@router.post("/ai/recommendation/daily/save", response_model=AiDailyRecommendationOut)
+async def ai_daily_recommendation_save(
+    payload: AiDailyRecommendationSaveIn,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    rec = None
+    if payload.recommendation_id:
+        try:
+            rid = PydanticObjectId(payload.recommendation_id)
+        except Exception:
+            raise HTTPException(400, "Invalid recommendation_id")
+        rec = await AiDailyRecommendation.get(rid)
+        if not rec or rec.user_id != current_user.id:
+            raise HTTPException(404, "Recommendation not found")
+    else:
+        day_iso = _today_iso_for_user(current_user)
+        rec = await AiDailyRecommendation.find_one(
+            AiDailyRecommendation.user_id == current_user.id,
+            AiDailyRecommendation.date == day_iso,
+            AiDailyRecommendation.removed_at == None,  # noqa: E711
+        )
+        if not rec:
+            raise HTTPException(404, "Recommendation not found")
+
+    if rec.removed_at is not None:
+        raise HTTPException(409, "Recommendation was removed")
+
+    now = utcnow()
+    target_saved = payload.saved if payload.saved is not None else (not rec.saved)
+    if target_saved:
+        rec.saved = True
+        rec.saved_at = now
+        if rec.opened_at is None:
+            rec.opened_at = now
+    else:
+        rec.saved = False
+        rec.saved_at = None
+        # Start unsaved retention window from unsave action.
+        rec.opened_at = now
+    await rec.save()
+
+    return _daily_rec_to_out(rec)
+
+
+@router.delete("/ai/recommendation/daily")
+async def ai_daily_recommendation_delete(
+    recommendation_id: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    rec = None
+    if recommendation_id:
+        try:
+            rid = PydanticObjectId(recommendation_id)
+        except Exception:
+            raise HTTPException(400, "Invalid recommendation_id")
+        rec = await AiDailyRecommendation.get(rid)
+        if not rec or rec.user_id != current_user.id:
+            raise HTTPException(404, "Recommendation not found")
+    else:
+        day_iso = _today_iso_for_user(current_user)
+        rec = await AiDailyRecommendation.find_one(
+            AiDailyRecommendation.user_id == current_user.id,
+            AiDailyRecommendation.date == day_iso,
+            AiDailyRecommendation.removed_at == None,  # noqa: E711
+        )
+        if not rec:
+            raise HTTPException(404, "Recommendation not found")
+
+    if rec.saved:
+        raise HTTPException(409, "Saved recommendation cannot be removed")
+
+    rec.removed_at = utcnow()
+    await rec.save()
+    return {"status": "ok"}
+
+
+@router.get("/ai/chat/history", response_model=AiChatHistoryOut)
+async def ai_chat_history(
+    thread_id: Optional[str] = None,
+    limit: int = 50,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    safe_limit = max(1, min(int(limit), 200))
+
+    thread = None
+    if thread_id:
+        try:
+            tid = PydanticObjectId(thread_id)
+        except Exception:
+            raise HTTPException(400, "Invalid thread_id")
+        thread = await AiChatThread.get(tid)
+        if not thread or thread.user_id != current_user.id:
+            raise HTTPException(404, "Thread not found")
+    else:
+        thread = await AiChatThread.find(
+            AiChatThread.user_id == current_user.id
+        ).sort("-updated_at").first_or_none()
+        if not thread:
+            raise HTTPException(404, "No chat history")
+
+    rows = await AiChatMessage.find(
+        AiChatMessage.thread_id == thread.id
+    ).sort("-created_at").limit(safe_limit).to_list()
+    rows = list(reversed(rows))
+
+    return AiChatHistoryOut(
+        thread_id=str(thread.id),
+        items=[
+            AiChatMessageOut(
+                id=str(m.id),
+                role=str(m.role),
+                text=str(m.text),
+                created_at=m.created_at,
+            )
+            for m in rows
+        ],
+    )
+
+
 @router.post("/ai/chat", response_model=AiChatOut)
 async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     if not current_user:
@@ -987,6 +1274,42 @@ def _apply_adjustments_to_meta(base: Dict[str, Any], adjustments: Dict[str, Any]
     return merged
 
 
+def _find_day_index(plan: AiPlan, day_iso: str) -> int:
+    for i, d in enumerate(plan.days or []):
+        if str(getattr(d, "date", "")) == day_iso:
+            return i
+    return -1
+
+
+def _day_title(day_obj: Any) -> str:
+    d_type = str(getattr(day_obj, "type", "recovery"))
+    wt = getattr(day_obj, "workout_template", None) or {}
+    if d_type == "workout":
+        return str(wt.get("title") or "Workout")
+    return str(wt.get("title") or "Recovery day")
+
+
+def _day_duration(day_obj: Any) -> Optional[int]:
+    wt = getattr(day_obj, "workout_template", None) or {}
+    v = wt.get("duration_min")
+    try:
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _day_intensity(day_obj: Any) -> Optional[str]:
+    wt = getattr(day_obj, "workout_template", None) or {}
+    v = wt.get("intensity")
+    return str(v) if v else None
+
+
+def _day_focus(day_obj: Any) -> Optional[str]:
+    wt = getattr(day_obj, "workout_template", None) or {}
+    v = wt.get("focus")
+    return str(v) if v else None
+
+
 @router.post("/ai/adjust-plan", response_model=AiAdjustOut)
 async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_user)):
     if not current_user:
@@ -1035,3 +1358,229 @@ async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_u
     await adjusted_plan.insert()
 
     return AiAdjustOut(request_id=str(req.id), plan=plan_to_out(adjusted_plan))
+
+
+@router.get("/ai/plan/weeks", response_model=AiPlanWeeksOut)
+async def ai_plan_weeks(current_user=Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    weeks: list[AiPlanWeekOut] = []
+    days = plan.days or []
+    for w_idx in range(0, len(days), 7):
+        chunk = days[w_idx : w_idx + 7]
+        cards: list[AiPlanDayCardOut] = []
+        for d in chunk:
+            day_iso = str(getattr(d, "date", ""))
+            try:
+                weekday = datetime.strptime(day_iso, "%Y-%m-%d").strftime("%A").upper()
+            except Exception:
+                weekday = ""
+            cards.append(
+                AiPlanDayCardOut(
+                    date=day_iso,
+                    weekday=weekday,
+                    type=str(getattr(d, "type", "recovery")),
+                    title=_day_title(d),
+                    duration_min=_day_duration(d),
+                    intensity=_day_intensity(d),
+                    focus=_day_focus(d),
+                )
+            )
+        weeks.append(AiPlanWeekOut(week_index=(w_idx // 7) + 1, days=cards))
+
+    return AiPlanWeeksOut(plan_id=str(plan.id), weeks=weeks)
+
+
+@router.get("/ai/plan/day", response_model=AiPlanDayDetailOut)
+async def ai_plan_day(date: str, current_user=Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    idx = _find_day_index(plan, date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    day_obj = plan.days[idx]
+    return AiPlanDayDetailOut(
+        plan_id=str(plan.id),
+        date=str(getattr(day_obj, "date", date)),
+        type=str(getattr(day_obj, "type", "recovery")),
+        workout_template=getattr(day_obj, "workout_template", None) or {},
+    )
+
+
+@router.patch("/ai/plan/day", response_model=AiPlanDayDetailOut)
+async def ai_plan_day_edit(
+    date: str,
+    payload: AiPlanDayEditIn,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    idx = _find_day_index(plan, date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    days = plan.days or []
+    day_obj = days[idx]
+    day_type = str(getattr(day_obj, "type", "recovery"))
+    wt = dict(getattr(day_obj, "workout_template", None) or {})
+    patch = payload.model_dump(exclude_unset=True)
+
+    to_rest = bool(patch.get("mark_rest_day")) or bool(patch.get("delete_session"))
+    if to_rest:
+        day_obj.type = "recovery"
+        day_obj.workout_template = {
+            "title": "Recovery day",
+            "recommendation": "Mobility + light walk 20-30 min.",
+        }
+    else:
+        if day_type != "workout":
+            day_obj.type = "workout"
+            wt = {
+                "title": "Edited workout",
+                "duration_min": 35,
+                "intensity": "moderate",
+                "focus": "strength",
+                "exercises": [],
+            }
+
+        if "duration_min" in patch and patch["duration_min"] is not None:
+            wt["duration_min"] = int(patch["duration_min"])
+        if "intensity" in patch and patch["intensity"]:
+            norm = _normalize_intensity(patch["intensity"])
+            if not norm:
+                raise HTTPException(400, "Invalid intensity")
+            wt["intensity"] = norm
+        if "title" in patch and patch["title"]:
+            wt["title"] = patch["title"].strip()
+        if "focus" in patch and patch["focus"]:
+            wt["focus"] = patch["focus"].strip().lower()
+
+        day_obj.workout_template = wt
+
+    days[idx] = day_obj
+    plan.days = days
+    await plan.save()
+
+    return AiPlanDayDetailOut(
+        plan_id=str(plan.id),
+        date=str(getattr(day_obj, "date", date)),
+        type=str(getattr(day_obj, "type", "recovery")),
+        workout_template=getattr(day_obj, "workout_template", None) or {},
+    )
+
+
+@router.get("/ai/plan/day/swaps", response_model=AiSwapOptionsOut)
+async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    idx = _find_day_index(plan, date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    day_obj = plan.days[idx]
+    if str(getattr(day_obj, "type", "")) != "workout":
+        raise HTTPException(400, "Swaps available only for workout day")
+
+    safe_limit = max(1, min(int(limit), 6))
+    meta = dict(plan.created_from or {})
+    inputs = _merge_prompt_with_profile(current_user, meta)
+    target_types = _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
+    injuries = set(_as_str_list(inputs.get("injuries")))
+    equipment = set(_as_str_list(inputs.get("equipment")))
+    exercises = await _load_exercises_for_planning(injuries=injuries, equipment=equipment, target_types=set(target_types))
+
+    current_focus = _day_focus(day_obj) or ""
+    focuses = [t for t in target_types if t != current_focus]
+    if not focuses:
+        focuses = target_types or ["strength", "cardio", "hiit"]
+
+    items: list[AiSwapOptionOut] = []
+    try:
+        day_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except Exception:
+        day_date = utcnow().date()
+
+    for i, focus in enumerate(focuses[:safe_limit]):
+        template = _build_workout_template(
+            day_date=day_date,
+            week_idx=0,
+            day_idx=i,
+            inputs=inputs,
+            exercises=exercises,
+            target_types=[focus],
+            rng_seed=f"swap:{current_user.id}:{date}:{i}",
+        )
+        items.append(
+            AiSwapOptionOut(
+                swap_id=f"swap_{i}",
+                title=str(template.get("title") or "Swap workout"),
+                duration_min=int(template.get("duration_min") or 35),
+                intensity=str(template.get("intensity") or "moderate"),
+                focus=str(template.get("focus") or focus),
+                workout_template=template,
+            )
+        )
+
+    return AiSwapOptionsOut(plan_id=str(plan.id), date=date, items=items)
+
+
+@router.post("/ai/plan/day/swap", response_model=AiPlanDayDetailOut)
+async def ai_plan_day_apply_swap(
+    date: str,
+    payload: AiApplySwapIn,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    idx = _find_day_index(plan, date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    # Regenerate options and find chosen swap by prefix index from swap_id
+    swaps = await ai_plan_day_swaps(date=date, limit=6, current_user=current_user)
+    chosen = None
+    for s in swaps.items:
+        if s.swap_id == payload.swap_id:
+            chosen = s
+            break
+    if not chosen:
+        raise HTTPException(404, "Swap option not found")
+
+    day_obj = plan.days[idx]
+    day_obj.type = "workout"
+    day_obj.workout_template = dict(chosen.workout_template or {})
+    plan.days[idx] = day_obj
+    await plan.save()
+
+    return AiPlanDayDetailOut(
+        plan_id=str(plan.id),
+        date=str(getattr(day_obj, "date", date)),
+        type=str(getattr(day_obj, "type", "workout")),
+        workout_template=getattr(day_obj, "workout_template", None) or {},
+    )

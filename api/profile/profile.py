@@ -38,9 +38,15 @@ async def get_profile(current_user: User = Depends(get_current_user)):
 async def update_profile(payload: ProfileUpdateIn, current_user: User = Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
-    patch = payload.model_dump(exclude_unset=True)
-    if not patch:
+    incoming_patch = payload.model_dump(exclude_unset=True)
+    if not incoming_patch:
         return _strip_password(current_user)
+
+    user_patch: Dict[str, Any] = {}
+    if "language" in incoming_patch:
+        user_patch["language"] = incoming_patch.pop("language")
+
+    patch = incoming_patch
 
     base_profile = {}
     if getattr(current_user, "profile", None):
@@ -54,21 +60,25 @@ async def update_profile(payload: ProfileUpdateIn, current_user: User = Depends(
         patch["schedule"] = {**base_schedule, **patch["schedule"]}
 
     if "photo_url" in patch and patch["photo_url"]:
-        patch["photo_url"] = normalize_profile_photo_value(patch["photo_url"])
+        patch["photo_url"] = normalize_profile_photo_value(
+            patch["photo_url"],
+            existing_photo_url=base_profile.get("photo_url"),
+        )
 
-    try:
-        merged_profile = UserProfile(**{**base_profile, **patch})
-    except ValidationError as exc:
-        raise HTTPException(status_code=400, detail=exc.errors()) from exc
+    set_patch: Dict[str, Any] = {}
+    if patch:
+        try:
+            merged_profile = UserProfile(**{**base_profile, **patch})
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=exc.errors()) from exc
+        set_patch["profile"] = merged_profile.model_dump()
+        set_patch["flags.onboarding_completed"] = True
 
-    await User.find_one(User.id == current_user.id).update(
-        {
-            "$set": {
-                "profile": merged_profile.model_dump(),
-                "flags.onboarding_completed": True,
-            }
-        }
-    )
+    if user_patch:
+        set_patch.update(user_patch)
+
+    if set_patch:
+        await User.find_one(User.id == current_user.id).update({"$set": set_patch})
 
     updated_user = await User.get(current_user.id)
     if not updated_user:

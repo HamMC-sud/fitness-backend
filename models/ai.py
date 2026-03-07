@@ -89,6 +89,25 @@ class AiChatMessage(BaseDoc):
         ]
 
 
+class AiDailyRecommendation(BaseDoc):
+    user_id: PydanticObjectId
+    date: str  # YYYY-MM-DD in user's timezone
+    text: str
+    meta: Dict[str, object] = Field(default_factory=dict)
+    saved: bool = False
+    opened_at: Optional[datetime] = None
+    saved_at: Optional[datetime] = None
+    removed_at: Optional[datetime] = None
+
+    class Settings:
+        name = "ai_daily_recommendations"
+        indexes = [
+            IndexModel([("user_id", ASCENDING), ("date", ASCENDING)], unique=True),
+            IndexModel([("user_id", ASCENDING), ("created_at", DESCENDING)]),
+            IndexModel([("user_id", ASCENDING), ("saved", ASCENDING)]),
+        ]
+
+
 class RewardedGrant(BaseDoc):
     user_id: PydanticObjectId
     nonce: str

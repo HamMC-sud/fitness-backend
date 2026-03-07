@@ -8,7 +8,7 @@ from models.enums import (
     Equipment,
     Injury,
     ExerciseMode,
-    Location,
+    Interest,
     MuscleGroup,
 )
 
@@ -29,15 +29,15 @@ class ExerciseOut(BaseModel):
     code: str
 
     name: I18nTextOut
-    status: str  # ⚠️ make Enum if possible
+    status: str  # make Enum if possible
 
     difficulty: Difficulty
     workout_type: List[WorkoutType]
 
     equipment: List[Equipment]
-    location: List[Location]  # ✅ REQUIRED
+    interest: List[Interest]  # required
 
-    muscle_groups: List[MuscleGroup]  # ✅ ENUM
+    muscle_groups: List[MuscleGroup]  # enum
 
     contraindications: List[Injury]
 

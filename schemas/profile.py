@@ -12,6 +12,7 @@ from models.enums import (
     Injury,
     Language,
     UnitSystem,
+    Interest,
 )
 
 
@@ -24,6 +25,8 @@ class ProfileUpdateIn(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=80)
     gender: Optional[Gender] = None
     birth_date: Optional[date] = None
+    interest: Optional[Interest] = None
+    language: Optional[Language] = None
     height_cm: Optional[int] = Field(default=None, ge=50, le=250)
     weight_kg: Optional[float] = Field(default=None, ge=20, le=300)
     target_weight_kg: Optional[float] = Field(default=None, ge=20, le=300)

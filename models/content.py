@@ -159,7 +159,7 @@ class WorkoutProgram(BaseDoc):
 
     level: Difficulty
     goals: List[str] = Field(default_factory=list)
-    location: str = "home"
+    interest: str = "home"
     equipment_required: List[Equipment] = Field(default_factory=list)
 
     preview: Dict[str, Optional[str]] = Field(default_factory=dict)
@@ -172,7 +172,7 @@ class WorkoutProgram(BaseDoc):
         indexes = [
             IndexModel([("slug", ASCENDING)], unique=True),
             IndexModel([("level", ASCENDING)]),
-            IndexModel([("location", ASCENDING)]),
+            IndexModel([("interest", ASCENDING)]),
         ]
 
 

@@ -31,7 +31,7 @@ class PushProvider(str, Enum):
     fcm = "fcm"
     rustore = "rustore"
 
-class Location(str, Enum):
+class Interest(str, Enum):
     home = "home"
     gym = "gym"
 
