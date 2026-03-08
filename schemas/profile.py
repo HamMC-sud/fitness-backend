@@ -1,7 +1,7 @@
 from datetime import date
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from models.enums import (
     Gender,
@@ -39,6 +39,13 @@ class ProfileUpdateIn(BaseModel):
 
     schedule: Optional[UserScheduleIn] = None
     photo_url: Optional[str] = None
+
+    @field_validator("equipment", mode="before")
+    @classmethod
+    def normalize_equipment(cls, v):
+        if v is None:
+            return None
+        return Equipment.normalize_many(v)
 
 
 class ProfileSettingsUpdateIn(BaseModel):

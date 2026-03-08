@@ -11,6 +11,7 @@ from api.api_router import api_router
 
 # Keep startup directories aligned with mounted static path (/statics -> statics/*).
 os.makedirs("statics", exist_ok=True)
+os.makedirs("upload_exercises", exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,6 +36,7 @@ app.add_middleware(
 )
 
 app.mount("/statics", StaticFiles(directory="statics"), name="statics")
+app.mount("/upload_exercises", StaticFiles(directory="upload_exercises"), name="upload_exercises")
 
 app.include_router(api_router)
 

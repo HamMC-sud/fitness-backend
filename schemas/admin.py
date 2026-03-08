@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from models.content import ExerciseDefaults, ExerciseMedia, I18nList
 from models.enums import Difficulty, Equipment, ExerciseMode, Injury, SubscriptionStatus, WorkoutType
@@ -27,6 +27,11 @@ class AdminExerciseCreateIn(BaseModel):
     instructions: Dict[str, List[str]] = Field(default_factory=dict)
     status: str = "active"
 
+    @field_validator("equipment", mode="before")
+    @classmethod
+    def normalize_equipment(cls, v):
+        return Equipment.normalize_many(v)
+
 
 class AdminExerciseUpdateIn(BaseModel):
     code: Optional[str] = None
@@ -45,6 +50,13 @@ class AdminExerciseUpdateIn(BaseModel):
     calories_per_minute: Optional[float] = Field(default=None, ge=0)
     instructions: Optional[Dict[str, List[str]]] = None
     status: Optional[str] = None
+
+    @field_validator("equipment", mode="before")
+    @classmethod
+    def normalize_equipment(cls, v):
+        if v is None:
+            return None
+        return Equipment.normalize_many(v)
 
 
 class AdminUserItemOut(BaseModel):

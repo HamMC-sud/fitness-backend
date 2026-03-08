@@ -63,6 +63,11 @@ class Exercise(BaseDoc):
     instructions: Dict[str, List[str]] = Field(default_factory=dict)
     status: str = "active"
 
+    @field_validator("equipment", mode="before")
+    @classmethod
+    def normalize_equipment(cls, v: Any):
+        return Equipment.normalize_many(v)
+
     class Settings:
         name = "exercises"
         indexes = [
@@ -124,6 +129,11 @@ class WorkoutTemplate(BaseDoc):
 
     status: str = "active"
 
+    @field_validator("equipment_required", mode="before")
+    @classmethod
+    def normalize_equipment_required(cls, v: Any):
+        return Equipment.normalize_many(v)
+
     class Settings:
         name = "workout_templates"
         indexes = [
@@ -166,6 +176,11 @@ class WorkoutProgram(BaseDoc):
     schedule: List[ProgramScheduleItem] = Field(default_factory=list)
 
     status: str = "active"
+
+    @field_validator("equipment_required", mode="before")
+    @classmethod
+    def normalize_equipment_required(cls, v: Any):
+        return Equipment.normalize_many(v)
 
     class Settings:
         name = "workout_programs"

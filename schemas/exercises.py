@@ -8,7 +8,6 @@ from models.enums import (
     Equipment,
     Injury,
     ExerciseMode,
-    Interest,
     MuscleGroup,
 )
 
@@ -21,7 +20,8 @@ class I18nTextOut(BaseModel):
 class ExerciseMediaOut(BaseModel):
     mode: ExerciseMode
     video_url: Optional[str] = None
-    image_url: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    duration_seconds: Optional[int] = None
 
 
 class ExerciseOut(BaseModel):
@@ -29,15 +29,13 @@ class ExerciseOut(BaseModel):
     code: str
 
     name: I18nTextOut
-    status: str  # make Enum if possible
+    status: str
 
     difficulty: Difficulty
     workout_type: List[WorkoutType]
 
     equipment: List[Equipment]
-    interest: List[Interest]  # required
-
-    muscle_groups: List[MuscleGroup]  # enum
+    muscle_groups: List[MuscleGroup]
 
     contraindications: List[Injury]
 
@@ -50,3 +48,13 @@ class ExerciseListOut(BaseModel):
     total: int
     skip: int
     limit: int
+
+
+class ExerciseCategoryOut(BaseModel):
+    key: str
+    label: str
+    count: int
+
+
+class ExerciseCategoriesOut(BaseModel):
+    items: List[ExerciseCategoryOut]

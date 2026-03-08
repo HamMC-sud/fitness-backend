@@ -39,6 +39,11 @@ class UserProfile(BaseModel):
 
     schedule: UserSchedule
 
+    @field_validator("equipment", mode="before")
+    @classmethod
+    def normalize_equipment(cls, v):
+        return Equipment.normalize_many(v)
+
     @field_validator("goals")
     @classmethod
     def validate_goals(cls, v: List[Goal]):

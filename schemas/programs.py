@@ -101,6 +101,11 @@ class WorkoutTemplateCreateIn(BaseModel):
     equipment_required: List[Equipment] = Field(default_factory=list)
     status: str = "active"
 
+    @field_validator("equipment_required", mode="before")
+    @classmethod
+    def normalize_equipment_required(cls, v):
+        return Equipment.normalize_many(v)
+
 
 class WorkoutTemplateUpdateIn(BaseModel):
     title: Optional[I18nTextIn] = None
@@ -111,6 +116,13 @@ class WorkoutTemplateUpdateIn(BaseModel):
     steps: Optional[List[WorkoutStepIn]] = None
     equipment_required: Optional[List[Equipment]] = None
     status: Optional[str] = None
+
+    @field_validator("equipment_required", mode="before")
+    @classmethod
+    def normalize_equipment_required(cls, v):
+        if v is None:
+            return None
+        return Equipment.normalize_many(v)
 
 
 class ProgramScheduleItemIn(BaseModel):
@@ -132,6 +144,11 @@ class WorkoutProgramCreateIn(BaseModel):
     preview: Dict[str, Optional[str]] = Field(default_factory=dict)
     schedule: List[ProgramScheduleItemIn] = Field(default_factory=list)
     status: str = "active"
+
+    @field_validator("equipment_required", mode="before")
+    @classmethod
+    def normalize_equipment_required(cls, v):
+        return Equipment.normalize_many(v)
 
     @field_validator("interest")
     @classmethod
@@ -156,3 +173,10 @@ class WorkoutProgramUpdateIn(BaseModel):
     preview: Optional[Dict[str, Optional[str]]] = None
     schedule: Optional[List[ProgramScheduleItemIn]] = None
     status: Optional[str] = None
+
+    @field_validator("equipment_required", mode="before")
+    @classmethod
+    def normalize_equipment_required(cls, v):
+        if v is None:
+            return None
+        return Equipment.normalize_many(v)

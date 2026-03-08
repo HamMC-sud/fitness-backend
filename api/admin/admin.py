@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Reques
 from fastapi.responses import StreamingResponse
 from fastapi.security import OAuth2PasswordBearer
 from starlette.concurrency import run_in_threadpool
+from pymongo.errors import DuplicateKeyError
 
 from api.auth.config import (
     create_access_token,
@@ -122,7 +123,9 @@ MAX_VIDEO_BYTES = 300 * 1024 * 1024
 MAX_AUDIO_BYTES = 100 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 CONTENT_UPLOAD_DIR = Path("statics/uploads/content")
+EXERCISE_UPLOAD_DIR = CONTENT_UPLOAD_DIR / "exercises"
 SAFE_UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
+SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
 ALLOWED_MEDIA_EXTS = {
     ".mp4",
     ".mov",
@@ -164,6 +167,48 @@ def _guess_ext(content_type: Optional[str], original_name: Optional[str]) -> str
     if original_name and "." in original_name:
         return "." + original_name.rsplit(".", 1)[1].lower()
     return ".bin"
+
+
+def _safe_path_segment(raw: str) -> str:
+    cleaned = SAFE_PATH_SEGMENT_RE.sub("_", (raw or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "exercise"
+
+
+def _uploaded_exercise_media_url(request: Request, folder: str, file_name: str) -> str:
+    base = str(request.base_url).rstrip("/")
+    return f"{base}/statics/uploads/content/exercises/{folder}/{file_name}"
+
+
+async def save_exercise_media_file(
+    file: UploadFile,
+    exercise_folder: str,
+    slot: str,
+    max_bytes: int,
+    request: Request,
+    overwrite_existing: bool = True,
+) -> tuple[str, str]:
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail=f"{slot} file is empty")
+    if len(data) > max_bytes:
+        raise HTTPException(status_code=400, detail=f"{slot} file exceeds size limit")
+
+    ext = _guess_ext(file.content_type, file.filename)
+    folder = _safe_path_segment(exercise_folder)
+    out_dir = EXERCISE_UPLOAD_DIR / folder
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    file_name = f"{slot}{ext}"
+    out_path = out_dir / file_name
+    if out_path.exists() and not overwrite_existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"File '{folder}/{file_name}' already exists. Set overwrite_existing=true to replace it.",
+        )
+
+    out_path.write_bytes(data)
+    return _uploaded_exercise_media_url(request, folder, file_name), file_name
 
 
 async def save_upload_file(file: UploadFile, category: str, max_bytes: int, request: Request) -> tuple[str, str]:
@@ -596,6 +641,63 @@ async def admin_update_exercise(
     return doc
 
 
+@router.post("/content/exercises/{exercise_id}/upload-media")
+async def admin_upload_exercise_media(
+    exercise_id: PydanticObjectId,
+    request: Request,
+    overwrite_existing: bool = Form(default=True),
+    thumbnail_file: Optional[UploadFile] = File(default=None),
+    video_file: Optional[UploadFile] = File(default=None),
+    admin_user=Depends(require_admin_user),
+):
+    doc = await Exercise.get(exercise_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Exercise not found")
+
+    if not thumbnail_file and not video_file:
+        raise HTTPException(status_code=400, detail="thumbnail_file or video_file is required")
+
+    folder_key = doc.code or str(doc.id)
+    media = doc.media
+
+    if thumbnail_file:
+        if not (thumbnail_file.content_type or "").lower().startswith("image/"):
+            raise HTTPException(status_code=400, detail="thumbnail_file must be an image/* file")
+        thumb_url, _ = await save_exercise_media_file(
+            thumbnail_file,
+            exercise_folder=folder_key,
+            slot="thumbnail",
+            max_bytes=MAX_IMAGE_BYTES,
+            request=request,
+            overwrite_existing=overwrite_existing,
+        )
+        media.thumbnail_url = thumb_url
+
+    if video_file:
+        if not (video_file.content_type or "").lower().startswith("video/"):
+            raise HTTPException(status_code=400, detail="video_file must be a video/* file")
+        video_url, _ = await save_exercise_media_file(
+            video_file,
+            exercise_folder=folder_key,
+            slot="video",
+            max_bytes=MAX_VIDEO_BYTES,
+            request=request,
+            overwrite_existing=overwrite_existing,
+        )
+        media.video_url = video_url
+
+    doc.media = media
+    await doc.save()
+    return {
+        "status": "ok",
+        "exercise_id": str(doc.id),
+        "code": doc.code,
+        "folder": _safe_path_segment(folder_key),
+        "thumbnail_url": doc.media.thumbnail_url,
+        "video_url": doc.media.video_url,
+    }
+
+
 @router.delete("/content/exercises/{exercise_id}")
 async def admin_delete_exercise(exercise_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
     doc = await Exercise.get(exercise_id)
@@ -822,6 +924,11 @@ async def admin_generate_promocode_batch_screen(
     if not name:
         raise HTTPException(status_code=400, detail="campaign_name is required")
 
+    # Keep campaign names unique; return a clear API error instead of 500 on DB constraint hit.
+    existing_batch = await PromoCodeBatch.find_one(PromoCodeBatch.name == name)
+    if existing_batch:
+        raise HTTPException(status_code=409, detail="campaign_name already exists")
+
     batch = PromoCodeBatch(
         name=name,
         discount_percent=int(payload.discount_percent),
@@ -830,7 +937,10 @@ async def admin_generate_promocode_batch_screen(
         codes_count=payload.quantity,
         created_by_admin_id=admin_user.id,
     )
-    await batch.insert()
+    try:
+        await batch.insert()
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="campaign_name already exists")
 
     created = 0
     attempts = 0

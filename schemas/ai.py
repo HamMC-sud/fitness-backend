@@ -62,6 +62,7 @@ class AiChatOut(BaseModel):
     user_message_id: str
     assistant_message_id: str
     assistant_text: str
+    action: Optional[Dict[str, Any]] = None
 
 
 class AiChatMessageOut(BaseModel):
@@ -137,7 +138,7 @@ class AiPlanDayDetailOut(BaseModel):
     plan_id: str
     date: str
     type: str
-    workout_template: Dict[str, Any] = Field(default_factory=dict)
+    workout_template: Optional[Dict[str, Any]] = None
 
 
 class AiPlanDayEditIn(BaseModel):

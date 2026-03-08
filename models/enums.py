@@ -63,12 +63,60 @@ class Preference(str, Enum):
 
 
 class Equipment(str, Enum):
-    bodyweight = "bodyweight"
-    dumbbells = "dumbbells"
-    pullup_bar = "pullup_bar"
-    resistance_bands = "resistance_bands"
-    barbell_bench = "barbell_bench"
+    home = "home"
+    gym = "gym"
 
+    @classmethod
+    def normalize(cls, value: object) -> "Equipment":
+        if isinstance(value, cls):
+            return value
+
+        raw = str(value or "").strip().lower()
+        token = raw.replace("-", "_")
+
+        home_tokens = {
+            "home",
+            "no equipment",
+            "no_equipment",
+            "bodyweight",
+            "bands",
+            "resistance bands",
+            "resistance_bands",
+        }
+        gym_tokens = {
+            "gym",
+            "dumbbells",
+            "pull-up bar",
+            "pull_up_bar",
+            "pullup bar",
+            "pullup_bar",
+            "barbell & bench",
+            "barbell_and_bench",
+            "barbell_bench",
+            "barbell",
+            "machine",
+            "cable",
+        }
+
+        if raw in home_tokens or token in home_tokens:
+            return cls.home
+        if raw in gym_tokens or token in gym_tokens:
+            return cls.gym
+
+        raise ValueError(f"Unsupported equipment: {value}")
+
+    @classmethod
+    def normalize_many(cls, value: object) -> list["Equipment"]:
+        if value is None:
+            return []
+
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        out: list[Equipment] = []
+        for item in items:
+            normalized = cls.normalize(item)
+            if normalized not in out:
+                out.append(normalized)
+        return out
 
 class Injury(str, Enum):
     none = "none"

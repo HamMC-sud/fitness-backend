@@ -25,7 +25,7 @@ from models import (
     RewardedGrant,
     Subscription,
 )
-from models.enums import AiRequestStatus, AiRequestType, SubscriptionStatus
+from models.enums import AiRequestStatus, AiRequestType, Equipment, SubscriptionStatus
 from schemas.ai import (
     AiAdjustIn,
     AiAdjustOut,
@@ -94,6 +94,18 @@ def _as_str_list(v: Any) -> list[str]:
         return [_as_str(x).strip() for x in v if _as_str(x).strip()]
     s = _as_str(v).strip()
     return [s] if s else []
+
+
+def _normalize_equipment_values(v: Any) -> list[str]:
+    out: list[str] = []
+    for item in _as_str_list(v):
+        try:
+            normalized = Equipment.normalize(item).value
+        except ValueError:
+            continue
+        if normalized not in out:
+            out.append(normalized)
+    return out
 
 
 def _pick_i18n_name(name_obj: Any, language: str) -> str:
@@ -235,8 +247,7 @@ async def _build_daily_recommendation(current_user: Any, day_iso: str) -> tuple[
                     "type": d_type,
                     "date": day_iso,
                 }
-            recovery_text = str(wt.get("recommendation") or "Mobility + light walk 20-30 min.")
-            return recovery_text, {
+            return "Rest day. Mobility + light walk 20-30 min.", {
                 "source": "active_plan",
                 "plan_id": str(plan.id),
                 "type": d_type,
@@ -249,13 +260,11 @@ async def _build_daily_recommendation(current_user: Any, day_iso: str) -> tuple[
     )
 
 
-def _is_unsaved_expired(rec: AiDailyRecommendation, now: datetime) -> bool:
+def _is_unsaved_expired(rec: AiDailyRecommendation, today_iso: str) -> bool:
+    """Remove opened+unsaved recommendations from any previous day."""
     if rec.saved or rec.removed_at is not None or rec.opened_at is None:
         return False
-    opened = rec.opened_at
-    if opened.tzinfo is None:
-        opened = opened.replace(tzinfo=timezone.utc)
-    return (now - opened) >= timedelta(days=1)
+    return rec.date < today_iso
 
 
 def _goal_to_types(goals: list[str], preferences: list[str]) -> list[str]:
@@ -325,9 +334,9 @@ def _merge_prompt_with_profile(current_user: Any, prompt_meta: Dict[str, Any]) -
     if not preferences and profile:
         preferences = _as_str_list(getattr(profile, "preferences", []))
 
-    equipment = _as_str_list(prompt_meta.get("equipment"))
+    equipment = _normalize_equipment_values(prompt_meta.get("equipment"))
     if not equipment and profile:
-        equipment = _as_str_list(getattr(profile, "equipment", []))
+        equipment = _normalize_equipment_values(getattr(profile, "equipment", []))
 
     injuries = _as_str_list(prompt_meta.get("injuries"))
     if not injuries and profile:
@@ -379,11 +388,12 @@ def _exercise_is_allowed(ex: Exercise, injuries: set[str], equipment: set[str]) 
     if injuries and contraindications.intersection(injuries):
         return False
 
-    required = {_as_str(x) for x in (ex.equipment or [])}
-    if not required:
-        return True
-
-    required.discard("bodyweight")
+    required: set[str] = set()
+    for item in (ex.equipment or []):
+        try:
+            required.add(Equipment.normalize(item).value)
+        except ValueError:
+            continue
     if not required:
         return True
 
@@ -645,10 +655,7 @@ async def build_plan_days(
                 {
                     "date": d.isoformat(),
                     "type": "recovery",
-                    "workout_template": {
-                        "title": "Recovery day",
-                        "recommendation": "Mobility + light walk 20-30 min.",
-                    },
+                    "workout_template": None,
                 }
             )
     return days
@@ -787,11 +794,71 @@ async def create_ai_request(
     return req
 
 
+async def fail_ai_request(req: AiRequest, message: str, status_code: int = 503) -> None:
+    req.status = AiRequestStatus.error
+    req.error = message
+    await req.save()
+    raise HTTPException(status_code, message)
+
+
 async def archive_active_plans(user_id: PydanticObjectId) -> None:
     await AiPlan.find(
         AiPlan.user_id == user_id,
         AiPlan.status == "active",
     ).update({"$set": {"status": "archived"}})
+
+
+def _detect_plan_intent(text: str) -> bool:
+    """Return True if user message is asking to generate a training plan."""
+    lower = text.lower()
+    # Must contain a generation verb AND a plan noun
+    gen_verbs = {"generate", "create", "make", "build", "give me", "i need",
+                 "создай", "сделай", "составь", "дай", "хочу",
+                 "сгенерируй", "напиши", "подготовь", "помоги", "придумай"}
+    plan_nouns = {"plan", "program", "schedule", "workout", "training",
+                  "план", "программу", "расписание", "тренировк", "тренировки",
+                  "упражнени"}
+    has_verb = any(v in lower for v in gen_verbs)
+    has_noun = any(n in lower for n in plan_nouns)
+    return has_verb and has_noun
+
+
+def _extract_plan_duration_days(text: str) -> int:
+    """Parse requested duration in days from a user message. Defaults to 30."""
+    lower = text.lower()
+
+    _WORD_NUMS = {
+        "one": 1, "two": 2, "three": 3, "four": 4,
+        "одну": 1, "одна": 1, "две": 2, "три": 3, "четыре": 4,
+    }
+
+    # numeric: "2 weeks", "1 month", "10 days"
+    m = re.search(r'(\d+)\s*(?:week|weeks|неделю|недели|недель)', lower)
+    if m:
+        return min(int(m.group(1)) * 7, 90)
+
+    m = re.search(r'(\d+)\s*(?:month|months|месяц|месяца|месяцев)', lower)
+    if m:
+        return min(int(m.group(1)) * 30, 90)
+
+    m = re.search(r'(\d+)\s*(?:day|days|день|дня|дней)', lower)
+    if m:
+        return max(7, min(int(m.group(1)), 90))
+
+    # word numbers: "one week", "two weeks", "одну неделю"
+    for word, num in _WORD_NUMS.items():
+        if re.search(rf'{word}\s+(?:week|weeks|неделю|недели|недель)', lower):
+            return min(num * 7, 90)
+        if re.search(rf'{word}\s+(?:month|months|месяц|месяца|месяцев)', lower):
+            return min(num * 30, 90)
+
+    # bare keywords without a number → default to 1 unit
+    if re.search(r'\b(?:неделю|неделя|на неделю|week)\b', lower):
+        return 7
+    if re.search(r'\b(?:месяц|на месяц|month)\b', lower):
+        return 30
+
+    return 30  # default
 
 
 async def yandex_chat_completion(
@@ -915,13 +982,12 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
     premium = await is_premium_user(current_user.id)
     now = utcnow()
 
+    usage: Optional[AiUsageMonthly] = None
     if not premium:
         period = period_yyyy_mm(now)
         usage = await get_or_create_usage(current_user.id, period)
         if usage.used >= (usage.base_limit + usage.extra_from_rewarded):
             raise HTTPException(403, "AI limit reached")
-        usage.used += 1
-        await usage.save()
 
     meta = payload.prompt_meta or {}
     req = await create_ai_request(
@@ -930,11 +996,19 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
         prompt_meta=meta,
     )
 
-    await archive_active_plans(current_user.id)
-
     days = await _try_generate_plan_with_yandex(current_user, meta, total_days=30)
     if not days:
-        days = await build_plan_days(current_user, meta, total_days=30)
+        await fail_ai_request(
+            req,
+            "AI did not return a valid plan JSON. Plan was not created.",
+            status_code=503,
+        )
+
+    if usage is not None:
+        usage.used += 1
+        await usage.save()
+
+    await archive_active_plans(current_user.id)
 
     plan = AiPlan(
         user_id=current_user.id,
@@ -976,16 +1050,15 @@ async def ai_reroll_plan(payload: AiRerollIn, current_user=Depends(get_current_u
         prompt_meta=merged_meta,
     )
 
-    await archive_active_plans(current_user.id)
-
     days = await _try_generate_plan_with_yandex(current_user, merged_meta, total_days=30)
     if not days:
-        days = await build_plan_days(
-            current_user,
-            merged_meta,
-            total_days=30,
-            seed_nonce=merged_meta["_reroll_nonce"],
+        await fail_ai_request(
+            req,
+            "AI did not return a valid reroll plan JSON. Reroll was not created.",
+            status_code=503,
         )
+
+    await archive_active_plans(current_user.id)
 
     new_plan = AiPlan(
         user_id=current_user.id,
@@ -1011,13 +1084,16 @@ async def get_current_plan(current_user=Depends(get_current_user)):
     return plan_to_out(plan)
 
 
+@router.get("/ai/daily-recommendation", response_model=AiDailyRecommendationOut)
 @router.get("/ai/recommendation/daily", response_model=AiDailyRecommendationOut)
 async def ai_daily_recommendation(mark_opened: bool = True, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
 
     now = utcnow()
-    # Lazy cleanup: remove unsaved opened recommendations older than 1 day.
+    day_iso = _today_iso_for_user(current_user)
+
+    # Auto-remove opened+unsaved recommendations from previous days.
     stale = await AiDailyRecommendation.find(
         AiDailyRecommendation.user_id == current_user.id,
         AiDailyRecommendation.saved == False,  # noqa: E712
@@ -1025,11 +1101,9 @@ async def ai_daily_recommendation(mark_opened: bool = True, current_user=Depends
         AiDailyRecommendation.removed_at == None,  # noqa: E711
     ).to_list()
     for s in stale:
-        if _is_unsaved_expired(s, now):
+        if _is_unsaved_expired(s, day_iso):
             s.removed_at = now
             await s.save()
-
-    day_iso = _today_iso_for_user(current_user)
     rec = await AiDailyRecommendation.find_one(
         AiDailyRecommendation.user_id == current_user.id,
         AiDailyRecommendation.date == day_iso,
@@ -1055,6 +1129,7 @@ async def ai_daily_recommendation(mark_opened: bool = True, current_user=Depends
     return _daily_rec_to_out(rec)
 
 
+@router.post("/ai/daily-recommendation/save", response_model=AiDailyRecommendationOut)
 @router.post("/ai/recommendation/daily/save", response_model=AiDailyRecommendationOut)
 async def ai_daily_recommendation_save(
     payload: AiDailyRecommendationSaveIn,
@@ -1102,6 +1177,7 @@ async def ai_daily_recommendation_save(
     return _daily_rec_to_out(rec)
 
 
+@router.delete("/ai/daily-recommendation")
 @router.delete("/ai/recommendation/daily")
 async def ai_daily_recommendation_delete(
     recommendation_id: Optional[str] = None,
@@ -1223,7 +1299,59 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     )
     await user_message.insert()
 
-    assistant_text = await yandex_chat_completion(payload.text, payload.meta or {}, history=history)
+    action: Optional[Dict[str, Any]] = None
+
+    if _detect_plan_intent(payload.text):
+        # Check generation limits
+        premium = await is_premium_user(current_user.id)
+        usage: Optional[AiUsageMonthly] = None
+        can_generate = True
+
+        if not premium:
+            period = period_yyyy_mm(utcnow())
+            usage = await get_or_create_usage(current_user.id, period)
+            can_generate = usage.used < (usage.base_limit + usage.extra_from_rewarded)
+
+        if not can_generate:
+            assistant_text = (
+                "You've used all your plan generation credits for this month. "
+                "Watch a rewarded ad to get more, or upgrade to Premium."
+            )
+        else:
+            try:
+                meta = payload.meta or {}
+                total_days = _extract_plan_duration_days(payload.text)
+                gen_req = await create_ai_request(
+                    user_id=current_user.id,
+                    req_type=AiRequestType.generate_plan,
+                    prompt_meta=meta,
+                )
+                days = await _try_generate_plan_with_yandex(current_user, meta, total_days=total_days)
+                if days:
+                    if usage is not None:
+                        usage.used += 1
+                        await usage.save()
+                    await archive_active_plans(current_user.id)
+                    plan = AiPlan(
+                        user_id=current_user.id,
+                        status="active",
+                        created_from=meta,
+                        days=days,
+                        version=1,
+                        reroll_of_plan_id=None,
+                    )
+                    await plan.insert()
+                    weeks = total_days // 7
+                    duration_label = f"{weeks} week{'s' if weeks != 1 else ''}" if total_days % 7 == 0 else f"{total_days} days"
+                    assistant_text = f"Your {duration_label} training plan is ready! Opening it now."
+                    action = {"type": "plan_generated", "plan_id": str(plan.id), "total_days": total_days}
+                else:
+                    assistant_text = "I couldn't generate a plan right now. Please try again in a moment."
+            except Exception as e:
+                logger.exception("Plan generation from chat failed: %s", e)
+                assistant_text = "Something went wrong generating your plan. Please try again."
+    else:
+        assistant_text = await yandex_chat_completion(payload.text, payload.meta or {}, history=history)
 
     assistant_message = AiChatMessage(
         thread_id=thread.id,
@@ -1239,6 +1367,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
         user_message_id=str(user_message.id),
         assistant_message_id=str(assistant_message.id),
         assistant_text=assistant_text,
+        action=action,
     )
 
 
@@ -1336,16 +1465,15 @@ async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_u
         prompt_meta=prompt_meta,
     )
 
-    await archive_active_plans(current_user.id)
-
     days = await _try_generate_plan_with_yandex(current_user, prompt_meta, total_days=30)
     if not days:
-        days = await build_plan_days(
-            current_user,
-            prompt_meta,
-            total_days=30,
-            seed_nonce=prompt_meta.get("_reroll_nonce"),
+        await fail_ai_request(
+            req,
+            "AI did not return a valid adjusted plan JSON. Adjusted plan was not created.",
+            status_code=503,
         )
+
+    await archive_active_plans(current_user.id)
 
     adjusted_plan = AiPlan(
         user_id=current_user.id,
@@ -1410,11 +1538,12 @@ async def ai_plan_day(date: str, current_user=Depends(get_current_user)):
         raise HTTPException(404, "Day not found")
 
     day_obj = plan.days[idx]
+    wt = getattr(day_obj, "workout_template", None) or None
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
         date=str(getattr(day_obj, "date", date)),
         type=str(getattr(day_obj, "type", "recovery")),
-        workout_template=getattr(day_obj, "workout_template", None) or {},
+        workout_template=wt if str(getattr(day_obj, "type", "recovery")) == "workout" else None,
     )
 
 
@@ -1444,10 +1573,7 @@ async def ai_plan_day_edit(
     to_rest = bool(patch.get("mark_rest_day")) or bool(patch.get("delete_session"))
     if to_rest:
         day_obj.type = "recovery"
-        day_obj.workout_template = {
-            "title": "Recovery day",
-            "recommendation": "Mobility + light walk 20-30 min.",
-        }
+        day_obj.workout_template = None
     else:
         if day_type != "workout":
             day_obj.type = "workout"
@@ -1477,11 +1603,12 @@ async def ai_plan_day_edit(
     plan.days = days
     await plan.save()
 
+    final_type = str(getattr(day_obj, "type", "recovery"))
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
         date=str(getattr(day_obj, "date", date)),
-        type=str(getattr(day_obj, "type", "recovery")),
-        workout_template=getattr(day_obj, "workout_template", None) or {},
+        type=final_type,
+        workout_template=getattr(day_obj, "workout_template", None) if final_type == "workout" else None,
     )
 
 
@@ -1499,9 +1626,6 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
         raise HTTPException(404, "Day not found")
 
     day_obj = plan.days[idx]
-    if str(getattr(day_obj, "type", "")) != "workout":
-        raise HTTPException(400, "Swaps available only for workout day")
-
     safe_limit = max(1, min(int(limit), 6))
     meta = dict(plan.created_from or {})
     inputs = _merge_prompt_with_profile(current_user, meta)
@@ -1581,6 +1705,6 @@ async def ai_plan_day_apply_swap(
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
         date=str(getattr(day_obj, "date", date)),
-        type=str(getattr(day_obj, "type", "workout")),
-        workout_template=getattr(day_obj, "workout_template", None) or {},
+        type="workout",
+        workout_template=getattr(day_obj, "workout_template", None),
     )

@@ -1,3 +1,4 @@
+import asyncio
 from typing import Optional
 
 from beanie.odm.fields import PydanticObjectId
@@ -6,9 +7,78 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from api.auth.config import get_current_user
 from models import Exercise
 from models.enums import Difficulty, WorkoutType, Equipment, Injury, ExerciseMode
-from schemas.exercises import ExerciseListOut, ExerciseOut
+from schemas.exercises import ExerciseListOut, ExerciseOut, ExerciseCategoriesOut, ExerciseCategoryOut
 
 router = APIRouter()
+
+
+def equipment_db_aliases(equipment: Equipment) -> list[str]:
+    if equipment == Equipment.home:
+        return [
+            Equipment.home.value,
+            "Home",
+            "No equipment",
+            "no equipment",
+            "bodyweight",
+            "resistance_bands",
+            "Resistance bands",
+            "bands",
+        ]
+    return [
+        Equipment.gym.value,
+        "Gym",
+        "Dumbbells",
+        "dumbbells",
+        "Pull-up bar",
+        "pullup_bar",
+        "pull_up_bar",
+        "Barbell & Bench",
+        "barbell_bench",
+        "barbell_and_bench",
+    ]
+
+
+# Maps category key → MongoDB filter dict
+_CATEGORY_FILTERS: dict[str, dict] = {
+    "legs_glutes": {"muscle_groups": {"$in": ["quads", "glutes", "hamstrings", "calves"]}},
+    "upper_body":  {"muscle_groups": {"$in": ["chest", "back", "shoulders"]}},
+    "arms":        {"muscle_groups": {"$in": ["biceps", "triceps"]}},
+    "core_abs":    {"muscle_groups": {"$in": ["core"]}},
+    "cardio_hiit": {"workout_type": {"$in": ["cardio", "hiit"]}},
+    "stretching":  {"workout_type": "stretching"},
+    "yoga":        {"workout_type": "yoga"},
+}
+
+_CATEGORY_LABELS: dict[str, str] = {
+    "legs_glutes": "Legs & Glutes",
+    "upper_body":  "Upper Body",
+    "arms":        "Arms",
+    "core_abs":    "Core & Abs",
+    "cardio_hiit": "Cardio & HIIT",
+    "stretching":  "Stretching",
+    "yoga":        "Yoga",
+}
+
+_CATEGORY_ORDER = ["legs_glutes", "upper_body", "arms", "core_abs", "cardio_hiit", "stretching", "yoga"]
+
+
+@router.get("/exercises/categories", response_model=ExerciseCategoriesOut)
+async def list_exercise_categories(
+    current_user=Depends(get_current_user),
+    status: str = Query(default="active"),
+):
+    async def _count(key: str) -> int:
+        f = {"status": status, **_CATEGORY_FILTERS[key]}
+        return await Exercise.find(f).count()
+
+    counts = await asyncio.gather(*[_count(k) for k in _CATEGORY_ORDER])
+
+    return ExerciseCategoriesOut(
+        items=[
+            ExerciseCategoryOut(key=k, label=_CATEGORY_LABELS[k], count=c)
+            for k, c in zip(_CATEGORY_ORDER, counts)
+        ]
+    )
 
 
 @router.get("/exercises", response_model=ExerciseListOut)
@@ -16,6 +86,7 @@ async def list_exercises(
     current_user=Depends(get_current_user),
     q: Optional[str] = Query(default=None),
     status: str = Query(default="active"),
+    category: Optional[str] = Query(default=None),
     difficulty: Optional[Difficulty] = None,
     mode: Optional[ExerciseMode] = None,
     workout_type: Optional[WorkoutType] = None,
@@ -30,17 +101,23 @@ async def list_exercises(
 
     filters = [Exercise.status == status]
 
+    if category is not None:
+        cat_filter = _CATEGORY_FILTERS.get(category)
+        if not cat_filter:
+            raise HTTPException(400, f"Unknown category '{category}'. Valid: {', '.join(_CATEGORY_ORDER)}")
+        filters.append(cat_filter)
+
     if difficulty is not None:
         filters.append(Exercise.difficulty == difficulty)
 
     if mode is not None:
-        filters.append(Exercise.media.mode == mode)
+        filters.append({"media.mode": mode.value})
 
     if workout_type is not None:
         filters.append(Exercise.workout_type == workout_type)
 
     if equipment is not None:
-        filters.append(Exercise.equipment == equipment)
+        filters.append({"equipment": {"$in": equipment_db_aliases(equipment)}})
 
     if contraindication is not None:
         filters.append(Exercise.contraindications == contraindication)

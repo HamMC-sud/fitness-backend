@@ -47,3 +47,11 @@ __pycache__/
 *.bak
 *.tmp
 requirements.txt
+
+
+tz.md
+
+kovi_app/
+Flutter_Specs/
+statics/
+upload_exercises/
