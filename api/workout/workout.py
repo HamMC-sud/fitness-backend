@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta ,timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from beanie.odm.fields import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -11,12 +12,15 @@ from copy import deepcopy
 
 from api.auth.config import get_current_user
 from models import UserWorkout, WorkoutRun, ExerciseFeedbackEvent
+from models.enums import ExerciseMode
 from models.workouts import Feedback  # ✅ enum
 from schemas.workout import (
     WorkoutCreateIn,
     WorkoutUpdateIn,
     WorkoutStartOut,
     WorkoutCompleteIn,
+    WorkoutSetProgressIn,
+    WorkoutSetProgressOut,
     HistoryStatsOut,
 )
 
@@ -26,6 +30,69 @@ history_router = APIRouter()
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def ensure_aware_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def user_tz_or_utc(tz_name: Optional[str]) -> ZoneInfo:
+    try:
+        return ZoneInfo(tz_name or "UTC")
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+def day_bounds_utc(local_day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    start_local = datetime.combine(local_day, time.min).replace(tzinfo=tz)
+    end_local = start_local + timedelta(days=1)
+    return (
+        start_local.astimezone(timezone.utc).replace(tzinfo=None),
+        end_local.astimezone(timezone.utc).replace(tzinfo=None),
+    )
+
+
+async def _workout_streak_snapshot(user_id: PydanticObjectId, tz_name: Optional[str]) -> tuple[bool, int, Optional[datetime]]:
+    tz = user_tz_or_utc(tz_name)
+    now_local = ensure_aware_utc(utcnow()).astimezone(tz)
+    today_local = now_local.date()
+    today_start_utc, today_end_utc = day_bounds_utc(today_local, tz)
+
+    has_today = bool(
+        await WorkoutRun.find(
+            {
+                "user_id": user_id,
+                "completed_at": {"$ne": None, "$gte": today_start_utc, "$lt": today_end_utc},
+            }
+        ).count()
+    )
+
+    runs = (
+        await WorkoutRun.find(
+            WorkoutRun.user_id == user_id,
+            WorkoutRun.completed_at != None,  # noqa: E711
+        )
+        .sort("-completed_at")
+        .to_list()
+    )
+    if not runs:
+        return has_today, 0, None
+
+    active_dates = set()
+    for r in runs:
+        if not r.completed_at:
+            continue
+        active_dates.add(ensure_aware_utc(r.completed_at).astimezone(tz).date())
+
+    streak_days = 0
+    d = today_local
+    while d in active_dates:
+        streak_days += 1
+        d = d - timedelta(days=1)
+
+    return has_today, streak_days, runs[0].completed_at
 
 
 class WorkoutFeedbackIn(BaseModel):
@@ -82,7 +149,7 @@ def _apply_signals_to_steps(
 
         reps = s.get("reps")
         duration = s.get("duration_seconds")
-        rest = s.get("rest_seconds")
+        rest = s.get("rest_seconds_after")
 
         # 1️⃣ INTRO HAS PRIORITY
         if needs_intro:
@@ -91,7 +158,7 @@ def _apply_signals_to_steps(
             if duration is not None:
                 s["duration_seconds"] = max(15, math.floor(duration * 0.7))
             if rest is not None:
-                s["rest_seconds"] = math.ceil(rest * 1.3)
+                s["rest_seconds_after"] = math.ceil(rest * 1.3)
 
         # 2️⃣ LOAD ADJUSTMENT (only if NOT intro)
         elif load_adjustment == "increase":
@@ -170,6 +237,21 @@ async def _get_last_run_for_workout(workout_id: PydanticObjectId, user_id: Pydan
     return runs[0] if runs else None
 
 
+async def _resolve_run_and_workout_for_id(id_value: PydanticObjectId, user_id: PydanticObjectId) -> tuple[WorkoutRun, Optional[UserWorkout]]:
+    run = await WorkoutRun.get(id_value)
+    if run:
+        if run.user_id != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        workout = await UserWorkout.get(run.workout_ref_id) if run.workout_ref_id else None
+        return run, workout
+
+    workout = await _get_owned_workout_or_404(id_value, user_id)
+    run = await _get_open_run_for_workout(workout.id, user_id)
+    if not run:
+        run = await _create_run_for_workout(workout, user_id)
+    return run, workout
+
+
 async def _create_run_for_workout(workout: UserWorkout, user_id: PydanticObjectId) -> WorkoutRun:
     run = WorkoutRun(
         user_id=user_id,
@@ -183,7 +265,91 @@ async def _create_run_for_workout(workout: UserWorkout, user_id: PydanticObjectI
     return run
 
 
-async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, user_id: PydanticObjectId):
+def _validate_mode_payload(mode: ExerciseMode, reps_done: Optional[int], seconds_done: Optional[int]) -> None:
+    if mode == ExerciseMode.reps:
+        if reps_done is None:
+            raise HTTPException(status_code=400, detail="reps_done is required when mode=reps")
+        if seconds_done is not None:
+            raise HTTPException(status_code=400, detail="seconds_done must be null when mode=reps")
+        return
+
+    if mode == ExerciseMode.time:
+        if seconds_done is None:
+            raise HTTPException(status_code=400, detail="seconds_done is required when mode=time")
+        if reps_done is not None:
+            raise HTTPException(status_code=400, detail="reps_done must be null when mode=time")
+
+
+def _step_mode_by_exercise(workout: Optional[UserWorkout]) -> dict[PydanticObjectId, ExerciseMode]:
+    mapping: dict[PydanticObjectId, ExerciseMode] = {}
+    if workout is None:
+        return mapping
+    for s in workout.steps:
+        mapping[s.exercise_id] = s.mode
+    return mapping
+
+
+def _step_sets_by_exercise(workout: Optional[UserWorkout]) -> dict[PydanticObjectId, int]:
+    mapping: dict[PydanticObjectId, int] = {}
+    if workout is None:
+        return mapping
+    for s in workout.steps:
+        mapping[s.exercise_id] = int(getattr(s, "sets", 1) or 1)
+    return mapping
+
+
+def _validate_exercise_results(payload: WorkoutCompleteIn, workout: Optional[UserWorkout]) -> None:
+    if not payload.exercise_results:
+        return
+
+    step_modes = _step_mode_by_exercise(workout)
+    step_sets = _step_sets_by_exercise(workout)
+
+    for r in payload.exercise_results:
+        _validate_mode_payload(r.mode, r.reps_done, r.seconds_done)
+        if not step_modes:
+            continue
+        expected_mode = step_modes.get(r.exercise_id)
+        if expected_mode is None:
+            raise HTTPException(status_code=400, detail=f"exercise_id not found in workout: {r.exercise_id}")
+        if expected_mode != r.mode:
+            raise HTTPException(status_code=400, detail=f"mode mismatch for exercise_id: {r.exercise_id}")
+        expected_sets = int(step_sets.get(r.exercise_id, 1) or 1)
+        if expected_sets > 1 and r.set_no is None:
+            raise HTTPException(status_code=400, detail=f"set_no is required for multi-set exercise: {r.exercise_id}")
+        if r.set_no is not None and int(r.set_no) > expected_sets:
+            raise HTTPException(status_code=400, detail=f"set_no exceeds configured sets for exercise: {r.exercise_id}")
+
+
+def _normalize_result_item(item) -> dict:
+    if hasattr(item, "model_dump"):
+        return item.model_dump()
+    if isinstance(item, dict):
+        return dict(item)
+    return dict(item or {})
+
+
+def _set_entry_key(item: dict) -> tuple[str, Optional[int]]:
+    return str(item.get("exercise_id")), item.get("set_no")
+
+
+def _upsert_set_entry(existing_items: list[dict], incoming_item: dict) -> list[dict]:
+    incoming_key = _set_entry_key(incoming_item)
+    merged = []
+    replaced = False
+    for it in existing_items:
+        if _set_entry_key(it) == incoming_key:
+            merged.append(incoming_item)
+            replaced = True
+        else:
+            merged.append(it)
+    if not replaced:
+        merged.append(incoming_item)
+    return merged
+
+
+async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, current_user):
+    user_id = current_user.id
     if run.completed_at is not None:
         raise HTTPException(status_code=400, detail="Run already completed")
 
@@ -192,7 +358,13 @@ async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, user_id: Py
     run.calories_estimated = payload.calories_estimated
     run.rating_stars = payload.rating_stars
     run.difficulty_feedback = payload.difficulty_feedback  # ✅ already Feedback enum in schema
-    run.exercise_results = [r.model_dump() for r in payload.exercise_results]
+    incoming_results = [r.model_dump() for r in payload.exercise_results]
+    if incoming_results:
+        existing_results = [_normalize_result_item(x) for x in (run.exercise_results or [])]
+        merged_results = existing_results
+        for entry in incoming_results:
+            merged_results = _upsert_set_entry(merged_results, entry)
+        run.exercise_results = merged_results
 
     await run.save()
 
@@ -217,10 +389,31 @@ async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, user_id: Py
             for e in events:
                 await e.insert()
 
-    return {"status": "ok", "run_id": str(run.id), "completed_at": run.completed_at.isoformat()}
+    has_completed_today, streak_days, last_activity_at = await _workout_streak_snapshot(
+        user_id=user_id,
+        tz_name=getattr(current_user, "timezone", None),
+    )
+
+    # Keep user stats in sync with workout streak logic.
+    try:
+        if getattr(current_user, "stats", None) is not None:
+            current_user.stats.streak_days = int(streak_days)
+            current_user.stats.last_activity_at = last_activity_at
+            await current_user.save()
+    except Exception:
+        pass
+
+    return {
+        "status": "ok",
+        "run_id": str(run.id),
+        "completed_at": run.completed_at.isoformat(),
+        "has_completed_today": has_completed_today,
+        "streak_days": streak_days,
+        "last_activity_at": last_activity_at.isoformat() if last_activity_at else None,
+    }
 
 
-@router.post("/workouts", status_code=status.HTTP_201_CREATED)
+# Removed: not used by frontend
 async def create_workout(payload: WorkoutCreateIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -236,7 +429,7 @@ async def create_workout(payload: WorkoutCreateIn, current_user=Depends(get_curr
     return w
 
 
-@router.get("/workouts")
+# Removed: not used by frontend
 async def list_workouts(current_user=Depends(get_current_user), skip: int = 0, limit: int = 20):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -253,7 +446,7 @@ async def list_workouts(current_user=Depends(get_current_user), skip: int = 0, l
     return {"items": items, "skip": skip, "limit": limit}
 
 
-@router.get("/workouts/{id}")
+# Removed: not used by frontend
 async def get_workout(id: PydanticObjectId, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -261,7 +454,7 @@ async def get_workout(id: PydanticObjectId, current_user=Depends(get_current_use
     return await _get_owned_workout_or_404(id, current_user.id)
 
 
-@router.put("/workouts/{workout_id}")
+# Removed: not used by frontend
 async def update_workout(workout_id: PydanticObjectId, payload: WorkoutUpdateIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -279,7 +472,7 @@ async def update_workout(workout_id: PydanticObjectId, payload: WorkoutUpdateIn,
     return w
 
 
-@router.delete("/workouts/{workout_id}", status_code=status.HTTP_200_OK)
+# Removed: not used by frontend
 async def delete_workout(workout_id: PydanticObjectId, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -346,29 +539,60 @@ async def start_workout(workout_id: PydanticObjectId, current_user=Depends(get_c
     )
 
 
+@router.post("/workouts/{id}/set-progress", response_model=WorkoutSetProgressOut, status_code=status.HTTP_200_OK)
+async def set_progress_workout(id: PydanticObjectId, payload: WorkoutSetProgressIn, current_user=Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    run, workout = await _resolve_run_and_workout_for_id(id, current_user.id)
+    if run.completed_at is not None:
+        raise HTTPException(status_code=400, detail="Run already completed")
+
+    _validate_mode_payload(payload.mode, payload.reps_done, payload.seconds_done)
+
+    step_modes = _step_mode_by_exercise(workout)
+    step_sets = _step_sets_by_exercise(workout)
+    if step_modes:
+        expected_mode = step_modes.get(payload.exercise_id)
+        if expected_mode is None:
+            raise HTTPException(status_code=400, detail=f"exercise_id not found in workout: {payload.exercise_id}")
+        if expected_mode != payload.mode:
+            raise HTTPException(status_code=400, detail=f"mode mismatch for exercise_id: {payload.exercise_id}")
+        expected_sets = int(step_sets.get(payload.exercise_id, 1) or 1)
+        if int(payload.set_no) > expected_sets:
+            raise HTTPException(status_code=400, detail=f"set_no exceeds configured sets for exercise: {payload.exercise_id}")
+
+    entry = payload.model_dump()
+    existing_results = [_normalize_result_item(x) for x in (run.exercise_results or [])]
+    run.exercise_results = _upsert_set_entry(existing_results, entry)
+    await run.save()
+
+    logged_sets_for_exercise = sum(
+        1
+        for it in (_normalize_result_item(x) for x in (run.exercise_results or []))
+        if str(it.get("exercise_id")) == str(payload.exercise_id)
+    )
+    return WorkoutSetProgressOut(
+        status="ok",
+        run_id=str(run.id),
+        exercise_id=str(payload.exercise_id),
+        set_no=payload.set_no,
+        logged_sets_for_exercise=logged_sets_for_exercise,
+    )
+
+
 
 @router.post("/workouts/{id}/complete", status_code=status.HTTP_200_OK)
 async def complete_workout(id: PydanticObjectId, payload: WorkoutCompleteIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # 1) try treat as run_id
-    run = await WorkoutRun.get(id)
-    if run:
-        if run.user_id != current_user.id:
-            raise HTTPException(status_code=403, detail="Forbidden")
-        return await _complete_run(run, payload, current_user.id)
-
-    # 2) treat as workout_id
-    w = await _get_owned_workout_or_404(id, current_user.id)
-    run = await _get_open_run_for_workout(w.id, current_user.id)
-    if not run:
-        run = await _create_run_for_workout(w, current_user.id)
-
-    return await _complete_run(run, payload, current_user.id)
+    run, workout = await _resolve_run_and_workout_for_id(id, current_user.id)
+    _validate_exercise_results(payload, workout)
+    return await _complete_run(run, payload, current_user)
 
 
-@router.post("/workouts/{workout_id}/feedback", status_code=status.HTTP_200_OK)
+# Removed: not used by frontend
 async def workout_feedback(workout_id: PydanticObjectId, payload: WorkoutFeedbackIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -416,7 +640,7 @@ async def workout_feedback(workout_id: PydanticObjectId, payload: WorkoutFeedbac
 
 
 
-@router.get("/history")
+# Removed: not used by frontend
 async def history_list(current_user=Depends(get_current_user), skip: int = 0, limit: int = 20):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -436,7 +660,7 @@ async def history_list(current_user=Depends(get_current_user), skip: int = 0, li
     return {"items": items, "skip": skip, "limit": limit}
 
 
-@router.get("/history/stats", response_model=HistoryStatsOut)
+# Removed: not used by frontend
 async def history_stats(current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -457,30 +681,23 @@ async def history_stats(current_user=Depends(get_current_user)):
             total_seconds=0,
             total_calories_estimated=0.0,
             streak_days=0,
+            has_completed_today=False,
             last_activity_at=None,
         )
 
     total_completed = len(runs)
     total_seconds = int(sum((r.total_seconds or 0) for r in runs))
     total_calories = float(sum((r.calories_estimated or 0) for r in runs))
-    last_activity_at = runs[0].completed_at
-
-    days = set()
-    for r in runs:
-        if r.completed_at:
-            days.add(r.completed_at.date())
-
-    last_day = max(days)
-    streak = 0
-    d = last_day
-    while d in days:
-        streak += 1
-        d = d - timedelta(days=1)
+    has_completed_today, streak, last_activity_at = await _workout_streak_snapshot(
+        user_id=current_user.id,
+        tz_name=getattr(current_user, "timezone", None),
+    )
 
     return HistoryStatsOut(
         total_completed=total_completed,
         total_seconds=total_seconds,
         total_calories_estimated=total_calories,
         streak_days=streak,
+        has_completed_today=has_completed_today,
         last_activity_at=last_activity_at,
     )

@@ -3,17 +3,7 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from models.enums import (
-    Gender,
-    ActivityLevel,
-    Goal,
-    Preference,
-    Equipment,
-    Injury,
-    Language,
-    UnitSystem,
-    Interest,
-)
+from models.enums import Gender, ActivityLevel, Goal, Preference, Equipment, Injury, Language, Interest
 
 
 class UserScheduleIn(BaseModel):
@@ -47,14 +37,3 @@ class ProfileUpdateIn(BaseModel):
             return None
         return Equipment.normalize_many(v)
 
-
-class ProfileSettingsUpdateIn(BaseModel):
-    unit_system: Optional[UnitSystem] = None
-    training_rest_seconds: Optional[int] = Field(default=None, ge=10, le=600)
-    language: Optional[Language] = None
-
-
-class ProfileSettingsOut(BaseModel):
-    unit_system: UnitSystem
-    training_rest_seconds: int
-    language: Language

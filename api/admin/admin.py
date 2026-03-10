@@ -28,19 +28,6 @@ from api.auth.config import (
     sha256,
     verify_password,
 )
-from api.meditations.meditations import (
-    create_meditation,
-    delete_meditation,
-    update_meditation,
-)
-from api.program.program import (
-    create_program,
-    create_template,
-    delete_program,
-    delete_template,
-    update_program,
-    update_template,
-)
 from api.subscription.subscription import (
     compute_subscription_status,
     create_plan,
@@ -87,13 +74,6 @@ from schemas.admin import (
     AdminPromoBatchesOut,
 )
 from schemas.register import LoginIn, TokenOut
-from schemas.meditations import MeditationCreateIn, MeditationUpdateIn
-from schemas.programs import (
-    WorkoutProgramCreateIn,
-    WorkoutProgramUpdateIn,
-    WorkoutTemplateCreateIn,
-    WorkoutTemplateUpdateIn,
-)
 from schemas.subscription import (
     PromoBatchCreateIn,
     PromoBatchCreateOut,
@@ -537,64 +517,7 @@ async def admin_login(payload: LoginIn, request: Request):
     return TokenOut(access_token=access, refresh_token=refresh)
 
 
-@router.post("/content/templates")
-async def admin_create_template(payload: WorkoutTemplateCreateIn, admin_user=Depends(require_admin_user)):
-    return await create_template(payload, admin_user)
-
-
-@router.put("/content/templates/{template_id}")
-async def admin_update_template(
-    template_id: PydanticObjectId,
-    payload: WorkoutTemplateUpdateIn,
-    admin_user=Depends(require_admin_user),
-):
-    return await update_template(template_id, payload, admin_user)
-
-
-@router.delete("/content/templates/{template_id}")
-async def admin_delete_template(template_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
-    return await delete_template(template_id, admin_user)
-
-
-@router.post("/content/programs")
-async def admin_create_program(payload: WorkoutProgramCreateIn, admin_user=Depends(require_admin_user)):
-    return await create_program(payload, admin_user)
-
-
-@router.put("/content/programs/{program_id}")
-async def admin_update_program(
-    program_id: PydanticObjectId,
-    payload: WorkoutProgramUpdateIn,
-    admin_user=Depends(require_admin_user),
-):
-    return await update_program(program_id, payload, admin_user)
-
-
-@router.delete("/content/programs/{program_id}")
-async def admin_delete_program(program_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
-    return await delete_program(program_id, admin_user)
-
-
-@router.post("/content/meditations")
-async def admin_create_meditation(payload: MeditationCreateIn, admin_user=Depends(require_admin_user)):
-    return await create_meditation(payload, admin_user)
-
-
-@router.put("/content/meditations/{item_id}")
-async def admin_update_meditation(
-    item_id: PydanticObjectId,
-    payload: MeditationUpdateIn,
-    admin_user=Depends(require_admin_user),
-):
-    return await update_meditation(item_id, payload, admin_user)
-
-
-@router.delete("/content/meditations/{item_id}")
-async def admin_delete_meditation(item_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
-    return await delete_meditation(item_id, admin_user)
-
-
-@router.post("/content/exercises")
+# @router.post("/content/exercises")
 async def admin_create_exercise(payload: AdminExerciseCreateIn, admin_user=Depends(require_admin_user)):
     code = (payload.code or "").strip()
     if not code:
@@ -612,7 +535,7 @@ async def admin_create_exercise(payload: AdminExerciseCreateIn, admin_user=Depen
     return doc
 
 
-@router.put("/content/exercises/{exercise_id}")
+# @router.put("/content/exercises/{exercise_id}")
 async def admin_update_exercise(
     exercise_id: PydanticObjectId,
     payload: AdminExerciseUpdateIn,
@@ -641,7 +564,7 @@ async def admin_update_exercise(
     return doc
 
 
-@router.post("/content/exercises/{exercise_id}/upload-media")
+# @router.post("/content/exercises/{exercise_id}/upload-media")
 async def admin_upload_exercise_media(
     exercise_id: PydanticObjectId,
     request: Request,
@@ -698,7 +621,7 @@ async def admin_upload_exercise_media(
     }
 
 
-@router.delete("/content/exercises/{exercise_id}")
+# @router.delete("/content/exercises/{exercise_id}")
 async def admin_delete_exercise(exercise_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
     doc = await Exercise.get(exercise_id)
     if not doc:
@@ -708,7 +631,7 @@ async def admin_delete_exercise(exercise_id: PydanticObjectId, admin_user=Depend
     return {"status": "ok"}
 
 
-@router.get("/users", response_model=AdminUsersOut)
+# @router.get("/users", response_model=AdminUsersOut)
 async def admin_list_users(
     q: Optional[str] = Query(default=None),
     skip: int = 0,
@@ -846,7 +769,7 @@ async def admin_users_table(
     return AdminUsersTableOut(items=items, total=int(total), skip=int(skip), limit=int(limit))
 
 
-@router.get("/users/stats", response_model=AdminUsersStatsOut)
+# @router.get("/users/stats", response_model=AdminUsersStatsOut)
 async def admin_users_stats(admin_user=Depends(require_admin_user)):
     now = utcnow()
     week_ago = now - timedelta(days=7)
@@ -875,7 +798,7 @@ async def admin_users_stats(admin_user=Depends(require_admin_user)):
     )
 
 
-@router.get("/promocodes", response_model=PromoCodesOut)
+# @router.get("/promocodes", response_model=PromoCodesOut)
 async def admin_list_promocodes(
     status: Optional[PromoStatus] = None,
     skip: int = 0,
@@ -886,17 +809,17 @@ async def admin_list_promocodes(
     return await list_promos(status=status, skip=skip, limit=limit, q=q, current_user=admin_user)
 
 
-@router.post("/subscription/plans", response_model=SubscriptionPlanOut)
+# @router.post("/subscription/plans", response_model=SubscriptionPlanOut)
 async def admin_create_subscription_plan(payload: SubscriptionPlanCreateIn, admin_user=Depends(require_admin_user)):
     return await create_plan(payload, current_user=admin_user)
 
 
-@router.post("/promocodes", response_model=PromoCodeOut)
+# @router.post("/promocodes", response_model=PromoCodeOut)
 async def admin_create_promocode(payload: PromoCodeCreateIn, admin_user=Depends(require_admin_user)):
     return await create_promo(payload, current_user=admin_user)
 
 
-@router.post("/promocodes/batches", response_model=PromoBatchCreateOut)
+# @router.post("/promocodes/batches", response_model=PromoBatchCreateOut)
 async def admin_create_promocode_batch(payload: PromoBatchCreateIn, admin_user=Depends(require_admin_user)):
     return await create_promo_batch(payload, current_user=admin_user)
 
@@ -906,7 +829,7 @@ async def admin_export_promocode_batch(batch_id: str, admin_user=Depends(require
     return await export_promo_batch_csv(batch_id, current_user=admin_user)
 
 
-@router.get("/promocodes/stats", response_model=PromoStatsOut)
+# @router.get("/promocodes/stats", response_model=PromoStatsOut)
 async def admin_promocode_stats(
     batch_id: Optional[str] = None,
     promo_code_id: Optional[str] = None,
@@ -1329,7 +1252,7 @@ async def admin_dashboard(admin_user=Depends(require_admin_user)):
 
 
 @router.get("/content-library/assets", response_model=AdminContentAssetsOut)
-@router.get("/content-library", response_model=AdminContentAssetsOut)
+# @router.get("/content-library", response_model=AdminContentAssetsOut)
 async def admin_list_content_assets(
     q: Optional[str] = Query(default=None),
     asset_type: Optional[str] = Query(default=None),
@@ -1364,7 +1287,7 @@ async def admin_list_content_assets(
 
 
 @router.get("/content-library/assets/{asset_id}", response_model=AdminContentAssetOut)
-@router.get("/content-library/{asset_id}", response_model=AdminContentAssetOut)
+# @router.get("/content-library/{asset_id}", response_model=AdminContentAssetOut)
 async def admin_get_content_asset(asset_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
     doc = await ContentAsset.get(asset_id)
     if not doc:
@@ -1486,7 +1409,7 @@ async def admin_upload_content_files(
 
 
 @router.post("/content-library/assets/{asset_id}/replace-media", response_model=AdminContentAssetOut)
-@router.post("/content-library/{asset_id}/replace-media", response_model=AdminContentAssetOut)
+# @router.post("/content-library/{asset_id}/replace-media", response_model=AdminContentAssetOut)
 async def admin_replace_content_asset_media(
     asset_id: PydanticObjectId,
     request: Request,
@@ -1680,7 +1603,7 @@ async def admin_import_exercise_media_mapping(
 
 
 @router.post("/content-library/assets", response_model=AdminContentAssetOut)
-@router.post("/content-library", response_model=AdminContentAssetOut)
+# @router.post("/content-library", response_model=AdminContentAssetOut)
 async def admin_create_content_asset(payload: AdminContentAssetIn, admin_user=Depends(require_admin_user)):
     duration_seconds = payload.duration_seconds
     if payload.duration_mmss is not None:
@@ -1704,7 +1627,7 @@ async def admin_create_content_asset(payload: AdminContentAssetIn, admin_user=De
 
 
 @router.put("/content-library/assets/{asset_id}", response_model=AdminContentAssetOut)
-@router.put("/content-library/{asset_id}", response_model=AdminContentAssetOut)
+# @router.put("/content-library/{asset_id}", response_model=AdminContentAssetOut)
 async def admin_update_content_asset(
     asset_id: PydanticObjectId,
     payload: AdminContentAssetUpdateIn,
@@ -1735,7 +1658,7 @@ async def admin_update_content_asset(
 
 
 @router.delete("/content-library/assets/{asset_id}")
-@router.delete("/content-library/{asset_id}")
+# @router.delete("/content-library/{asset_id}")
 async def admin_delete_content_asset(asset_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
     doc = await ContentAsset.get(asset_id)
     if not doc:
@@ -1745,7 +1668,7 @@ async def admin_delete_content_asset(asset_id: PydanticObjectId, admin_user=Depe
 
 
 @router.get("/content-library/assets/export/csv")
-@router.get("/content-library/export/csv")
+# @router.get("/content-library/export/csv")
 async def admin_export_content_assets_csv(
     q: Optional[str] = Query(default=None),
     asset_type: Optional[str] = Query(default=None),

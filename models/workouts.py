@@ -19,6 +19,7 @@ class UserWorkoutStep(BaseModel):
     exercise_id: PydanticObjectId
 
     mode: ExerciseMode
+    sets: int = Field(default=1, ge=1, le=20)
     reps: Optional[int] = Field(default=None, ge=1, le=500)
     duration_seconds: Optional[int] = Field(default=None, ge=5, le=3600)
     rest_seconds_after: int = Field(default=45, ge=0, le=600)
@@ -54,8 +55,10 @@ class UserWorkout(BaseDoc):
 class WorkoutRunExerciseResult(BaseModel):
     exercise_id: PydanticObjectId
     mode: ExerciseMode
+    set_no: Optional[int] = Field(default=None, ge=1, le=100)
     reps_done: Optional[int] = None
     seconds_done: Optional[int] = None
+    rest_seconds_done: Optional[int] = Field(default=None, ge=0, le=3600)
     feedback: Optional[Feedback] = None
 
 

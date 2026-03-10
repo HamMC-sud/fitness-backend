@@ -10,7 +10,7 @@ from fastapi import (
 
 from models import User, VerificationCode
 from models.users import UserProfile
-from schemas.register import RegisterStartIn, RegisterVerifyIn, ResendCodeIn, RegisterCompleteIn
+from schemas.register import RegisterStartIn, RegisterVerifyIn, RegisterCompleteIn
 from api.auth.config import hash_password, hash_code, verify_code, now_utc, generate_numeric_code ,create_access_token, create_refresh_token
 from utils.email_sender import send_verification_email
 from utils.profile_image import normalize_profile_photo_value
@@ -94,34 +94,6 @@ async def verify_and_register(payload: RegisterVerifyIn):
         "status": "success",
         "message": "Email verified successfully. Please complete registration with profile information.",
         "email": record.email,
-    }
-
-
-@router.post("/register/resend-code", status_code=status.HTTP_200_OK)
-async def resend_code(payload: ResendCodeIn, background_tasks: BackgroundTasks):
-    email = payload.email.lower().strip()
-
-    record = await VerificationCode.find_one(VerificationCode.email == email)
-    if not record:
-        raise HTTPException(status_code=400, detail="No pending verification found. Start registration again.")
-
-    if record.last_resend:
-        seconds = (now_utc() - record.last_resend).total_seconds()
-        if seconds < 60:
-            raise HTTPException(status_code=429, detail="Please wait before requesting a new code")
-
-    new_code = generate_numeric_code(CODE_LENGTH)
-    record.code_hash = hash_code(new_code)
-    record.attempts = 0
-    record.last_resend = now_utc()
-    record.expires_at = now_utc() + timedelta(seconds=CODE_TTL_SECONDS)
-    await record.save()
-    background_tasks.add_task(send_verification_email, email, new_code, CODE_TTL_SECONDS)
-
-    return {
-        "status": "code_resent",
-        "email": email,
-        "expires_in_seconds": CODE_TTL_SECONDS,
     }
 
 

@@ -62,6 +62,8 @@ class AiChatOut(BaseModel):
     user_message_id: str
     assistant_message_id: str
     assistant_text: str
+    plan_message_id: Optional[str] = None
+    plan_message_text: Optional[str] = None
     action: Optional[Dict[str, Any]] = None
 
 

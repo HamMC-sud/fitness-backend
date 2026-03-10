@@ -46,10 +46,6 @@ class RegisterVerifyIn(BaseModel):
     code: str
 
 
-class ResendCodeIn(BaseModel):
-    email: str
-
-
 class RegisterCompleteIn(BaseModel):
     email: str
     profile: UserProfile

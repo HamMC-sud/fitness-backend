@@ -289,29 +289,6 @@ def build_web_checkout_url(transaction_id: str) -> Optional[str]:
     return f"{base}{sep}transaction_id={transaction_id}"
 
 
-@router.get("/subscription", response_model=SubscriptionGetOut)
-async def get_subscription(current_user=Depends(get_current_user)):
-    require_auth(current_user)
-
-    sub = await Subscription.find_one(Subscription.user_id == current_user.id)
-    if not sub:
-        return SubscriptionGetOut(subscription=None, is_active=False, in_grace=False, expires_at=None)
-
-    status, is_active, in_grace = compute_subscription_status(sub)
-    out = sub_to_out(sub)
-    out.status = status
-    return SubscriptionGetOut(subscription=out, is_active=is_active, in_grace=in_grace, expires_at=sub.expires_at)
-
-
-@router.get("/subscription/plans", response_model=SubscriptionPlansOut)
-async def list_plans(status: str = Query(default="active"), skip: int = 0, limit: int = 20):
-    limit = clamp_limit(limit)
-    q = SubscriptionPlan.find(SubscriptionPlan.status == status).sort("code")
-    total = await q.count()
-    items = await q.skip(int(skip)).limit(limit).to_list()
-    return SubscriptionPlansOut(items=[plan_to_out(p) for p in items], total=int(total), skip=int(skip), limit=int(limit))
-
-
 async def create_plan(payload: SubscriptionPlanCreateIn, current_user=Depends(get_current_user)):
     require_auth(current_user)
 
@@ -498,54 +475,6 @@ async def verify_purchase(payload: PurchaseVerifyIn, current_user=Depends(get_cu
     )
 
 
-@router.post("/payments/yookassa/webhook", response_model=YooKassaWebhookOut)
-async def yookassa_webhook(body: YooKassaWebhookIn, x_webhook_token: Optional[str] = Header(default=None)):
-    if not webhook_token_ok(x_webhook_token):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    try:
-        tx_id = PydanticObjectId(body.transaction_id)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid transaction_id")
-
-    tx = await SubscriptionTransaction.get(tx_id)
-    if not tx:
-        raise HTTPException(status_code=404, detail="Transaction not found")
-
-    st = (body.status or "").strip().lower()
-    store = dict(getattr(tx, "store", {}) or {})
-    store["yookassa"] = dict(body.payload or {})
-    store["updated_at"] = utcnow().isoformat()
-
-    if st in {"succeeded", "paid", "success"}:
-        plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == tx.plan_code, SubscriptionPlan.status == "active")
-        store["status"] = "verified"
-        store["verified_at"] = utcnow().isoformat()
-        store["provider"] = "yookassa"
-        tx.store = store
-        await tx.save()
-        if plan:
-            await upsert_subscription(
-                user_id=tx.user_id,
-                plan_code=plan.code,
-                source=tx.source,
-                add_days=int(plan.duration_days),
-                tx_id=tx.id,
-            )
-        return YooKassaWebhookOut(ok=True)
-
-    if st in {"failed", "canceled", "cancelled", "refunded"}:
-        store["status"] = "failed"
-        store["error"] = st
-        tx.store = store
-        await tx.save()
-        return YooKassaWebhookOut(ok=True)
-
-    tx.store = store
-    await tx.save()
-    return YooKassaWebhookOut(ok=True)
-
-
 @router.post("/subscription/promo/preview", response_model=PromoPreviewOut)
 async def preview_promo(payload: PromoActivateIn, current_user=Depends(get_current_user)):
     require_auth(current_user)
@@ -681,20 +610,6 @@ async def activate_promo(payload: PromoActivateIn, current_user=Depends(get_curr
         except Exception:
             pass
         raise
-
-
-@router.post("/subscription/cancel", response_model=CancelOut)
-async def cancel_subscription(current_user=Depends(get_current_user)):
-    require_auth(current_user)
-
-    sub = await Subscription.find_one(Subscription.user_id == current_user.id)
-    if not sub:
-        return CancelOut(status="ok")
-
-    sub.auto_renew = False
-    sub.status = SubscriptionStatus.canceled
-    await sub.save()
-    return CancelOut(status="ok")
 
 
 async def list_promos(

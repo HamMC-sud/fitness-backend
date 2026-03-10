@@ -67,7 +67,7 @@ async def _get_user_by_identifier(ident: str) -> Optional[User]:
 
 # ---------------- AUTH ----------------
 
-@router.post("/token", response_model=TokenOut)
+# Removed: not used by frontend
 async def token(form: OAuth2PasswordRequestForm = Depends(), request: Request = None):
     user = await _get_user_by_identifier(form.username.strip())
     if not user or not user.password_hash:
@@ -113,6 +113,7 @@ async def login(payload: LoginIn, request: Request):
 
 
 @router.post("/refresh-token", response_model=TokenOut)
+@router.post("/refresh", response_model=TokenOut)
 async def refresh_token(payload: RefreshIn, request: Request):
     decoded = decode_token(payload.refresh_token)
     if not decoded or decoded.get("type") != "refresh":

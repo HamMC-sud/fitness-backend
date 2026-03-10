@@ -25,29 +25,6 @@ def _to_local_date(recorded_at: datetime, tz_name: Optional[str]) -> date:
     return ts_utc.date()
 
 
-class HealthIntegrationStateOut(BaseModel):
-    connected: bool = False
-
-
-class HealthIntegrationsOut(BaseModel):
-    appleHealth: HealthIntegrationStateOut
-    googleFit: HealthIntegrationStateOut
-
-
-class HealthIntegrationToggleIn(BaseModel):
-    provider: HealthProvider
-    connected: bool
-    external_account_id: Optional[str] = Field(default=None, max_length=128)
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-
-class HealthIntegrationToggleOut(BaseModel):
-    provider: HealthProvider
-    connected: bool
-    connected_at: Optional[datetime] = None
-    updated_at: datetime
-
-
 class HealthStepsIn(BaseModel):
     provider: HealthProvider
     steps: int = Field(ge=0)

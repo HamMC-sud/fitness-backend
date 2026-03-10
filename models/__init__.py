@@ -3,17 +3,16 @@ from __future__ import annotations
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from beanie import init_beanie
 from .db import db, client
-from .users import User , UserProfile
+from .users import User, UserProfile
 from .verification_code import VerificationCode
-from .auth import OAuthAccount, AuthSession, EmailOTP 
-from .devices import Device
-from .content import Exercise, WorkoutTemplate, WorkoutProgram, MeditationItem
+from .auth import OAuthAccount, AuthSession, EmailOTP
+from .content import Exercise, MeditationItem
 from .workouts import UserWorkout, WorkoutRun, ExerciseFeedbackEvent
 from .meditation_run import MeditationRun
-from .engagement import DevicePushToken , Reminder , PushDeliveryLog , AnalyticsEvent , OfflineDownloadRecord
+from .engagement import AnalyticsEvent
 from .progress import (
-    ActivityEvent, WeeklyFocusWeek, AchievementDef, UserAchievement,
-    UserExerciseStats, BodyMeasurement, BeforeAfterPhoto
+    UserAchievement,
+    BodyMeasurement,
 )
 from .subscription import SubscriptionPlan, Subscription, SubscriptionTransaction
 from .promo import PromoCodeBatch, PromoCode, PromoRedemption
@@ -21,38 +20,28 @@ from .ai import (
     AiUsageMonthly, AiPlan, AiRequest,
     AiChatThread, AiChatMessage, AiDailyRecommendation, RewardedGrant
 )
-from .notifications import Notification, ReminderSettings
-from .admin import AdminUser, AdminAuditLog
-from .password_reset import PasswordReset
+from .admin import AdminUser
 from .social import SocialAccount
-from .health import UserHealthIntegration, UserHealthStepDaily
+from .health import UserHealthStepDaily
 from .content_library import ContentAsset
+
 ALL_MODELS = [
     User,
     VerificationCode,
     OAuthAccount, AuthSession, EmailOTP,
-    Device,
-    Exercise, WorkoutTemplate, WorkoutProgram, MeditationItem,
+    Exercise, MeditationItem,
     UserWorkout, WorkoutRun, ExerciseFeedbackEvent,
     MeditationRun,
-    ActivityEvent, WeeklyFocusWeek,
-    AchievementDef, UserAchievement,
-    UserExerciseStats,
-    BodyMeasurement, BeforeAfterPhoto,
-    DevicePushToken, Reminder, PushDeliveryLog, AnalyticsEvent , OfflineDownloadRecord,
+    UserAchievement,
+    BodyMeasurement,
+    AnalyticsEvent,
     SubscriptionPlan, Subscription, SubscriptionTransaction,
-
     PromoCodeBatch, PromoCode, PromoRedemption,
-
     AiUsageMonthly, AiPlan, AiRequest,
     AiChatThread, AiChatMessage, AiDailyRecommendation, RewardedGrant,
-
-    Notification, ReminderSettings,
-
-    AdminUser, AdminAuditLog,
-    PasswordReset,
+    AdminUser,
     SocialAccount,
-    UserHealthIntegration, UserHealthStepDaily,
+    UserHealthStepDaily,
     ContentAsset,
 ]
 

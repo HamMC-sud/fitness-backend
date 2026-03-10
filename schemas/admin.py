@@ -5,7 +5,14 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from models.content import ExerciseDefaults, ExerciseMedia, I18nList
+from models.content import (
+    ExerciseDefaults,
+    ExerciseMedia,
+    ExerciseInstruction,
+    ExerciseCommonMistake,
+    I18nList,
+    I18nText,
+)
 from models.enums import Difficulty, Equipment, ExerciseMode, Injury, SubscriptionStatus, WorkoutType
 
 
@@ -24,7 +31,10 @@ class AdminExerciseCreateIn(BaseModel):
     contraindications: List[Injury] = Field(default_factory=list)
     difficulty: Difficulty
     calories_per_minute: Optional[float] = Field(default=None, ge=0)
-    instructions: Dict[str, List[str]] = Field(default_factory=dict)
+    instructions: List[ExerciseInstruction] = Field(default_factory=list)
+    common_mistakes: List[ExerciseCommonMistake] = Field(default_factory=list)
+    ai_technique: Optional[I18nText] = None
+    ai_mistakes: Optional[I18nText] = None
     status: str = "active"
 
     @field_validator("equipment", mode="before")
@@ -48,7 +58,10 @@ class AdminExerciseUpdateIn(BaseModel):
     contraindications: Optional[List[Injury]] = None
     difficulty: Optional[Difficulty] = None
     calories_per_minute: Optional[float] = Field(default=None, ge=0)
-    instructions: Optional[Dict[str, List[str]]] = None
+    instructions: Optional[List[ExerciseInstruction]] = None
+    common_mistakes: Optional[List[ExerciseCommonMistake]] = None
+    ai_technique: Optional[I18nText] = None
+    ai_mistakes: Optional[I18nText] = None
     status: Optional[str] = None
 
     @field_validator("equipment", mode="before")

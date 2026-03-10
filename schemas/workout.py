@@ -16,6 +16,7 @@ class WorkoutStepIn(BaseModel):
     exercise_id: PydanticObjectId
 
     mode: ExerciseMode
+    sets: int = Field(default=1, ge=1, le=20)
     reps: Optional[int] = Field(default=None, ge=1, le=500)
     duration_seconds: Optional[int] = Field(default=None, ge=5, le=3600)
     rest_seconds_after: int = Field(default=45, ge=0, le=600)
@@ -50,14 +51,29 @@ class WorkoutUpdateIn(BaseModel):
 class WorkoutRunExerciseResultIn(BaseModel):
     exercise_id: PydanticObjectId
     mode: ExerciseMode
+    set_no: Optional[int] = Field(default=None, ge=1, le=100)
     reps_done: Optional[int] = None
     seconds_done: Optional[int] = None
+    rest_seconds_done: Optional[int] = Field(default=None, ge=0, le=3600)
     feedback: Optional[Feedback] = None
+
+
+class WorkoutStepOut(BaseModel):
+    order: int
+    exercise_id: PydanticObjectId
+    mode: ExerciseMode
+    sets: int = 1
+    reps: Optional[int] = None
+    duration_seconds: Optional[int] = None
+    rest_seconds_after: int = 45
 
 
 class WorkoutStartOut(BaseModel):
     run_id: PydanticObjectId
     started_at: datetime
+    needs_intro: bool = False
+    load_adjustment: Optional[str] = None
+    steps: List[WorkoutStepOut] = Field(default_factory=list)
 
 
 class WorkoutCompleteIn(BaseModel):
@@ -70,9 +86,28 @@ class WorkoutCompleteIn(BaseModel):
     exercise_results: List[WorkoutRunExerciseResultIn] = Field(default_factory=list)
 
 
+class WorkoutSetProgressIn(BaseModel):
+    exercise_id: PydanticObjectId
+    mode: ExerciseMode
+    set_no: int = Field(ge=1, le=100)
+    reps_done: Optional[int] = None
+    seconds_done: Optional[int] = None
+    rest_seconds_done: Optional[int] = Field(default=None, ge=0, le=3600)
+    feedback: Optional[Feedback] = None
+
+
+class WorkoutSetProgressOut(BaseModel):
+    status: str
+    run_id: str
+    exercise_id: str
+    set_no: int
+    logged_sets_for_exercise: int
+
+
 class HistoryStatsOut(BaseModel):
     total_completed: int
     total_seconds: int
     total_calories_estimated: float
     streak_days: int
+    has_completed_today: bool = False
     last_activity_at: Optional[datetime] = None

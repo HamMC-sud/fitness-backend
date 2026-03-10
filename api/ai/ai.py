@@ -938,7 +938,8 @@ async def ai_limits(current_user=Depends(get_current_user)):
     return await build_limits(current_user.id)
 
 
-@router.post("/ai/rewarded/grant", response_model=RewardedGrantOut)
+# Removed: not used by frontend
+@router.post("/ai/rewarded-grant", response_model=RewardedGrantOut)
 async def ai_rewarded_grant(payload: RewardedGrantIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
@@ -1023,7 +1024,8 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
     return AiGenerateOut(request_id=str(req.id), plan=plan_to_out(plan))
 
 
-@router.post("/ai/reroll-plan", response_model=AiRerollOut)
+# Removed: not used by frontend
+@router.post("/ai/reroll", response_model=AiRerollOut)
 async def ai_reroll_plan(payload: AiRerollIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
@@ -1085,7 +1087,6 @@ async def get_current_plan(current_user=Depends(get_current_user)):
 
 
 @router.get("/ai/daily-recommendation", response_model=AiDailyRecommendationOut)
-@router.get("/ai/recommendation/daily", response_model=AiDailyRecommendationOut)
 async def ai_daily_recommendation(mark_opened: bool = True, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
@@ -1130,7 +1131,6 @@ async def ai_daily_recommendation(mark_opened: bool = True, current_user=Depends
 
 
 @router.post("/ai/daily-recommendation/save", response_model=AiDailyRecommendationOut)
-@router.post("/ai/recommendation/daily/save", response_model=AiDailyRecommendationOut)
 async def ai_daily_recommendation_save(
     payload: AiDailyRecommendationSaveIn,
     current_user=Depends(get_current_user),
@@ -1177,8 +1177,7 @@ async def ai_daily_recommendation_save(
     return _daily_rec_to_out(rec)
 
 
-@router.delete("/ai/daily-recommendation")
-@router.delete("/ai/recommendation/daily")
+# Removed: not used by frontend
 async def ai_daily_recommendation_delete(
     recommendation_id: Optional[str] = None,
     current_user=Depends(get_current_user),

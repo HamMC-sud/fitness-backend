@@ -2,9 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Any
 
-from beanie.odm.fields import PydanticObjectId
-from bson import ObjectId
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator
 from pymongo import IndexModel, ASCENDING, TEXT
 
 from .base import BaseDoc
@@ -27,6 +25,31 @@ class I18nList(BaseModel):
         return [str(v)]
 
 
+class I18nText(BaseModel):
+    ru: str = ""
+    en: str = ""
+
+    @field_validator("ru", "en", mode="before")
+    @classmethod
+    def coerce_to_str(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, list):
+            return str(v[0]) if v else ""
+        return str(v)
+
+
+class ExerciseInstruction(BaseModel):
+    step: int = Field(ge=1)
+    title: I18nText
+    description: I18nText
+
+
+class ExerciseCommonMistake(BaseModel):
+    title: I18nText
+    description: I18nText
+
+
 class ExerciseMedia(BaseModel):
     video_url: str
     thumbnail_url: str
@@ -35,8 +58,10 @@ class ExerciseMedia(BaseModel):
 
 
 class ExerciseDefaults(BaseModel):
+    sets: int = Field(default=4, ge=1, le=20)
     reps: Optional[int] = Field(default=None, ge=1, le=500)
     duration_seconds: Optional[int] = Field(default=None, ge=5, le=3600)
+    rest_seconds_after: int = Field(default=60, ge=0, le=600)
 
 
 class Exercise(BaseDoc):
@@ -60,7 +85,10 @@ class Exercise(BaseDoc):
     difficulty: Difficulty
     calories_per_minute: Optional[float] = Field(default=None, ge=0)
 
-    instructions: Dict[str, List[str]] = Field(default_factory=dict)
+    instructions: List[ExerciseInstruction] = Field(default_factory=list)
+    common_mistakes: List[ExerciseCommonMistake] = Field(default_factory=list)
+    ai_technique: Optional[I18nText] = None
+    ai_mistakes: Optional[I18nText] = None
     status: str = "active"
 
     @field_validator("equipment", mode="before")
@@ -78,116 +106,6 @@ class Exercise(BaseDoc):
             IndexModel([("equipment", ASCENDING)]),
             IndexModel([("contraindications", ASCENDING)]),
             IndexModel([("name.ru", TEXT), ("name.en", TEXT)]),
-        ]
-
-
-class WorkoutStep(BaseModel):
-    order: int = Field(ge=1)
-    exercise_id: PydanticObjectId
-
-    mode: ExerciseMode
-    reps: Optional[int] = Field(default=None, ge=1, le=500)
-    duration_seconds: Optional[int] = Field(default=None, ge=5, le=3600)
-    rest_seconds_after: int = Field(default=45, ge=0, le=600)
-
-    @field_validator("exercise_id", mode="before")
-    @classmethod
-    def parse_exercise_id(cls, v: Any):
-        if v is None:
-            return v
-        if isinstance(v, (PydanticObjectId, ObjectId)):
-            return v
-        if isinstance(v, str):
-            return ObjectId(v)
-        return ObjectId(str(v))
-
-    @model_validator(mode="after")
-    def validate_step(self):
-        if self.mode == ExerciseMode.reps:
-            if self.reps is None:
-                raise ValueError("reps is required when mode='reps'")
-            if self.duration_seconds is not None:
-                raise ValueError("duration_seconds must be null when mode='reps'")
-        elif self.mode == ExerciseMode.time:
-            if self.duration_seconds is None:
-                raise ValueError("duration_seconds is required when mode='time'")
-            if self.reps is not None:
-                raise ValueError("reps must be null when mode='time'")
-        return self
-
-
-class WorkoutTemplate(BaseDoc):
-    title: I18nList
-    description: Optional[I18nList] = None
-
-    type: WorkoutType
-    level: Difficulty
-    estimated_minutes: int = Field(ge=5, le=180)
-
-    steps: List[WorkoutStep] = Field(default_factory=list)
-    equipment_required: List[Equipment] = Field(default_factory=list)
-
-    status: str = "active"
-
-    @field_validator("equipment_required", mode="before")
-    @classmethod
-    def normalize_equipment_required(cls, v: Any):
-        return Equipment.normalize_many(v)
-
-    class Settings:
-        name = "workout_templates"
-        indexes = [
-            IndexModel([("type", ASCENDING)]),
-            IndexModel([("level", ASCENDING)]),
-        ]
-
-
-class ProgramScheduleItem(BaseModel):
-    day_index: int = Field(ge=1, le=7)
-    workout_template_id: PydanticObjectId
-
-    @field_validator("workout_template_id", mode="before")
-    @classmethod
-    def parse_template_id(cls, v: Any):
-        if v is None:
-            return v
-        if isinstance(v, (PydanticObjectId, ObjectId)):
-            return v
-        if isinstance(v, str):
-            return ObjectId(v)
-        return ObjectId(str(v))
-
-
-class WorkoutProgram(BaseDoc):
-    slug: str
-    title: I18nList
-    description: Optional[I18nList] = None
-
-    weeks: int = Field(ge=1, le=52)
-    workouts_per_week: int = Field(ge=1, le=7)
-    session_minutes: int = Field(ge=15, le=120)
-
-    level: Difficulty
-    goals: List[str] = Field(default_factory=list)
-    interest: str = "home"
-    equipment_required: List[Equipment] = Field(default_factory=list)
-
-    preview: Dict[str, Optional[str]] = Field(default_factory=dict)
-    schedule: List[ProgramScheduleItem] = Field(default_factory=list)
-
-    status: str = "active"
-
-    @field_validator("equipment_required", mode="before")
-    @classmethod
-    def normalize_equipment_required(cls, v: Any):
-        return Equipment.normalize_many(v)
-
-    class Settings:
-        name = "workout_programs"
-        indexes = [
-            IndexModel([("slug", ASCENDING)], unique=True),
-            IndexModel([("level", ASCENDING)]),
-            IndexModel([("interest", ASCENDING)]),
         ]
 
 

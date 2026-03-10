@@ -11,22 +11,6 @@ from .base import BaseDoc
 from .enums import HealthProvider
 
 
-class UserHealthIntegration(BaseDoc):
-    user_id: PydanticObjectId
-    provider: HealthProvider
-    is_connected: bool = False
-    connected_at: Optional[datetime] = None
-    external_account_id: Optional[str] = Field(default=None, max_length=128)
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-    class Settings:
-        name = "user_health_integrations"
-        indexes = [
-            IndexModel([("user_id", ASCENDING), ("provider", ASCENDING)], unique=True),
-            IndexModel([("user_id", ASCENDING), ("updated_at", DESCENDING)]),
-        ]
-
-
 class UserHealthStepDaily(BaseDoc):
     user_id: PydanticObjectId
     provider: HealthProvider
