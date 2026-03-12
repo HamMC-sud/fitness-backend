@@ -77,13 +77,12 @@ class WorkoutStartOut(BaseModel):
 
 
 class WorkoutCompleteIn(BaseModel):
+    exercise_id: PydanticObjectId
     total_seconds: Optional[int] = Field(default=None, ge=0)
     calories_estimated: Optional[float] = Field(default=None, ge=0)
 
     rating_stars: Optional[int] = Field(default=None, ge=1, le=5)
     difficulty_feedback: Optional[Feedback] = None
-
-    exercise_results: List[WorkoutRunExerciseResultIn] = Field(default_factory=list)
 
 
 class WorkoutSetProgressIn(BaseModel):

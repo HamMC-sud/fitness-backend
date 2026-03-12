@@ -37,6 +37,51 @@ def parse_time_to_defaults(time_str: str) -> dict[str, Any]:
     return {"mode": "reps", "reps": 12, "duration_seconds": None, "media_duration": 40, "sets": 4, "rest_seconds_after": 60}
 
 
+def build_set_plan(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    sets = int(parsed.get("sets") or 4)
+    rest = int(parsed.get("rest_seconds_after") or 60)
+    mode = str(parsed.get("mode") or "reps")
+    reps = parsed.get("reps")
+    seconds = parsed.get("duration_seconds")
+
+    out: list[dict[str, Any]] = []
+    for i in range(1, sets + 1):
+        item: dict[str, Any] = {"set_no": i, "rest_seconds_after": rest}
+        if mode == "reps":
+            item["target_reps"] = int(reps or 12)
+            item["target_duration_seconds"] = None
+        else:
+            item["target_reps"] = None
+            item["target_duration_seconds"] = int(seconds or parsed.get("media_duration") or 30)
+        out.append(item)
+    return out
+
+
+def build_sets_reps(parsed: dict[str, Any]) -> list[dict[str, Any]]:
+    sets = int(parsed.get("sets") or 4)
+    rest = int(parsed.get("rest_seconds_after") or 60)
+    mode = str(parsed.get("mode") or "reps")
+    reps = parsed.get("reps")
+    seconds = parsed.get("duration_seconds")
+    fallback_seconds = int(seconds or parsed.get("media_duration") or 30)
+
+    out: list[dict[str, Any]] = []
+    for i in range(1, sets + 1):
+        rep_item = {
+            "rep_no": 1,
+            "target_reps": int(reps) if (mode == "reps" and reps is not None) else None,
+            "target_duration_seconds": fallback_seconds if mode == "time" else None,
+        }
+        out.append(
+            {
+                "set_no": i,
+                "rest_seconds_after": rest,
+                "reps": [rep_item],
+            }
+        )
+    return out
+
+
 def load_all_exercises(ts_path: Path) -> list[dict[str, Any]]:
     raw = ts_path.read_text(encoding="utf-8")
     start = raw.find("[")
@@ -195,6 +240,8 @@ def upsert_exercises(db, all_exercises: list[dict[str, Any]], base_url: str, dry
             "defaults.reps": parsed["reps"],
             "defaults.duration_seconds": parsed["duration_seconds"],
             "defaults.rest_seconds_after": int(parsed["rest_seconds_after"]),
+            "defaults.sets_reps": build_sets_reps(parsed),
+            "defaults.set_plan": build_set_plan(parsed),
             "workout_type": workout_types,
             "equipment": map_equipment(str(ex.get("equipment") or "")),
             "contraindications": [],

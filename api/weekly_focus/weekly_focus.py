@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from api.auth.config import get_current_user
 from models.workouts import WorkoutRun
@@ -47,16 +47,39 @@ def week_bounds_utc(tz_name: Optional[str]) -> tuple[datetime, datetime, str]:
     return start_utc, end_utc, tz_used
 
 
+def _normalize_tz_name(value: Optional[str]) -> Optional[str]:
+    tz_name = str(value or "").strip()
+    if not tz_name:
+        return None
+    try:
+        ZoneInfo(tz_name)
+        return tz_name
+    except Exception:
+        return None
+
+
+def _effective_tz_name(current_user, request: Optional[Request]) -> str:
+    user_tz = _normalize_tz_name(getattr(current_user, "timezone", None))
+    if user_tz and user_tz.upper() != "UTC":
+        return user_tz
+
+    header_tz = _normalize_tz_name(request.headers.get("X-Timezone") if request else None)
+    if header_tz:
+        return header_tz
+
+    return user_tz or "UTC"
+
+
 def require_auth(user):
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 @router.get("/weekly-focus", response_model=WeeklyFocusOut)
-async def get_weekly_focus(current_user=Depends(get_current_user)):
+async def get_weekly_focus(request: Request, current_user=Depends(get_current_user)):
     require_auth(current_user)
 
-    tz_name = getattr(current_user, "timezone", None) or "UTC"
+    tz_name = _effective_tz_name(current_user, request)
     start_utc, end_utc, tz_used = week_bounds_utc(tz_name)
 
     workout_runs = await WorkoutRun.find(

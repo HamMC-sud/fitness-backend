@@ -5,13 +5,13 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from beanie.odm.fields import PydanticObjectId
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 import math
 from copy import deepcopy
 
 from api.auth.config import get_current_user
-from models import UserWorkout, WorkoutRun, ExerciseFeedbackEvent
+from models import UserWorkout, WorkoutRun, Exercise, UserAchievement
 from models.enums import ExerciseMode
 from models.workouts import Feedback  # ✅ enum
 from schemas.workout import (
@@ -43,6 +43,29 @@ def user_tz_or_utc(tz_name: Optional[str]) -> ZoneInfo:
         return ZoneInfo(tz_name or "UTC")
     except Exception:
         return ZoneInfo("UTC")
+
+
+def _normalize_tz_name(value: Optional[str]) -> Optional[str]:
+    tz_name = str(value or "").strip()
+    if not tz_name:
+        return None
+    try:
+        ZoneInfo(tz_name)
+        return tz_name
+    except Exception:
+        return None
+
+
+def _effective_tz_name(current_user, request: Optional[Request]) -> str:
+    user_tz = _normalize_tz_name(getattr(current_user, "timezone", None))
+    if user_tz and user_tz.upper() != "UTC":
+        return user_tz
+
+    header_tz = _normalize_tz_name(request.headers.get("X-Timezone") if request else None)
+    if header_tz:
+        return header_tz
+
+    return user_tz or "UTC"
 
 
 def day_bounds_utc(local_day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
@@ -182,6 +205,77 @@ def _fb_to_str(fb: Feedback) -> str:
     return getattr(fb, "value", str(fb))
 
 
+STREAK_ACHIEVEMENTS: list[dict[str, object]] = [
+    {"id": "str_003", "name": "Spark", "logic": "streak >= 3", "max_progress": 3, "points": 50},
+    {"id": "str_007", "name": "On Fire", "logic": "streak >= 7", "max_progress": 7, "points": 100},
+    {"id": "str_014", "name": "Two Weeks Strong", "logic": "streak >= 14", "max_progress": 14, "points": 150},
+    {"id": "str_030", "name": "Unstoppable", "logic": "streak >= 30", "max_progress": 30, "points": 200},
+    {"id": "str_090", "name": "90 Day Grind", "logic": "streak >= 90", "max_progress": 90, "points": 250},
+    {"id": "str_365", "name": "Yearly Warrior", "logic": "streak >= 365", "max_progress": 365, "points": 300},
+]
+
+
+async def _upsert_user_achievement_progress(
+    *,
+    user_id: PydanticObjectId,
+    achievement_code: str,
+    category: str,
+    name: str,
+    logic: str,
+    progress: float,
+    max_progress: float,
+    points: int,
+) -> None:
+    safe_progress = max(0.0, min(float(progress), float(max_progress)))
+    doc = await UserAchievement.find_one(
+        UserAchievement.user_id == user_id,
+        UserAchievement.achievement_code == achievement_code,
+    )
+
+    if doc:
+        # Keep progress monotonic to avoid losing unlocked achievements.
+        doc.progress = max(float(getattr(doc, "progress", 0) or 0), safe_progress)
+        doc.max_progress = float(max_progress)
+        doc.points = int(points)
+        if not getattr(doc, "category", None):
+            doc.category = category
+        if not getattr(doc, "name", None):
+            doc.name = name
+        if not getattr(doc, "logic", None):
+            doc.logic = logic
+        if doc.progress >= doc.max_progress and getattr(doc, "unlocked_at", None) is None:
+            doc.unlocked_at = utcnow()
+        await doc.save()
+        return
+
+    await UserAchievement(
+        user_id=user_id,
+        achievement_code=achievement_code,
+        category=category,
+        name=name,
+        logic=logic,
+        progress=safe_progress,
+        max_progress=float(max_progress),
+        points=int(points),
+        unlocked_at=utcnow() if safe_progress >= float(max_progress) else None,
+    ).insert()
+
+
+async def _sync_streak_achievements(user_id: PydanticObjectId, streak_days: int) -> None:
+    streak = max(0, int(streak_days or 0))
+    for row in STREAK_ACHIEVEMENTS:
+        await _upsert_user_achievement_progress(
+            user_id=user_id,
+            achievement_code=str(row["id"]),
+            category="A",
+            name=str(row["name"]),
+            logic=str(row["logic"]),
+            progress=float(streak),
+            max_progress=float(row["max_progress"]),
+            points=int(row["points"]),
+        )
+
+
 async def _get_owned_workout_or_404(workout_id: PydanticObjectId, user_id: PydanticObjectId) -> UserWorkout:
     w = await UserWorkout.get(workout_id)
     if not w:
@@ -245,11 +339,67 @@ async def _resolve_run_and_workout_for_id(id_value: PydanticObjectId, user_id: P
         workout = await UserWorkout.get(run.workout_ref_id) if run.workout_ref_id else None
         return run, workout
 
-    workout = await _get_owned_workout_or_404(id_value, user_id)
+    workout = await UserWorkout.get(id_value)
+    if workout:
+        if workout.user_id != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    else:
+        exercise = await Exercise.get(id_value)
+        if not exercise or getattr(exercise, "status", "active") != "active":
+            raise HTTPException(status_code=404, detail="Workout not found")
+        workout = await _create_user_workout_from_exercise(exercise, user_id)
+
     run = await _get_open_run_for_workout(workout.id, user_id)
     if not run:
         run = await _create_run_for_workout(workout, user_id)
     return run, workout
+
+
+def _pick_workout_title_from_exercise(exercise: Exercise) -> str:
+    name = getattr(exercise, "name", None)
+    for lang in ("en", "ru"):
+        values = getattr(name, lang, None) if name else None
+        if isinstance(values, list) and values:
+            text = str(values[0]).strip()
+            if text:
+                return text
+    code = str(getattr(exercise, "code", "") or "").strip()
+    return code or "Single Exercise"
+
+
+async def _create_user_workout_from_exercise(exercise: Exercise, user_id: PydanticObjectId) -> UserWorkout:
+    mode = getattr(exercise, "mode", ExerciseMode.reps)
+    defaults = getattr(exercise, "defaults", None)
+    media = getattr(exercise, "media", None)
+
+    sets = int(getattr(defaults, "sets", 1) or 1)
+    reps = getattr(defaults, "reps", None)
+    duration = getattr(defaults, "duration_seconds", None)
+    if duration is None:
+        duration = int(getattr(media, "duration_seconds", 0) or 0) or None
+    rest_seconds_after = int(getattr(defaults, "rest_seconds_after", 45) or 45)
+
+    step: dict = {
+        "order": 1,
+        "exercise_id": exercise.id,
+        "mode": mode,
+        "sets": sets,
+        "rest_seconds_after": rest_seconds_after,
+    }
+    if mode == ExerciseMode.reps:
+        step["reps"] = int(reps or 1)
+        step["duration_seconds"] = None
+    else:
+        step["duration_seconds"] = max(5, int(duration or 30))
+        step["reps"] = None
+
+    workout = UserWorkout(
+        user_id=user_id,
+        title=_pick_workout_title_from_exercise(exercise),
+        steps=[step],
+    )
+    await workout.insert()
+    return workout
 
 
 async def _create_run_for_workout(workout: UserWorkout, user_id: PydanticObjectId) -> WorkoutRun:
@@ -298,27 +448,13 @@ def _step_sets_by_exercise(workout: Optional[UserWorkout]) -> dict[PydanticObjec
     return mapping
 
 
-def _validate_exercise_results(payload: WorkoutCompleteIn, workout: Optional[UserWorkout]) -> None:
-    if not payload.exercise_results:
+def _validate_complete_exercise_id(payload: WorkoutCompleteIn, workout: Optional[UserWorkout]) -> None:
+    if workout is None:
         return
 
-    step_modes = _step_mode_by_exercise(workout)
-    step_sets = _step_sets_by_exercise(workout)
-
-    for r in payload.exercise_results:
-        _validate_mode_payload(r.mode, r.reps_done, r.seconds_done)
-        if not step_modes:
-            continue
-        expected_mode = step_modes.get(r.exercise_id)
-        if expected_mode is None:
-            raise HTTPException(status_code=400, detail=f"exercise_id not found in workout: {r.exercise_id}")
-        if expected_mode != r.mode:
-            raise HTTPException(status_code=400, detail=f"mode mismatch for exercise_id: {r.exercise_id}")
-        expected_sets = int(step_sets.get(r.exercise_id, 1) or 1)
-        if expected_sets > 1 and r.set_no is None:
-            raise HTTPException(status_code=400, detail=f"set_no is required for multi-set exercise: {r.exercise_id}")
-        if r.set_no is not None and int(r.set_no) > expected_sets:
-            raise HTTPException(status_code=400, detail=f"set_no exceeds configured sets for exercise: {r.exercise_id}")
+    step_ids = {str(s.exercise_id) for s in (workout.steps or [])}
+    if step_ids and str(payload.exercise_id) not in step_ids:
+        raise HTTPException(status_code=400, detail=f"exercise_id not found in workout: {payload.exercise_id}")
 
 
 def _normalize_result_item(item) -> dict:
@@ -348,7 +484,7 @@ def _upsert_set_entry(existing_items: list[dict], incoming_item: dict) -> list[d
     return merged
 
 
-async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, current_user):
+async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, current_user, tz_name: Optional[str] = None):
     user_id = current_user.id
     if run.completed_at is not None:
         raise HTTPException(status_code=400, detail="Run already completed")
@@ -358,40 +494,10 @@ async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, current_use
     run.calories_estimated = payload.calories_estimated
     run.rating_stars = payload.rating_stars
     run.difficulty_feedback = payload.difficulty_feedback  # ✅ already Feedback enum in schema
-    incoming_results = [r.model_dump() for r in payload.exercise_results]
-    if incoming_results:
-        existing_results = [_normalize_result_item(x) for x in (run.exercise_results or [])]
-        merged_results = existing_results
-        for entry in incoming_results:
-            merged_results = _upsert_set_entry(merged_results, entry)
-        run.exercise_results = merged_results
-
     await run.save()
-
-    # exercise-level feedback events (existing behavior)
-    events = []
-    for r in payload.exercise_results:
-        if r.feedback is None:
-            continue
-        events.append(
-            ExerciseFeedbackEvent(
-                user_id=user_id,
-                exercise_id=r.exercise_id,
-                workout_run_id=run.id,
-                feedback=r.feedback,
-            )
-        )
-
-    if events:
-        try:
-            await ExerciseFeedbackEvent.insert_many(events)
-        except Exception:
-            for e in events:
-                await e.insert()
-
     has_completed_today, streak_days, last_activity_at = await _workout_streak_snapshot(
         user_id=user_id,
-        tz_name=getattr(current_user, "timezone", None),
+        tz_name=tz_name or getattr(current_user, "timezone", None),
     )
 
     # Keep user stats in sync with workout streak logic.
@@ -401,6 +507,12 @@ async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, current_use
             current_user.stats.last_activity_at = last_activity_at
             await current_user.save()
     except Exception:
+        pass
+
+    try:
+        await _sync_streak_achievements(user_id=user_id, streak_days=streak_days)
+    except Exception:
+        # Do not fail workout completion if achievement sync fails.
         pass
 
     return {
@@ -583,13 +695,19 @@ async def set_progress_workout(id: PydanticObjectId, payload: WorkoutSetProgress
 
 
 @router.post("/workouts/{id}/complete", status_code=status.HTTP_200_OK)
-async def complete_workout(id: PydanticObjectId, payload: WorkoutCompleteIn, current_user=Depends(get_current_user)):
+async def complete_workout(
+    id: PydanticObjectId,
+    payload: WorkoutCompleteIn,
+    request: Request,
+    current_user=Depends(get_current_user),
+):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     run, workout = await _resolve_run_and_workout_for_id(id, current_user.id)
-    _validate_exercise_results(payload, workout)
-    return await _complete_run(run, payload, current_user)
+    _validate_complete_exercise_id(payload, workout)
+    tz_name = _effective_tz_name(current_user, request)
+    return await _complete_run(run, payload, current_user, tz_name=tz_name)
 
 
 # Removed: not used by frontend
@@ -661,7 +779,7 @@ async def history_list(current_user=Depends(get_current_user), skip: int = 0, li
 
 
 # Removed: not used by frontend
-async def history_stats(current_user=Depends(get_current_user)):
+async def history_stats(request: Request, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -690,7 +808,7 @@ async def history_stats(current_user=Depends(get_current_user)):
     total_calories = float(sum((r.calories_estimated or 0) for r in runs))
     has_completed_today, streak, last_activity_at = await _workout_streak_snapshot(
         user_id=current_user.id,
-        tz_name=getattr(current_user, "timezone", None),
+        tz_name=_effective_tz_name(current_user, request),
     )
 
     return HistoryStatsOut(
@@ -701,3 +819,5 @@ async def history_stats(current_user=Depends(get_current_user)):
         has_completed_today=has_completed_today,
         last_activity_at=last_activity_at,
     )
+
+

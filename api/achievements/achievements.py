@@ -130,58 +130,6 @@ def nth_completed_at(sorted_completed: List[datetime], n: int) -> Optional[datet
         return None
     return sorted_completed[n - 1]
 
-
-def milestone_item(
-    key: str,
-    category: str,
-    title_ru: str,
-    title_en: str,
-    desc_ru: str,
-    desc_en: str,
-    unit: str,
-    current: float,
-    target: float,
-    unlocked_at: Optional[datetime],
-) -> AchievementItemOut:
-    unlocked = current >= target
-    return AchievementItemOut(
-        key=key,
-        category=category,
-        title=I18nText(ru=title_ru, en=title_en),
-        description=I18nText(ru=desc_ru, en=desc_en),
-        unit=unit,
-        current=current,
-        target=target,
-        progress=clamp_progress(current, target),
-        unlocked=unlocked,
-        unlocked_at=unlocked_at if unlocked else None,
-    )
-
-
-def _slug_code(name: str) -> str:
-    s = "_".join((name or "").strip().lower().split())
-    return "".join(ch for ch in s if ch.isalnum() or ch == "_")[:120] or "achievement"
-
-
-def _to_user_achievement_out(x: UserAchievement) -> UserAchievementOut:
-    return UserAchievementOut(
-        id=str(x.id),
-        achievement_code=x.achievement_code,
-        name=getattr(x, "name", "achievement"),
-        progress=float(x.progress or 0),
-        max_progress=float(getattr(x, "max_progress", 100) or 100),
-        points=int(getattr(x, "points", 0) or 0),
-        unlocked_at=getattr(x, "unlocked_at", None),
-    )
-
-
-def _catalog_item_by_id(category: str, achievement_id: str) -> Optional[dict]:
-    for it in ACHIEVEMENT_CATALOG.get(category, []):
-        if it["id"] == achievement_id:
-            return it
-    return None
-
-
 def _category_for_achievement(achievement_id: str) -> Optional[str]:
     for cat, items in ACHIEVEMENT_CATALOG.items():
         for it in items:
@@ -204,29 +152,6 @@ def _max_progress_for(achievement_id: str) -> float:
 
 def _clamp_to_max(progress: float, max_progress: float) -> float:
     return max(0.0, min(float(progress), float(max_progress)))
-
-
-def _to_catalog_item_out(category: str, item: dict, doc: Optional[UserAchievement]) -> AchievementCatalogItemOut:
-    max_progress = _max_progress_for(item["id"])
-    progress = float(getattr(doc, "progress", 0) or 0) if doc else 0.0
-    progress = _clamp_to_max(progress, max_progress)
-    unlocked_at = getattr(doc, "unlocked_at", None) if doc else None
-    unlocked = progress >= max_progress or unlocked_at is not None
-    points_value = _points_for(category, item["id"])
-    return AchievementCatalogItemOut(
-        id=item["id"],
-        category=category,
-        name_ru=item["name_ru"],
-        name_en=item["name_en"],
-        description_ru=item["description_ru"],
-        description_en=item["description_en"],
-        logic=item["logic"],
-        points=points_value,
-        progress=progress,
-        max_progress=max_progress,
-        unlocked=unlocked,
-        unlocked_at=unlocked_at,
-    )
 
 
 def _to_progress_out(achievement_id: str, doc: Optional[UserAchievement]) -> AchievementProgressOut:

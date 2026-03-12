@@ -574,6 +574,7 @@ def _build_workout_template(
         mode = _as_str(ex.mode)
         default_reps = getattr(ex.defaults, "reps", None) if ex.defaults else None
         default_dur = getattr(ex.defaults, "duration_seconds", None) if ex.defaults else None
+        media = getattr(ex, "media", None)
 
         item: dict[str, Any] = {
             "exercise_id": str(ex.id),
@@ -582,6 +583,8 @@ def _build_workout_template(
             "mode": mode,
             "sets": sets,
             "rest_seconds": rest_seconds,
+            "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
+            "video_url": getattr(media, "video_url", None) if media else None,
         }
         if mode == "time":
             item["duration_seconds"] = int(default_dur or 30)
@@ -758,6 +761,9 @@ async def _try_generate_plan_with_yandex(
     if not isinstance(raw_days, list) or len(raw_days) != total_days:
         return None
 
+    catalog_by_id = {str(ex.id): ex for ex in catalog}
+    catalog_by_code = {str(ex.code): ex for ex in catalog if getattr(ex, "code", None)}
+
     normalized: list[dict[str, Any]] = []
     for i, d in enumerate(raw_days):
         if not isinstance(d, dict):
@@ -769,6 +775,42 @@ async def _try_generate_plan_with_yandex(
         wt = d.get("workout_template")
         if wt is not None and not isinstance(wt, dict):
             wt = None
+
+        # Enrich AI-produced workout template with media and stable ids
+        # so frontend can show exercise photo and open a concrete exercise on click.
+        if d_type == "workout" and isinstance(wt, dict):
+            raw_exercises = wt.get("exercises")
+            if isinstance(raw_exercises, list):
+                enriched_exercises: list[dict[str, Any]] = []
+                for it in raw_exercises:
+                    if not isinstance(it, dict):
+                        continue
+                    row = dict(it)
+                    ex_obj = None
+
+                    ex_id = str(row.get("exercise_id") or "").strip()
+                    if ex_id:
+                        ex_obj = catalog_by_id.get(ex_id)
+                    if ex_obj is None:
+                        ex_code = str(row.get("exercise_code") or "").strip()
+                        if ex_code:
+                            ex_obj = catalog_by_code.get(ex_code)
+
+                    if ex_obj is not None:
+                        media = getattr(ex_obj, "media", None)
+                        row["exercise_id"] = str(ex_obj.id)
+                        if not row.get("exercise_code"):
+                            row["exercise_code"] = getattr(ex_obj, "code", None)
+                        if not row.get("name"):
+                            row["name"] = _pick_i18n_name(ex_obj.name, language)
+                        if not row.get("thumbnail_url"):
+                            row["thumbnail_url"] = getattr(media, "thumbnail_url", None) if media else None
+                        if not row.get("video_url"):
+                            row["video_url"] = getattr(media, "video_url", None) if media else None
+
+                    enriched_exercises.append(row)
+                wt["exercises"] = enriched_exercises
+
         normalized.append(
             {
                 "date": day_date,
@@ -1086,6 +1128,58 @@ async def get_current_plan(current_user=Depends(get_current_user)):
     return plan_to_out(plan)
 
 
+@router.delete("/ai/plan/{plan_id}", status_code=200)
+async def delete_ai_plan(plan_id: str, current_user=Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        pid = PydanticObjectId(plan_id)
+    except Exception:
+        raise HTTPException(400, "Invalid plan_id")
+
+    plan = await AiPlan.get(pid)
+    if not plan or plan.user_id != current_user.id:
+        raise HTTPException(404, "Plan not found")
+
+    await plan.delete()
+    return {"status": "ok", "plan_id": str(pid)}
+
+
+@router.delete("/ai/plan/{plan_id}/day", status_code=200)
+async def delete_ai_plan_day(plan_id: str, date: str, current_user=Depends(get_current_user)):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+
+    try:
+        pid = PydanticObjectId(plan_id)
+    except Exception:
+        raise HTTPException(400, "Invalid plan_id")
+
+    plan = await AiPlan.get(pid)
+    if not plan or plan.user_id != current_user.id:
+        raise HTTPException(404, "Plan not found")
+
+    idx = _find_day_index(plan, date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    day_obj = plan.days[idx]
+    day_obj.type = "recovery"
+    day_obj.workout_template = None
+
+    plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
+    day_obj = plan.days[idx]
+
+    return {
+        "status": "ok",
+        "plan_id": str(plan.id),
+        "date": str(getattr(day_obj, "date", date)),
+        "type": str(getattr(day_obj, "type", "recovery")),
+        "workout_template": None,
+    }
+
+
 @router.get("/ai/daily-recommendation", response_model=AiDailyRecommendationOut)
 async def ai_daily_recommendation(mark_opened: bool = True, current_user=Depends(get_current_user)):
     if not current_user:
@@ -1177,7 +1271,7 @@ async def ai_daily_recommendation_save(
     return _daily_rec_to_out(rec)
 
 
-# Removed: not used by frontend
+@router.delete("/ai/daily-recommendation", status_code=200)
 async def ai_daily_recommendation_delete(
     recommendation_id: Optional[str] = None,
     current_user=Depends(get_current_user),
@@ -1209,7 +1303,11 @@ async def ai_daily_recommendation_delete(
 
     rec.removed_at = utcnow()
     await rec.save()
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "recommendation_id": str(rec.id),
+        "removed_at": rec.removed_at,
+    }
 
 
 @router.get("/ai/chat/history", response_model=AiChatHistoryOut)
@@ -1438,6 +1536,84 @@ def _day_focus(day_obj: Any) -> Optional[str]:
     return str(v) if v else None
 
 
+def _day_to_dict(day_obj: Any) -> Dict[str, Any]:
+    if hasattr(day_obj, "model_dump"):
+        return day_obj.model_dump()
+    if isinstance(day_obj, dict):
+        return dict(day_obj)
+    return {
+        "date": str(getattr(day_obj, "date", "")),
+        "type": str(getattr(day_obj, "type", "recovery")),
+        "workout_template": getattr(day_obj, "workout_template", None),
+    }
+
+
+async def _persist_plan_day(plan: AiPlan, idx: int, day_obj: Any, user_id: PydanticObjectId) -> AiPlan:
+    await AiPlan.find_one(
+        AiPlan.id == plan.id,
+        AiPlan.user_id == user_id,
+    ).update(
+        {
+            "$set": {
+                f"days.{idx}": _day_to_dict(day_obj),
+                "updated_at": utcnow(),
+            }
+        }
+    )
+    refreshed = await AiPlan.get(plan.id)
+    if not refreshed or refreshed.user_id != user_id:
+        raise HTTPException(404, "Plan not found")
+    return refreshed
+
+
+async def _build_template_for_existing_plan_day(
+    *,
+    current_user: Any,
+    plan: AiPlan,
+    day_iso: str,
+    day_index: int,
+    focus_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    meta = dict(getattr(plan, "created_from", None) or {})
+    inputs = _merge_prompt_with_profile(current_user, meta)
+    target_types = _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
+
+    if focus_override:
+        focus = str(focus_override).strip().lower()
+        if focus:
+            target_types = [focus] + [t for t in target_types if t != focus]
+
+    injuries = set(_as_str_list(inputs.get("injuries")))
+    equipment = set(_as_str_list(inputs.get("equipment")))
+    exercises = await _load_exercises_for_planning(
+        injuries=injuries,
+        equipment=equipment,
+        target_types=set(target_types),
+    )
+
+    try:
+        day_date = datetime.strptime(day_iso, "%Y-%m-%d").date()
+    except Exception:
+        day_date = utcnow().date()
+
+    workout_day_idx = 0
+    for i, d in enumerate(plan.days or []):
+        if i >= day_index:
+            break
+        if str(getattr(d, "type", "recovery")) == "workout":
+            workout_day_idx += 1
+
+    return _build_workout_template(
+        day_date=day_date,
+        week_idx=max(0, int(day_index) // 7),
+        day_idx=workout_day_idx,
+        inputs=inputs,
+        exercises=exercises,
+        target_types=target_types or ["strength", "cardio", "hiit"],
+        rng_seed=f"edit:{plan.id}:{day_iso}",
+    )
+
+
 @router.post("/ai/adjust-plan", response_model=AiAdjustOut)
 async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_user)):
     if not current_user:
@@ -1574,15 +1750,19 @@ async def ai_plan_day_edit(
         day_obj.type = "recovery"
         day_obj.workout_template = None
     else:
+        requested_focus = None
+        if "focus" in patch and patch["focus"]:
+            requested_focus = patch["focus"].strip().lower()
+
         if day_type != "workout":
             day_obj.type = "workout"
-            wt = {
-                "title": "Edited workout",
-                "duration_min": 35,
-                "intensity": "moderate",
-                "focus": "strength",
-                "exercises": [],
-            }
+            wt = await _build_template_for_existing_plan_day(
+                current_user=current_user,
+                plan=plan,
+                day_iso=date,
+                day_index=idx,
+                focus_override=requested_focus,
+            )
 
         if "duration_min" in patch and patch["duration_min"] is not None:
             wt["duration_min"] = int(patch["duration_min"])
@@ -1593,14 +1773,13 @@ async def ai_plan_day_edit(
             wt["intensity"] = norm
         if "title" in patch and patch["title"]:
             wt["title"] = patch["title"].strip()
-        if "focus" in patch and patch["focus"]:
-            wt["focus"] = patch["focus"].strip().lower()
+        if requested_focus:
+            wt["focus"] = requested_focus
 
         day_obj.workout_template = wt
 
-    days[idx] = day_obj
-    plan.days = days
-    await plan.save()
+    plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
+    day_obj = plan.days[idx]
 
     final_type = str(getattr(day_obj, "type", "recovery"))
     return AiPlanDayDetailOut(
@@ -1698,8 +1877,8 @@ async def ai_plan_day_apply_swap(
     day_obj = plan.days[idx]
     day_obj.type = "workout"
     day_obj.workout_template = dict(chosen.workout_template or {})
-    plan.days[idx] = day_obj
-    await plan.save()
+    plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
+    day_obj = plan.days[idx]
 
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
