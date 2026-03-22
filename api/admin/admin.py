@@ -103,7 +103,7 @@ MAX_VIDEO_BYTES = 300 * 1024 * 1024
 MAX_AUDIO_BYTES = 100 * 1024 * 1024
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 CONTENT_UPLOAD_DIR = Path("statics/uploads/content")
-EXERCISE_UPLOAD_DIR = CONTENT_UPLOAD_DIR / "exercises"
+EXERCISE_UPLOAD_DIR = Path("upload_exercises")
 SAFE_UPLOAD_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,255}$")
 SAFE_PATH_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_-]+")
 ALLOWED_MEDIA_EXTS = {
@@ -157,7 +157,7 @@ def _safe_path_segment(raw: str) -> str:
 
 def _uploaded_exercise_media_url(request: Request, folder: str, file_name: str) -> str:
     base = str(request.base_url).rstrip("/")
-    return f"{base}/statics/uploads/content/exercises/{folder}/{file_name}"
+    return f"{base}/upload_exercises/{folder}/{file_name}"
 
 
 async def save_exercise_media_file(
@@ -484,6 +484,22 @@ async def require_admin_user(admin_user=Depends(get_current_admin_user)):
     return admin_user
 
 
+async def require_support_admin(admin_user=Depends(require_admin_user)):
+    roles = [str(r).strip().lower() for r in (getattr(admin_user, "roles", None) or [])]
+    if "support" not in roles:
+        raise HTTPException(status_code=403, detail="Support role required")
+    return admin_user
+
+
+@router.get("/me")
+async def admin_me(admin_user=Depends(require_admin_user)):
+    return {
+        "id": str(admin_user.id),
+        "email": admin_user.email,
+        "roles": list(getattr(admin_user, "roles", None) or []),
+    }
+
+
 @router.post("/login", response_model=TokenOut)
 async def admin_login(payload: LoginIn, request: Request):
     identifier = (payload.identifier or "").strip().lower()
@@ -517,8 +533,8 @@ async def admin_login(payload: LoginIn, request: Request):
     return TokenOut(access_token=access, refresh_token=refresh)
 
 
-# @router.post("/content/exercises")
-async def admin_create_exercise(payload: AdminExerciseCreateIn, admin_user=Depends(require_admin_user)):
+@router.post("/content/exercises")
+async def admin_create_exercise(payload: AdminExerciseCreateIn, admin_user=Depends(require_support_admin)):
     code = (payload.code or "").strip()
     if not code:
         raise HTTPException(status_code=400, detail="Exercise code is required")
@@ -532,14 +548,16 @@ async def admin_create_exercise(payload: AdminExerciseCreateIn, admin_user=Depen
 
     doc = Exercise(**data)
     await doc.insert()
-    return doc
+    result = doc.model_dump()
+    result["id"] = str(doc.id)
+    return result
 
 
-# @router.put("/content/exercises/{exercise_id}")
+@router.put("/content/exercises/{exercise_id}")
 async def admin_update_exercise(
     exercise_id: PydanticObjectId,
     payload: AdminExerciseUpdateIn,
-    admin_user=Depends(require_admin_user),
+    admin_user=Depends(require_support_admin),
 ):
     doc = await Exercise.get(exercise_id)
     if not doc:
@@ -564,14 +582,14 @@ async def admin_update_exercise(
     return doc
 
 
-# @router.post("/content/exercises/{exercise_id}/upload-media")
+@router.post("/content/exercises/{exercise_id}/upload-media")
 async def admin_upload_exercise_media(
     exercise_id: PydanticObjectId,
     request: Request,
     overwrite_existing: bool = Form(default=True),
     thumbnail_file: Optional[UploadFile] = File(default=None),
     video_file: Optional[UploadFile] = File(default=None),
-    admin_user=Depends(require_admin_user),
+    admin_user=Depends(require_support_admin),
 ):
     doc = await Exercise.get(exercise_id)
     if not doc:
@@ -621,8 +639,8 @@ async def admin_upload_exercise_media(
     }
 
 
-# @router.delete("/content/exercises/{exercise_id}")
-async def admin_delete_exercise(exercise_id: PydanticObjectId, admin_user=Depends(require_admin_user)):
+@router.delete("/content/exercises/{exercise_id}")
+async def admin_delete_exercise(exercise_id: PydanticObjectId, admin_user=Depends(require_support_admin)):
     doc = await Exercise.get(exercise_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Exercise not found")
