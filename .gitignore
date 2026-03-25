@@ -10,6 +10,7 @@ pnpm-debug.log*
 
 # Environment variables (do not commit secrets)
 .env
+.env.example
 .env.local
 .env.*.local
 
