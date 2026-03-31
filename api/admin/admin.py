@@ -884,10 +884,7 @@ async def admin_generate_promocode_batch_screen(
         raise HTTPException(status_code=409, detail="campaign_name already exists")
 
     created = 0
-    attempts = 0
-    max_attempts = int(payload.quantity) * 30
-    while created < int(payload.quantity) and attempts < max_attempts:
-        attempts += 1
+    while created < int(payload.quantity):
         code = f"KV-{code_random(int(payload.code_length))}"
         doc = PromoCode(
             batch_id=batch.id,
@@ -904,9 +901,6 @@ async def admin_generate_promocode_batch_screen(
             created += 1
         except Exception:
             continue
-
-    if created != int(payload.quantity):
-        raise HTTPException(status_code=500, detail="Failed to generate all promo codes")
 
     return {
         "batch_id": str(batch.id),

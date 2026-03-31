@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from models.enums import SubscriptionSource, SubscriptionStatus, PromoStatus
 
@@ -91,6 +91,19 @@ class PurchaseVerifyOut(BaseModel):
     expires_at: Optional[datetime] = None
 
 
+class SubscriptionActivateIn(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    user_id: str = Field(alias="userId", min_length=1)
+    product_id: str = Field(alias="productId", min_length=1)
+
+
+class SubscriptionActivateOut(BaseModel):
+    userId: str
+    isPremium: bool
+    premiumUntil: Optional[datetime] = None
+
+
 class PromoActivateIn(BaseModel):
     code: str
 
@@ -133,7 +146,7 @@ class PromoCodeCreateIn(BaseModel):
     code: str
     discount_percent: int = Field(default=0, ge=0, le=95)
     duration_days: int = Field(ge=1, le=3650)
-    max_uses: int = Field(default=1, ge=1, le=10_000_000)
+    max_uses: int = Field(default=1, ge=1)
     expires_at: Optional[datetime] = None
     status: PromoStatus = PromoStatus.active
 
@@ -142,9 +155,9 @@ class PromoBatchCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     discount_percent: int = Field(default=0, ge=0, le=95)
     duration_days: int = Field(ge=1, le=3650)
-    max_uses_per_code: int = Field(ge=1, le=1_000_000)
-    codes_count: int = Field(ge=1, le=5000)
-    code_length: int = Field(default=10, ge=6, le=24)
+    max_uses_per_code: int = Field(ge=1)
+    codes_count: int = Field(ge=1)
+    code_length: int = Field(default=10, ge=1)
 
 
 class PromoBatchOut(BaseModel):

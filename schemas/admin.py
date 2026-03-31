@@ -204,10 +204,10 @@ class AdminContentAssetsOut(BaseModel):
 class AdminPromoBatchGenerateIn(BaseModel):
     campaign_name: str = Field(min_length=1, max_length=128)
     discount_percent: int = Field(ge=1, le=95)
-    quantity: int = Field(ge=1, le=5000)
+    quantity: int = Field(ge=1)
     duration_days: int = Field(default=30, ge=1, le=3650)
-    max_uses_per_code: int = Field(default=1, ge=1, le=1_000_000)
-    code_length: int = Field(default=10, ge=6, le=24)
+    max_uses_per_code: int = Field(default=1, ge=1)
+    code_length: int = Field(default=10, ge=1)
 
 
 class AdminPromoBatchItemOut(BaseModel):

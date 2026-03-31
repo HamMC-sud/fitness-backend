@@ -19,6 +19,7 @@ from api.auth.config import get_current_user
 from models.enums import PromoStatus, SubscriptionSource, SubscriptionStatus
 from models.promo import PromoCode, PromoCodeBatch, PromoRedemption
 from models.subscription import Subscription, SubscriptionPlan, SubscriptionTransaction
+from models.users import User
 from schemas.subscription import (
     CancelOut,
     PromoActivateIn,
@@ -35,6 +36,8 @@ from schemas.subscription import (
     PurchaseOut,
     PurchaseVerifyIn,
     PurchaseVerifyOut,
+    SubscriptionActivateIn,
+    SubscriptionActivateOut,
     SubscriptionGetOut,
     SubscriptionOut,
     SubscriptionPlanCreateIn,
@@ -45,6 +48,12 @@ from schemas.subscription import (
 )
 
 router = APIRouter(tags=["subscription"])
+
+SUBSCRIPTION_DURATIONS = {
+    "0760188330": 30,
+    "0760188340": 180,
+    "0760188350": 365,
+}
 
 
 def utcnow() -> datetime:
@@ -187,6 +196,39 @@ async def upsert_subscription(
     return sub
 
 
+async def activate_google_play_premium(user_id: str, product_id: str) -> User:
+    product = (product_id or "").strip()
+    if not product:
+        raise HTTPException(status_code=400, detail="productId is required")
+
+    duration_days = SUBSCRIPTION_DURATIONS.get(product)
+    if duration_days is None:
+        raise HTTPException(status_code=400, detail="Invalid productId")
+
+    try:
+        uid = PydanticObjectId(user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid userId")
+
+    user = await User.get(uid)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    now = utcnow()
+    current_until = getattr(user.flags, "premium_until", None)
+    if current_until and current_until.tzinfo is None:
+        current_until = current_until.replace(tzinfo=timezone.utc)
+
+    base_date = current_until if current_until and current_until > now else now
+    new_premium_until = base_date + timedelta(days=duration_days)
+
+    user.flags.is_premium = True
+    user.flags.premium_until = new_premium_until
+
+    await user.save()
+    return user
+
+
 def _utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -300,6 +342,18 @@ async def create_plan(payload: SubscriptionPlanCreateIn, current_user=Depends(ge
     doc = SubscriptionPlan(**payload.model_dump())
     await doc.insert()
     return plan_to_out(doc)
+
+
+@router.post("/subscription/activate", response_model=SubscriptionActivateOut)
+async def activate_subscription(payload: SubscriptionActivateIn, current_user=Depends(get_current_user)):
+    require_auth(current_user)
+
+    user = await activate_google_play_premium(payload.user_id, payload.product_id)
+    return SubscriptionActivateOut(
+        userId=str(user.id),
+        isPremium=bool(getattr(user.flags, "is_premium", False)),
+        premiumUntil=getattr(user.flags, "premium_until", None),
+    )
 
 
 @router.post("/subscription/purchase", response_model=PurchaseInitOut)
@@ -673,11 +727,8 @@ async def create_promo_batch(payload: PromoBatchCreateIn, current_user=Depends(g
         raise HTTPException(status_code=409, detail="Batch name already exists")
 
     created = 0
-    attempts = 0
-    max_attempts = int(payload.codes_count) * 30
 
-    while created < int(payload.codes_count) and attempts < max_attempts:
-        attempts += 1
+    while created < int(payload.codes_count):
         c = PromoCode(
             batch_id=batch.id,
             code=code_random(int(payload.code_length)),
@@ -693,9 +744,6 @@ async def create_promo_batch(payload: PromoBatchCreateIn, current_user=Depends(g
             created += 1
         except DuplicateKeyError:
             continue
-
-    if created != int(payload.codes_count):
-        raise HTTPException(status_code=500, detail="Failed to generate all codes")
 
     return PromoBatchCreateOut(
         batch=PromoBatchOut(

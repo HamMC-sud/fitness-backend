@@ -57,6 +57,7 @@ class UserProfile(BaseModel):
 class UserFlags(BaseModel):
     onboarding_completed: bool = False
     is_premium: bool = False
+    premium_until: Optional[datetime] = None
 
 
 class UserStats(BaseModel):

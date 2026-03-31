@@ -6,14 +6,17 @@ from .db import db, client
 from .users import User, UserProfile
 from .verification_code import VerificationCode
 from .auth import OAuthAccount, AuthSession, EmailOTP
-from .content import Exercise, MeditationItem
-from .workouts import UserWorkout, WorkoutRun, ExerciseFeedbackEvent
+from .content import Exercise
+# from .content import MeditationItem  # currently unused by API routes
+from .workouts import UserWorkout, WorkoutRun
+# from .workouts import ExerciseFeedbackEvent  # currently unused by API routes
 from .meditation_run import MeditationRun
 from .engagement import AnalyticsEvent
 from .progress import (
     UserAchievement,
     BodyMeasurement,
 )
+from .achievements import Achievement
 from .subscription import SubscriptionPlan, Subscription, SubscriptionTransaction
 from .promo import PromoCodeBatch, PromoCode, PromoRedemption
 from .ai import (
@@ -29,10 +32,13 @@ ALL_MODELS = [
     User,
     VerificationCode,
     OAuthAccount, AuthSession, EmailOTP,
-    Exercise, MeditationItem,
-    UserWorkout, WorkoutRun, ExerciseFeedbackEvent,
+    Exercise,
+    # MeditationItem,  # currently unused by API routes
+    UserWorkout, WorkoutRun,
+    # ExerciseFeedbackEvent,  # currently unused by API routes
     MeditationRun,
     UserAchievement,
+    Achievement,
     BodyMeasurement,
     AnalyticsEvent,
     SubscriptionPlan, Subscription, SubscriptionTransaction,

@@ -1,4 +1,5 @@
 import os
+import time
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -11,13 +12,23 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
 
-def send_verification_email(receiver_email: str, code: str, ttl_seconds: int) -> None:
+def send_verification_email(
+    receiver_email: str,
+    code: str,
+    ttl_seconds: int,
+) -> None:
+    """
+    Send verification email with retry and safe error handling.
+    Will NOT crash the application.
+    """
+
     if not SMTP_USER or not SMTP_PASSWORD:
         raise RuntimeError("SMTP_USER / SMTP_PASSWORD are not configured")
 
     ttl_minutes = max(1, ttl_seconds // 60)
 
     subject = "Your verification code"
+
     html = f"""
     <html>
       <body style="font-family: Arial, sans-serif; color: #222;">
@@ -47,7 +58,32 @@ def send_verification_email(receiver_email: str, code: str, ttl_seconds: int) ->
     message.attach(MIMEText(text, "plain"))
     message.attach(MIMEText(html, "html"))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.sendmail(SMTP_FROM, receiver_email, message.as_string())
+    # retry config
+    max_attempts = 3
+    delay_seconds = 2
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+
+                server.login(SMTP_USER, SMTP_PASSWORD)
+
+                server.sendmail(
+                    SMTP_FROM,
+                    receiver_email,
+                    message.as_string(),
+                )
+
+            print(f"[EMAIL] sent to {receiver_email}")
+            return
+
+        except Exception as e:
+            print(f"[EMAIL ERROR] attempt {attempt}/{max_attempts}: {e}")
+
+            if attempt < max_attempts:
+                time.sleep(delay_seconds)
+            else:
+                print(f"[EMAIL FAILED] could not send to {receiver_email}")
