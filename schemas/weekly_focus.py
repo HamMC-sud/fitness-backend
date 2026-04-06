@@ -2,6 +2,13 @@ from __future__ import annotations
 from typing import List
 from pydantic import BaseModel
 
+class WeeklyFocusMetricsOut(BaseModel):
+    total_points: int
+    goal_points: int
+    remaining_points: int
+    progress: float
+
+
 class DayPointsOut(BaseModel):
     date: str
     points: int
@@ -30,6 +37,7 @@ class WeeklyFocusOut(BaseModel):
     remaining_points: int
     progress: float
     streak_days: int
+    metrics: WeeklyFocusMetricsOut
     breakdown: WeeklyFocusBreakdownOut
     days: List[DayPointsOut]
 

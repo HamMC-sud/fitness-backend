@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import ClassVar, Optional
 
 from beanie.odm.fields import PydanticObjectId
-from pydantic import Field, AliasChoices
+from pydantic import AliasChoices, Field, field_validator
 from pymongo import IndexModel, ASCENDING, DESCENDING
 
 from .base import BaseDoc
@@ -16,12 +16,26 @@ def utcnow() -> datetime:
 
 
 class PromoCodeBatch(BaseDoc):
+    ALLOWED_DURATION_DAYS: ClassVar[set[int]] = {7, 14, 30, 90, 365}
+
     name: str
     discount_percent: int = Field(default=0, ge=0, le=95)
-    duration_days: int = Field(ge=1, le=3650, validation_alias=AliasChoices("duration_days", "days"), serialization_alias="duration_days")
+    duration_days: int = Field(
+        validation_alias=AliasChoices("duration_days", "days"),
+        serialization_alias="duration_days",
+    )
     max_uses_per_code: int = Field(ge=1, le=1_000_000)
     codes_count: int = Field(ge=1)
     created_by_admin_id: PydanticObjectId
+
+    @field_validator("duration_days")
+    @classmethod
+    def validate_duration_days(cls, value: int) -> int:
+        v = int(value)
+        if v not in cls.ALLOWED_DURATION_DAYS:
+            allowed = ", ".join(str(d) for d in sorted(cls.ALLOWED_DURATION_DAYS))
+            raise ValueError(f"duration_days must be one of: {allowed}")
+        return v
 
     class Settings:
         name = "promo_code_batches"
@@ -36,7 +50,10 @@ class PromoCode(BaseDoc):
     code: str
     discount_percent: int = Field(default=0, ge=0, le=95)
 
-    duration_days: int = Field(ge=1, le=3650, validation_alias=AliasChoices("duration_days", "days"), serialization_alias="duration_days")
+    duration_days: int = Field(
+        validation_alias=AliasChoices("duration_days", "days"),
+        serialization_alias="duration_days",
+    )
     max_uses: int = Field(ge=1)
 
     used_count: int = Field(
@@ -57,6 +74,19 @@ class PromoCode(BaseDoc):
             IndexModel([("status", ASCENDING)]),
             IndexModel([("expires_at", ASCENDING)]),
         ]
+
+    @classmethod
+    def is_allowed_duration_days(cls, value: int) -> bool:
+        return int(value) in PromoCodeBatch.ALLOWED_DURATION_DAYS
+
+    @field_validator("duration_days")
+    @classmethod
+    def validate_duration_days(cls, value: int) -> int:
+        v = int(value)
+        if not cls.is_allowed_duration_days(v):
+            allowed = ", ".join(str(d) for d in sorted(PromoCodeBatch.ALLOWED_DURATION_DAYS))
+            raise ValueError(f"duration_days must be one of: {allowed}")
+        return v
 
 
 class PromoRedemption(BaseDoc):

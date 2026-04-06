@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import List, Optional
 from zoneinfo import ZoneInfo
 
@@ -10,6 +10,7 @@ from api.auth.config import get_current_user
 from models import AnalyticsEvent, BodyMeasurement, UserAchievement
 from models.workouts import WorkoutRun, UserWorkout
 from schemas.measurements import (
+    ActivityMetricsOut,
     CompletedAchievementOut,
     DayActivityOut,
     DayExercisesOut,
@@ -17,18 +18,24 @@ from schemas.measurements import (
     MeasurementSaveIn,
     MeasurementSummaryOut,
 )
+from utils.fitness_metrics import (
+    POINTS_WORKOUT,
+    run_effective_seconds,
+    seconds_to_minutes,
+)
 
 router = APIRouter(tags=["measurements"])
 
 
-def user_tz_or_utc(tz_name: Optional[str]) -> ZoneInfo:
+def user_tz_or_utc(tz_name: Optional[str]) -> tzinfo:
     try:
         return ZoneInfo(tz_name or "UTC")
     except Exception:
-        return ZoneInfo("UTC")
+        # Work even when system zoneinfo DB / tzdata is unavailable.
+        return timezone.utc
 
 
-def day_bounds_utc(local_day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+def day_bounds_utc(local_day: date, tz: tzinfo) -> tuple[datetime, datetime]:
     start_local = datetime.combine(local_day, time.min).replace(tzinfo=tz)
     end_local = start_local + timedelta(days=1)
     return (
@@ -90,6 +97,7 @@ async def _build_measurement_summary(current_user, anchor_day: Optional[date] = 
     exercises_by_day: List[DayExercisesOut] = []
 
     total_minutes = 0
+    total_seconds = 0
     total_kkal = 0.0
     total_steps = 0
 
@@ -103,8 +111,8 @@ async def _build_measurement_summary(current_user, anchor_day: Optional[date] = 
             }
         ).to_list()
 
-        day_seconds = int(sum((getattr(r, "total_seconds", 0) or 0) for r in runs))
-        day_minutes = day_seconds // 60
+        day_seconds = int(sum(run_effective_seconds(r) for r in runs))
+        day_minutes = seconds_to_minutes(day_seconds)
         day_kkal = float(sum((getattr(r, "calories_estimated", 0) or 0) for r in runs))
 
         events = await AnalyticsEvent.find(
@@ -134,17 +142,24 @@ async def _build_measurement_summary(current_user, anchor_day: Optional[date] = 
                 minutes=day_minutes,
                 kkal=day_kkal,
                 steps=day_steps,
+                metrics=ActivityMetricsOut(
+                    total_seconds=day_seconds,
+                    total_minutes=day_minutes,
+                    total_calories=float(day_kkal),
+                    total_steps=day_steps,
+                ),
             )
         )
 
         total_minutes += day_minutes
+        total_seconds += day_seconds
         total_kkal += day_kkal
         total_steps += day_steps
 
         for run in runs:
             workout_name = "Workout"
             workout_type = str(getattr(run, "source", "workout") or "workout")
-            workout_points = 10
+            workout_points = POINTS_WORKOUT
 
             workout_ref_id = getattr(run, "workout_ref_id", None)
             if workout_ref_id:
@@ -192,6 +207,12 @@ async def _build_measurement_summary(current_user, anchor_day: Optional[date] = 
             minutes=total_minutes,
             kkal=float(total_kkal),
             steps=total_steps,
+            metrics=ActivityMetricsOut(
+                total_seconds=total_seconds,
+                total_minutes=total_minutes,
+                total_calories=float(total_kkal),
+                total_steps=total_steps,
+            ),
         ),
         by_days=by_days,
         completed_achievements=completed_achievements,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -13,7 +13,7 @@ from models.content import (
     I18nList,
     I18nText,
 )
-from models.enums import Difficulty, Equipment, ExerciseMode, Injury, SubscriptionStatus, WorkoutType
+from models.enums import Difficulty, Equipment, ExerciseMode, SubscriptionStatus, WorkoutType
 
 
 class AdminExerciseCreateIn(BaseModel):
@@ -28,7 +28,7 @@ class AdminExerciseCreateIn(BaseModel):
     movement_type: Optional[str] = None
     workout_type: List[WorkoutType] = Field(default_factory=list)
     equipment: List[Equipment] = Field(default_factory=list)
-    contraindications: List[Injury] = Field(default_factory=list)
+    contraindications: List[str] = Field(default_factory=list)
     difficulty: Difficulty
     calories_per_minute: Optional[float] = Field(default=None, ge=0)
     instructions: List[ExerciseInstruction] = Field(default_factory=list)
@@ -41,6 +41,30 @@ class AdminExerciseCreateIn(BaseModel):
     @classmethod
     def normalize_equipment(cls, v):
         return Equipment.normalize_many(v)
+
+    @field_validator("contraindications", mode="before")
+    @classmethod
+    def normalize_contraindications(cls, v):
+        if v is None:
+            return []
+        items = v if isinstance(v, (list, tuple, set)) else [v]
+        label_by_key = {
+            "none": "None",
+            "back_pain": "Back pain",
+            "knee_issues": "Knee issues",
+            "shoulder_issues": "Shoulder issues",
+            "no_jumping": "No jumping",
+        }
+        out: list[str] = []
+        for item in items:
+            raw = str(item or "").strip()
+            if not raw:
+                continue
+            key = raw.lower().replace("-", "_").replace(" ", "_")
+            normalized = label_by_key.get(key, raw)
+            if normalized not in out:
+                out.append(normalized)
+        return out
 
 
 class AdminExerciseUpdateIn(BaseModel):
@@ -55,7 +79,7 @@ class AdminExerciseUpdateIn(BaseModel):
     movement_type: Optional[str] = None
     workout_type: Optional[List[WorkoutType]] = None
     equipment: Optional[List[Equipment]] = None
-    contraindications: Optional[List[Injury]] = None
+    contraindications: Optional[List[str]] = None
     difficulty: Optional[Difficulty] = None
     calories_per_minute: Optional[float] = Field(default=None, ge=0)
     instructions: Optional[List[ExerciseInstruction]] = None
@@ -70,6 +94,30 @@ class AdminExerciseUpdateIn(BaseModel):
         if v is None:
             return None
         return Equipment.normalize_many(v)
+
+    @field_validator("contraindications", mode="before")
+    @classmethod
+    def normalize_contraindications(cls, v):
+        if v is None:
+            return None
+        items = v if isinstance(v, (list, tuple, set)) else [v]
+        label_by_key = {
+            "none": "None",
+            "back_pain": "Back pain",
+            "knee_issues": "Knee issues",
+            "shoulder_issues": "Shoulder issues",
+            "no_jumping": "No jumping",
+        }
+        out: list[str] = []
+        for item in items:
+            raw = str(item or "").strip()
+            if not raw:
+                continue
+            key = raw.lower().replace("-", "_").replace(" ", "_")
+            normalized = label_by_key.get(key, raw)
+            if normalized not in out:
+                out.append(normalized)
+        return out
 
 
 class AdminUserItemOut(BaseModel):
@@ -205,7 +253,7 @@ class AdminPromoBatchGenerateIn(BaseModel):
     campaign_name: str = Field(min_length=1, max_length=128)
     discount_percent: int = Field(ge=1, le=95)
     quantity: int = Field(ge=1)
-    duration_days: int = Field(default=30, ge=1, le=3650)
+    duration_days: Literal[7, 14, 30, 90, 365] = 30
     max_uses_per_code: int = Field(default=1, ge=1)
     code_length: int = Field(default=10, ge=1)
 

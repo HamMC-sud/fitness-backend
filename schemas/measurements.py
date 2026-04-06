@@ -6,6 +6,13 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class ActivityMetricsOut(BaseModel):
+    total_seconds: int = 0
+    total_minutes: int = 0
+    total_calories: float = 0.0
+    total_steps: int = 0
+
+
 class MeasurementSaveIn(BaseModel):
     day: date
     weight_kg: float = Field(ge=20, le=400)
@@ -21,6 +28,7 @@ class DayActivityOut(BaseModel):
     minutes: int = 0
     kkal: float = 0.0
     steps: int = 0
+    metrics: Optional[ActivityMetricsOut] = None
 
 
 class CompletedAchievementOut(BaseModel):

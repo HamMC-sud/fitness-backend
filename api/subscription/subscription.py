@@ -105,6 +105,10 @@ def _promo_is_expired(promo: PromoCode) -> bool:
     return utcnow() >= exp
 
 
+def _promo_duration_is_allowed(duration_days: int) -> bool:
+    return int(duration_days) in PromoCodeBatch.ALLOWED_DURATION_DAYS
+
+
 def compute_subscription_status(sub: Subscription) -> Tuple[SubscriptionStatus, bool, bool]:
     now = utcnow()
 
@@ -179,6 +183,12 @@ async def upsert_subscription(
         existing.last_transaction_id = tx_id
         existing.status = SubscriptionStatus.active
         await existing.save()
+
+        user = await User.get(user_id)
+        if user:
+            user.flags.is_premium = True
+            user.flags.premium_until = expires_at
+            await user.save()
         return existing
 
     sub = Subscription(
@@ -193,6 +203,12 @@ async def upsert_subscription(
         last_transaction_id=tx_id,
     )
     await sub.insert()
+
+    user = await User.get(user_id)
+    if user:
+        user.flags.is_premium = True
+        user.flags.premium_until = expires_at
+        await user.save()
     return sub
 
 
@@ -544,6 +560,9 @@ async def preview_promo(payload: PromoActivateIn, current_user=Depends(get_curre
     if _promo_is_expired(promo):
         raise HTTPException(status_code=400, detail="Promo code expired")
 
+    if not _promo_duration_is_allowed(int(promo.duration_days)):
+        raise HTTPException(status_code=400, detail="Promo code has unsupported duration")
+
     remaining = max(0, int(promo.max_uses) - int(promo.used_count))
     if remaining <= 0:
         raise HTTPException(status_code=400, detail="Promo code limit reached or expired")
@@ -578,6 +597,8 @@ async def activate_promo(payload: PromoActivateIn, current_user=Depends(get_curr
 
     if int(promo.duration_days) <= 0:
         raise HTTPException(status_code=400, detail="Promo code invalid duration")
+    if not _promo_duration_is_allowed(int(promo.duration_days)):
+        raise HTTPException(status_code=400, detail="Promo code has unsupported duration")
 
     tx = SubscriptionTransaction(
         user_id=current_user.id,
@@ -634,6 +655,17 @@ async def activate_promo(payload: PromoActivateIn, current_user=Depends(get_curr
         except Exception:
             pass
         raise HTTPException(status_code=400, detail="Promo code invalid duration")
+    if not _promo_duration_is_allowed(duration_days):
+        await promo_atomic_rollback(code)
+        try:
+            await redemption.delete()
+        except Exception:
+            pass
+        try:
+            await tx.delete()
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail="Promo code has unsupported duration")
 
     existing = await Subscription.find_one(Subscription.user_id == current_user.id)
     plan_code = (existing.plan_code if existing else None) or "promo"

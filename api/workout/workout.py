@@ -1,6 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -13,7 +13,8 @@ from copy import deepcopy
 from api.auth.config import get_current_user
 from models import UserWorkout, WorkoutRun, Exercise, UserAchievement
 from models.enums import ExerciseMode
-from models.workouts import Feedback  # ✅ enum
+from utils.fitness_metrics import run_effective_seconds
+from models.workouts import Feedback  # âœ… enum
 from schemas.workout import (
     WorkoutCreateIn,
     WorkoutUpdateIn,
@@ -38,11 +39,12 @@ def ensure_aware_utc(dt: datetime) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
-def user_tz_or_utc(tz_name: Optional[str]) -> ZoneInfo:
+def user_tz_or_utc(tz_name: Optional[str]) -> tzinfo:
     try:
         return ZoneInfo(tz_name or "UTC")
     except Exception:
-        return ZoneInfo("UTC")
+        # Work even when system zoneinfo DB / tzdata is unavailable.
+        return timezone.utc
 
 
 def _normalize_tz_name(value: Optional[str]) -> Optional[str]:
@@ -68,7 +70,7 @@ def _effective_tz_name(current_user, request: Optional[Request]) -> str:
     return user_tz or "UTC"
 
 
-def day_bounds_utc(local_day: date, tz: ZoneInfo) -> tuple[datetime, datetime]:
+def day_bounds_utc(local_day: date, tz: tzinfo) -> tuple[datetime, datetime]:
     start_local = datetime.combine(local_day, time.min).replace(tzinfo=tz)
     end_local = start_local + timedelta(days=1)
     return (
@@ -119,7 +121,7 @@ async def _workout_streak_snapshot(user_id: PydanticObjectId, tz_name: Optional[
 
 
 class WorkoutFeedbackIn(BaseModel):
-    difficulty: str = Field(..., description="easy|normal|hard (also accepts ru: легко/нормально/тяжело)")
+    difficulty: str = Field(..., description="easy|normal|hard (also accepts ru: Ð»ÐµÐ³ÐºÐ¾/Ð½Ð¾Ñ€Ð¼Ð°Ð»ÑŒÐ½Ð¾/Ñ‚ÑÐ¶ÐµÐ»Ð¾)")
 
 
 INACTIVITY_DAYS = 14
@@ -127,7 +129,7 @@ INACTIVITY_DAYS = 14
 
 def _is_inactive(last_completed_at: Optional[datetime]) -> bool:
     if not last_completed_at:
-        return True  # never trained → intro
+        return True  # never trained â†’ intro
     return (utcnow() - last_completed_at) >= timedelta(days=INACTIVITY_DAYS)
 
 
@@ -137,7 +139,7 @@ def _normalize_feedback(v: str) -> Feedback:
 
     s = str(v).strip().lower()
 
-    ru_map = {"легко": "easy", "нормально": "normal", "тяжело": "hard"}
+    ru_map = {"Ð»ÐµÐ³ÐºÐ¾": "easy", "Ð½Ð¾Ñ€Ð¼Ð°Ð»ÑŒÐ½Ð¾": "normal", "Ñ‚ÑÐ¶ÐµÐ»Ð¾": "hard"}
     s = ru_map.get(s, s)
     try:
         return Feedback(s)
@@ -174,7 +176,7 @@ def _apply_signals_to_steps(
         duration = s.get("duration_seconds")
         rest = s.get("rest_seconds_after")
 
-        # 1️⃣ INTRO HAS PRIORITY
+        # 1ï¸âƒ£ INTRO HAS PRIORITY
         if needs_intro:
             if reps is not None:
                 s["reps"] = max(5, math.floor(reps * 0.7))
@@ -183,7 +185,7 @@ def _apply_signals_to_steps(
             if rest is not None:
                 s["rest_seconds_after"] = math.ceil(rest * 1.3)
 
-        # 2️⃣ LOAD ADJUSTMENT (only if NOT intro)
+        # 2ï¸âƒ£ LOAD ADJUSTMENT (only if NOT intro)
         elif load_adjustment == "increase":
             if reps is not None:
                 s["reps"] = reps + 2
@@ -490,10 +492,12 @@ async def _complete_run(run: WorkoutRun, payload: WorkoutCompleteIn, current_use
         raise HTTPException(status_code=400, detail="Run already completed")
 
     run.completed_at = utcnow()
-    run.total_seconds = payload.total_seconds
+    payload_seconds = int(payload.total_seconds or 0)
+    effective_seconds = max(payload_seconds, run_effective_seconds(run))
+    run.total_seconds = effective_seconds if effective_seconds > 0 else None
     run.calories_estimated = payload.calories_estimated
     run.rating_stars = payload.rating_stars
-    run.difficulty_feedback = payload.difficulty_feedback  # ✅ already Feedback enum in schema
+    run.difficulty_feedback = payload.difficulty_feedback  # âœ… already Feedback enum in schema
     await run.save()
     has_completed_today, streak_days, last_activity_at = await _workout_streak_snapshot(
         user_id=user_id,
@@ -717,7 +721,7 @@ async def workout_feedback(workout_id: PydanticObjectId, payload: WorkoutFeedbac
 
     w = await _get_owned_workout_or_404(workout_id, current_user.id)
 
-    fb = _normalize_feedback(payload.difficulty)  # ✅ Feedback enum
+    fb = _normalize_feedback(payload.difficulty)  # âœ… Feedback enum
 
     run = await _get_last_run_for_workout(w.id, current_user.id)
     if not run:
@@ -736,7 +740,7 @@ async def workout_feedback(workout_id: PydanticObjectId, payload: WorkoutFeedbac
         .to_list()
     )
 
-    # order oldest → newest
+    # order oldest â†’ newest
     recent_runs = list(reversed(recent_runs))
     recent_feedbacks = [r.difficulty_feedback for r in recent_runs]
 
@@ -804,7 +808,7 @@ async def history_stats(request: Request, current_user=Depends(get_current_user)
         )
 
     total_completed = len(runs)
-    total_seconds = int(sum((r.total_seconds or 0) for r in runs))
+    total_seconds = int(sum(run_effective_seconds(r) for r in runs))
     total_calories = float(sum((r.calories_estimated or 0) for r in runs))
     has_completed_today, streak, last_activity_at = await _workout_streak_snapshot(
         user_id=current_user.id,

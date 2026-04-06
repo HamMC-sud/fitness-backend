@@ -73,6 +73,8 @@ class Equipment(str, Enum):
 
         raw = str(value or "").strip().lower()
         token = raw.replace("-", "_")
+        token = token.replace("&", "and")
+        token = token.replace(" ", "_")
 
         home_tokens = {
             "home",
@@ -92,6 +94,7 @@ class Equipment(str, Enum):
             "pullup_bar",
             "barbell & bench",
             "barbell_and_bench",
+            "barbell_&_bench",
             "barbell_bench",
             "barbell",
             "machine",
@@ -136,6 +139,30 @@ class Difficulty(str, Enum):
     intermediate = "intermediate"
     advanced = "advanced"
 
+    @classmethod
+    def normalize(cls, value: object) -> "Difficulty":
+        if isinstance(value, cls):
+            return value
+
+        raw = str(value or "").strip().lower()
+        token = raw.replace("-", "_").replace(" ", "_")
+
+        aliases = {
+            "easy": "beginner",
+            "novice": "beginner",
+            "starter": "beginner",
+            "medium": "intermediate",
+            "normal": "intermediate",
+            "all_levels": "intermediate",
+            "all_level": "intermediate",
+            "any": "intermediate",
+        }
+        token = aliases.get(token, token)
+        try:
+            return cls(token)
+        except Exception:
+            raise ValueError(f"Unsupported difficulty: {value}")
+
 
 class WorkoutType(str, Enum):
     strength = "strength"
@@ -143,6 +170,87 @@ class WorkoutType(str, Enum):
     hiit = "hiit"
     stretching = "stretching"
     yoga = "yoga"
+
+    @classmethod
+    def normalize(cls, value: object) -> "WorkoutType":
+        if isinstance(value, cls):
+            return value
+
+        raw = str(value or "").strip().lower()
+        if not raw:
+            raise ValueError(f"Unsupported workout type: {value}")
+
+        token = (
+            raw.replace("-", "_")
+            .replace(" ", "_")
+            .replace("&", "_")
+            .replace("/", "_")
+        )
+        token = "_".join(part for part in token.split("_") if part)
+
+        aliases = {
+            "strength_training": "strength",
+            "power": "strength",
+            "aerobic": "cardio",
+            "flexibility": "stretching",
+        }
+        token = aliases.get(token, token)
+        try:
+            return cls(token)
+        except Exception:
+            raise ValueError(f"Unsupported workout type: {value}")
+
+    @classmethod
+    def expand(cls, value: object) -> list["WorkoutType"]:
+        if isinstance(value, cls):
+            return [value]
+
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return []
+
+        parts_by_comma = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(parts_by_comma) > 1:
+            out: list[WorkoutType] = []
+            for p in parts_by_comma:
+                for wt in cls.expand(p):
+                    if wt not in out:
+                        out.append(wt)
+            return out
+
+        token = (
+            raw.replace("-", "_")
+            .replace(" ", "_")
+            .replace("&", "_")
+            .replace("/", "_")
+        )
+        token = "_".join(part for part in token.split("_") if part)
+
+        # Legacy combined values like "strength_cardio".
+        if "_" in token:
+            chunks = [c for c in token.split("_") if c]
+            if chunks and all(c in {x.value for x in cls} for c in chunks):
+                out: list[WorkoutType] = []
+                for c in chunks:
+                    wt = cls(c)
+                    if wt not in out:
+                        out.append(wt)
+                return out
+
+        return [cls.normalize(token)]
+
+    @classmethod
+    def normalize_many(cls, value: object) -> list["WorkoutType"]:
+        if value is None:
+            return []
+
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        out: list[WorkoutType] = []
+        for item in items:
+            for wt in cls.expand(item):
+                if wt not in out:
+                    out.append(wt)
+        return out
 
 
 class Feedback(str, Enum):

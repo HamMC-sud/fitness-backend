@@ -9,14 +9,18 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from api.auth.config import get_current_user
 from models.workouts import WorkoutRun
 from models import MeditationRun
-from schemas.weekly_focus import WeeklyFocusOut, WeeklyFocusBreakdownOut, ActivityBreakdownOut, DayPointsOut
+from schemas.weekly_focus import (
+    WeeklyFocusOut,
+    WeeklyFocusBreakdownOut,
+    ActivityBreakdownOut,
+    DayPointsOut,
+    WeeklyFocusMetricsOut,
+)
+from utils.fitness_metrics import POINTS_WORKOUT, POINTS_YOGA, POINTS_MEDITATION
 
 router = APIRouter(tags=["weekly-focus"])
 
 WEEKLY_GOAL_POINTS = 50
-POINTS_WORKOUT = 10
-POINTS_YOGA = 10
-POINTS_MEDITATION = 5
 
 
 def utcnow() -> datetime:
@@ -34,7 +38,8 @@ def week_bounds_utc(tz_name: Optional[str]) -> tuple[datetime, datetime, str]:
         tz = ZoneInfo(tz_name or "UTC")
         tz_used = tz_name or "UTC"
     except Exception:
-        tz = ZoneInfo("UTC")
+        # Work even when system zoneinfo DB / tzdata is unavailable.
+        tz = timezone.utc
         tz_used = "UTC"
 
     now_local = ensure_aware_utc(utcnow()).astimezone(tz)
@@ -116,7 +121,7 @@ async def get_weekly_focus(request: Request, current_user=Depends(get_current_us
     try:
         tz = ZoneInfo(tz_used)
     except Exception:
-        tz = ZoneInfo("UTC")
+        tz = timezone.utc
         tz_used = "UTC"
 
     day_points: Dict[str, int] = {}
@@ -191,6 +196,12 @@ async def get_weekly_focus(request: Request, current_user=Depends(get_current_us
         remaining_points=remaining,
         progress=progress,
         streak_days=streak_days,
+        metrics=WeeklyFocusMetricsOut(
+            total_points=total_points,
+            goal_points=goal,
+            remaining_points=remaining,
+            progress=progress,
+        ),
         breakdown=WeeklyFocusBreakdownOut(
             workouts=ActivityBreakdownOut(count=workouts_count, points=points_workouts),
             yoga=ActivityBreakdownOut(count=yoga_count, points=points_yoga),

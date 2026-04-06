@@ -9,6 +9,7 @@ from pydantic import AliasChoices, BaseModel, Field
 
 from models.enums import WorkoutType, Difficulty, Equipment, ExerciseMode
 from models.content import Exercise
+from utils.fitness_metrics import build_metrics_block, seconds_to_minutes
 
 router = APIRouter(tags=["content"])
 
@@ -63,10 +64,6 @@ def _pick_i18n_text(i18n_obj: Any, lang: str = "en") -> str:
     if isinstance(fallback, str):
         return fallback
     return ""
-
-
-def _to_minutes(seconds: int) -> int:
-    return max(1, int(round(seconds / 60))) if seconds > 0 else 0
 
 
 def _resolve_set_plan(ex: Exercise, step_duration_default: int) -> list[dict[str, Any]]:
@@ -186,6 +183,88 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
     return out
 
 
+def _aggregate_sets_metrics(sets_payload: list[dict[str, Any]]) -> dict[str, int]:
+    total_sets = len(sets_payload)
+    total_intervals = 0
+    total_reps_target = 0
+    timed_intervals = 0
+    timed_intervals_seconds = 0
+
+    for s in sets_payload:
+        reps = s.get("reps", []) or []
+        total_intervals += len(reps)
+        for rep in reps:
+            target = rep.get("target")
+            duration_seconds = rep.get("duration_seconds")
+
+            if target is not None:
+                total_reps_target += int(target)
+            if duration_seconds is not None:
+                timed_intervals += 1
+                timed_intervals_seconds += int(duration_seconds)
+
+    return {
+        "total_sets": total_sets,
+        "total_intervals": total_intervals,
+        "total_reps_target": total_reps_target,
+        "timed_intervals": timed_intervals,
+        "timed_intervals_seconds": timed_intervals_seconds,
+    }
+
+
+def _exercise_base_duration_seconds(ex: Exercise) -> int:
+    media = getattr(ex, "media", None)
+    duration_seconds = int(getattr(media, "duration_seconds", 0) or 0) if media else 0
+    if duration_seconds <= 0 and getattr(ex, "defaults", None):
+        duration_seconds = int(getattr(ex.defaults, "duration_seconds", 0) or 0)
+    return max(0, duration_seconds)
+
+
+def _derive_exercise_workout_metrics(ex: Exercise) -> dict[str, Any]:
+    mode_value = str(getattr(ex, "mode", ""))
+    base_duration_seconds = _exercise_base_duration_seconds(ex)
+    step_duration = int(base_duration_seconds) if mode_value == ExerciseMode.time.value else None
+
+    set_plan = _resolve_set_plan(ex, step_duration or base_duration_seconds)
+    sets_payload = _build_sets_payload(ex, set_plan)
+    metrics = _aggregate_sets_metrics(sets_payload)
+
+    rest_between_sets_seconds = 0
+    if len(sets_payload) > 1:
+        for s in sets_payload[:-1]:
+            rest_between_sets_seconds += int((s.get("rest_seconds_after", 0) or 0))
+
+    rest_seconds_after_exercise = int((sets_payload[-1].get("rest_seconds_after", 0) if sets_payload else 0) or 0)
+    active_seconds = int(metrics["timed_intervals_seconds"])
+    planned_total_seconds = active_seconds + rest_between_sets_seconds
+
+    # Fallback for reps-only templates where explicit timed intervals are absent.
+    total_seconds = planned_total_seconds if planned_total_seconds > 0 else base_duration_seconds
+    total_reps = int(metrics["total_reps_target"]) if mode_value == ExerciseMode.reps.value else 0
+
+    set_summaries = [
+        {
+            "set_id": int(s.get("set_no", 0)),
+            "reps_count": len(s.get("reps", []) or []),
+        }
+        for s in sets_payload
+    ]
+
+    return {
+        "mode": mode_value,
+        "sets_payload": sets_payload,
+        "set_summaries": set_summaries,
+        "total_sets": int(metrics["total_sets"]),
+        "total_intervals": int(metrics["total_intervals"]),
+        "total_reps": total_reps,
+        "timed_intervals": int(metrics["timed_intervals"]),
+        "timed_intervals_seconds": active_seconds,
+        "rest_between_sets_seconds": int(rest_between_sets_seconds),
+        "rest_seconds_after_exercise": rest_seconds_after_exercise,
+        "planned_total_seconds": int(total_seconds),
+    }
+
+
 @router.get("/discover/worktypes/{worktype}")
 async def discover_worktype_details(
     worktype: str,
@@ -223,10 +302,9 @@ async def discover_worktype_details(
     category_image = None
 
     for ex in exercises:
+        wm = _derive_exercise_workout_metrics(ex)
         media = getattr(ex, "media", None)
-        total_seconds = int(getattr(media, "duration_seconds", 0) or 0)
-        if total_seconds <= 0:
-            total_seconds = int(getattr(ex, "defaults", None).duration_seconds or 0) if getattr(ex, "defaults", None) else 0
+        total_seconds = int(wm["planned_total_seconds"])
         total_calories = 0.0
         if getattr(ex, "calories_per_minute", None):
             total_calories = float(ex.calories_per_minute or 0) * (total_seconds / 60.0)
@@ -253,8 +331,22 @@ async def discover_worktype_details(
                 "cover_image": cover_image,
                 "exercise_count": 1,
                 "total_seconds": total_seconds,
-                "total_minutes": _to_minutes(total_seconds),
+                "total_minutes": seconds_to_minutes(total_seconds),
+                "sets": int(wm["total_sets"]),
+                "intervals": int(wm["total_intervals"]),
+                "reps": int(wm["total_reps"]),
+                "timed_intervals_seconds": int(wm["timed_intervals_seconds"]),
                 "total_calories": round(total_calories, 1),
+                "metrics": build_metrics_block(
+                    total_seconds=total_seconds,
+                    total_calories=round(total_calories, 1),
+                    total_sets=int(wm["total_sets"]),
+                    total_reps=int(wm["total_reps"]),
+                    total_intervals=int(wm["total_intervals"]),
+                    timed_intervals=int(wm["timed_intervals"]),
+                    timed_intervals_seconds=int(wm["timed_intervals_seconds"]),
+                    rest_between_sets_seconds=int(wm["rest_between_sets_seconds"]),
+                ),
                 "exercise_id": str(ex.id),
                 "exercise_code": getattr(ex, "code", None),
             }
@@ -265,7 +357,7 @@ async def discover_worktype_details(
         "category_image": category_image,
         "totals": {
             "workouts": len(items),
-            "total_minutes": _to_minutes(sum_seconds),
+            "total_minutes": seconds_to_minutes(sum_seconds),
             "total_calories": round(sum_calories, 1),
         },
         "items": items,
@@ -278,38 +370,15 @@ async def discover_workout_details(template_id: PydanticObjectId):
     if not ex or ex.status != "active":
         raise HTTPException(status_code=404, detail="Workout not found")
 
+    wm = _derive_exercise_workout_metrics(ex)
     media = getattr(ex, "media", None)
-    duration_seconds = int(getattr(media, "duration_seconds", 0) or 0) if media else 0
-    if duration_seconds <= 0 and getattr(ex, "defaults", None):
-        duration_seconds = int(getattr(ex.defaults, "duration_seconds", 0) or 0)
+    duration_seconds = int(wm["planned_total_seconds"])
 
     calories = 0.0
     if getattr(ex, "calories_per_minute", None):
         calories = float(ex.calories_per_minute or 0) * (duration_seconds / 60.0)
 
-    mode_value = str(getattr(ex, "mode", ""))
-    step_duration = int(duration_seconds) if mode_value == "time" else None
-    set_plan = _resolve_set_plan(ex, step_duration or duration_seconds)
-    sets_payload = _build_sets_payload(ex, set_plan)
-    set_summaries = [
-        {
-            "set_id": int(s.get("set_no", 0)),
-            "reps_count": len(s.get("reps", []) or []),
-        }
-        for s in sets_payload
-    ]
-    total_sets = len(sets_payload)
-    rest_seconds_after_exercise = int(
-        (sets_payload[-1].get("rest_seconds_after", 0) if sets_payload else 0) or 0
-    )
-    total_reps = 0
-    for s in sets_payload:
-        for rep in (s.get("reps") or []):
-            target = rep.get("target")
-            if target is not None:
-                total_reps += int(target)
-            else:
-                total_reps += 1
+    set_summaries = wm["set_summaries"]
     ai_tip = getattr(ex, "ai_technique", None)
 
     return {
@@ -340,13 +409,27 @@ async def discover_workout_details(template_id: PydanticObjectId):
         ),
         "level": str(ex.difficulty.value if hasattr(ex.difficulty, "value") else ex.difficulty),
         "totals": {
-            "sets": total_sets,
-            "reps": total_reps,
-            "rest_seconds_after_exercise": rest_seconds_after_exercise,
+            "sets": int(wm["total_sets"]),
+            "reps": int(wm["total_reps"]),
+            "intervals": int(wm["total_intervals"]),
+            "timed_intervals": int(wm["timed_intervals"]),
+            "timed_intervals_seconds": int(wm["timed_intervals_seconds"]),
+            "rest_between_sets_seconds": int(wm["rest_between_sets_seconds"]),
+            "rest_seconds_after_exercise": int(wm["rest_seconds_after_exercise"]),
             "total_seconds": duration_seconds,
-            "total_minutes": _to_minutes(duration_seconds),
+            "total_minutes": seconds_to_minutes(duration_seconds),
             "total_calories": round(calories, 1),
         },
+        "metrics": build_metrics_block(
+            total_seconds=duration_seconds,
+            total_calories=round(calories, 1),
+            total_sets=int(wm["total_sets"]),
+            total_reps=int(wm["total_reps"]),
+            total_intervals=int(wm["total_intervals"]),
+            timed_intervals=int(wm["timed_intervals"]),
+            timed_intervals_seconds=int(wm["timed_intervals_seconds"]),
+            rest_between_sets_seconds=int(wm["rest_between_sets_seconds"]),
+        ),
         "sets": set_summaries,
     }
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -145,7 +145,7 @@ class PromoCodesOut(BaseModel):
 class PromoCodeCreateIn(BaseModel):
     code: str
     discount_percent: int = Field(default=0, ge=0, le=95)
-    duration_days: int = Field(ge=1, le=3650)
+    duration_days: Literal[7, 14, 30, 90, 365]
     max_uses: int = Field(default=1, ge=1)
     expires_at: Optional[datetime] = None
     status: PromoStatus = PromoStatus.active
@@ -154,7 +154,7 @@ class PromoCodeCreateIn(BaseModel):
 class PromoBatchCreateIn(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     discount_percent: int = Field(default=0, ge=0, le=95)
-    duration_days: int = Field(ge=1, le=3650)
+    duration_days: Literal[7, 14, 30, 90, 365]
     max_uses_per_code: int = Field(ge=1)
     codes_count: int = Field(ge=1)
     code_length: int = Field(default=10, ge=1)

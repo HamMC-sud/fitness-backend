@@ -14,6 +14,11 @@ from beanie.odm.fields import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.auth.config import get_current_user
+from api.ai.request_understanding import (
+    apply_understanding_to_meta,
+    parse_plan_request,
+    validate_plan_distribution,
+)
 from models import (
     AiChatMessage,
     AiChatThread,
@@ -25,7 +30,7 @@ from models import (
     RewardedGrant,
     Subscription,
 )
-from models.enums import AiRequestStatus, AiRequestType, Equipment, SubscriptionStatus
+from models.enums import AiRequestStatus, AiRequestType, Equipment, Injury, SubscriptionStatus
 from schemas.ai import (
     AiAdjustIn,
     AiAdjustOut,
@@ -101,6 +106,37 @@ def _normalize_equipment_values(v: Any) -> list[str]:
     for item in _as_str_list(v):
         try:
             normalized = Equipment.normalize(item).value
+        except ValueError:
+            continue
+        if normalized not in out:
+            out.append(normalized)
+    return out
+
+
+def _normalize_injury_values(v: Any) -> list[str]:
+    out: list[str] = []
+    for item in _as_str_list(v):
+        raw = item.strip()
+        if not raw:
+            continue
+
+        # Human-readable values used in exercise contraindications.
+        key = raw.lower().replace("-", "_").replace(" ", "_")
+        human_to_key = {
+            "none": "none",
+            "back_pain": "back_pain",
+            "knee_issues": "knee_issues",
+            "shoulder_issues": "shoulder_issues",
+            "no_jumping": "no_jumping",
+            "back pain": "back_pain",
+            "knee issues": "knee_issues",
+            "shoulder issues": "shoulder_issues",
+            "no jumping": "no_jumping",
+        }
+        key = human_to_key.get(raw.lower(), human_to_key.get(key, key))
+
+        try:
+            normalized = Injury(key).value
         except ValueError:
             continue
         if normalized not in out:
@@ -338,9 +374,9 @@ def _merge_prompt_with_profile(current_user: Any, prompt_meta: Dict[str, Any]) -
     if not equipment and profile:
         equipment = _normalize_equipment_values(getattr(profile, "equipment", []))
 
-    injuries = _as_str_list(prompt_meta.get("injuries"))
+    injuries = _normalize_injury_values(prompt_meta.get("injuries"))
     if not injuries and profile:
-        injuries = _as_str_list(getattr(profile, "injuries", []))
+        injuries = _normalize_injury_values(getattr(profile, "injuries", []))
 
     level = (_as_str(prompt_meta.get("activity_level"))).lower().strip()
     if not level and profile:
@@ -384,8 +420,9 @@ def _merge_prompt_with_profile(current_user: Any, prompt_meta: Dict[str, Any]) -
 
 
 def _exercise_is_allowed(ex: Exercise, injuries: set[str], equipment: set[str]) -> bool:
-    contraindications = {_as_str(x) for x in (ex.contraindications or [])}
-    if injuries and contraindications.intersection(injuries):
+    contraindications = set(_normalize_injury_values(ex.contraindications or []))
+    normalized_injuries = set(_normalize_injury_values(list(injuries)))
+    if normalized_injuries and contraindications.intersection(normalized_injuries):
         return False
 
     required: set[str] = set()
@@ -507,7 +544,16 @@ async def _load_exercises_for_planning(
     equipment: set[str],
     target_types: set[str],
 ) -> list[Exercise]:
-    active = await Exercise.find(Exercise.status == "active").limit(1200).to_list()
+    # Use raw cursor + per-document validation to avoid one malformed legacy
+    # record breaking all AI planning requests.
+    collection = Exercise.get_motor_collection()
+    raw_active = await collection.find({"status": "active"}).limit(1200).to_list(length=1200)
+    active: list[Exercise] = []
+    for row in raw_active:
+        try:
+            active.append(Exercise.model_validate(row))
+        except Exception as exc:
+            logger.warning("Skipping invalid exercise document id=%s: %s", row.get("_id"), str(exc))
     if not active:
         return []
 
@@ -1335,7 +1381,7 @@ async def ai_chat_history(
             AiChatThread.user_id == current_user.id
         ).sort("-updated_at").first_or_none()
         if not thread:
-            raise HTTPException(404, "No chat history")
+            return AiChatHistoryOut(thread_id="", items=[])
 
     rows = await AiChatMessage.find(
         AiChatMessage.thread_id == thread.id
@@ -1416,14 +1462,34 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
             )
         else:
             try:
-                meta = payload.meta or {}
-                total_days = _extract_plan_duration_days(payload.text)
+                understanding = parse_plan_request(payload.text, payload.meta or {})
+                total_days = int(understanding.total_days)
+                meta = apply_understanding_to_meta(payload.meta or {}, understanding)
                 gen_req = await create_ai_request(
                     user_id=current_user.id,
                     req_type=AiRequestType.generate_plan,
                     prompt_meta=meta,
                 )
                 days = await _try_generate_plan_with_yandex(current_user, meta, total_days=total_days)
+                if days and not validate_plan_distribution(
+                    days,
+                    total_days=understanding.total_days,
+                    rest_days=understanding.rest_days,
+                    strict=understanding.rest_days_strict,
+                ):
+                    # Keep generation dependent on structured data and force distribution consistency.
+                    days = await build_plan_days(current_user, meta, total_days=total_days)
+                if days and not validate_plan_distribution(
+                    days,
+                    total_days=understanding.total_days,
+                    rest_days=understanding.rest_days,
+                    strict=understanding.rest_days_strict,
+                ):
+                    await fail_ai_request(
+                        gen_req,
+                        "Generated plan does not match requested rest-day distribution.",
+                        status_code=422,
+                    )
                 if days:
                     if usage is not None:
                         usage.used += 1
@@ -1444,6 +1510,8 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                     action = {"type": "plan_generated", "plan_id": str(plan.id), "total_days": total_days}
                 else:
                     assistant_text = "I couldn't generate a plan right now. Please try again in a moment."
+            except ValueError as e:
+                assistant_text = f"Plan request is inconsistent: {str(e)}"
             except Exception as e:
                 logger.exception("Plan generation from chat failed: %s", e)
                 assistant_text = "Something went wrong generating your plan. Please try again."

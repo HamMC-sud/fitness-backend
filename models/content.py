@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import IndexModel, ASCENDING, TEXT
 
 from .base import BaseDoc
-from .enums import ExerciseMode, Difficulty, WorkoutType, Equipment, Injury
+from .enums import ExerciseMode, Difficulty, WorkoutType, Equipment
 
 
 class I18nList(BaseModel):
@@ -142,7 +142,7 @@ class Exercise(BaseDoc):
     workout_type: List[WorkoutType] = Field(default_factory=list)
 
     equipment: List[Equipment] = Field(default_factory=list)
-    contraindications: List[Injury] = Field(default_factory=list)
+    contraindications: List[str] = Field(default_factory=list)
 
     difficulty: Difficulty
     calories_per_minute: Optional[float] = Field(default=None, ge=0)
@@ -153,10 +153,56 @@ class Exercise(BaseDoc):
     ai_mistakes: Optional[I18nText] = None
     status: str = "active"
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_fields(cls, data: Any):
+        if not isinstance(data, dict):
+            return data
+        row = dict(data)
+        if "workout_type" in row:
+            row["workout_type"] = WorkoutType.normalize_many(row.get("workout_type"))
+        return row
+
     @field_validator("equipment", mode="before")
     @classmethod
     def normalize_equipment(cls, v: Any):
         return Equipment.normalize_many(v)
+
+    @field_validator("workout_type", mode="before")
+    @classmethod
+    def normalize_workout_type(cls, v: Any):
+        return WorkoutType.normalize_many(v)
+
+    @field_validator("difficulty", mode="before")
+    @classmethod
+    def normalize_difficulty(cls, v: Any):
+        return Difficulty.normalize(v)
+
+    @field_validator("contraindications", mode="before")
+    @classmethod
+    def normalize_contraindications(cls, v: Any):
+        if v is None:
+            return []
+
+        items = v if isinstance(v, (list, tuple, set)) else [v]
+        label_by_key = {
+            "none": "None",
+            "back_pain": "Back pain",
+            "knee_issues": "Knee issues",
+            "shoulder_issues": "Shoulder issues",
+            "no_jumping": "No jumping",
+        }
+
+        out: list[str] = []
+        for item in items:
+            raw = str(item or "").strip()
+            if not raw:
+                continue
+            key = raw.lower().replace("-", "_").replace(" ", "_")
+            normalized = label_by_key.get(key, raw)
+            if normalized not in out:
+                out.append(normalized)
+        return out
 
     class Settings:
         name = "exercises"
