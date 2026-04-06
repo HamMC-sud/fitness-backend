@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
+import logging
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -27,6 +28,8 @@ from schemas.workout import (
 
 router = APIRouter()
 history_router = APIRouter()
+# Reuse uvicorn app logger so streak diagnostics are visible in default server output.
+logger = logging.getLogger("uvicorn.error")
 
 
 def utcnow() -> datetime:
@@ -116,6 +119,27 @@ async def _workout_streak_snapshot(user_id: PydanticObjectId, tz_name: Optional[
     while d in active_dates:
         streak_days += 1
         d = d - timedelta(days=1)
+
+    # Diagnostics for timezone/date-boundary streak issues.
+    try:
+        recent_completed = [
+            ensure_aware_utc(r.completed_at).astimezone(tz).isoformat()
+            for r in runs[:10]
+            if r.completed_at
+        ]
+        logger.info(
+            "Streak snapshot: user_id=%s tz_name=%s now_local=%s today_local=%s has_today=%s streak_days=%s active_dates=%s recent_completed_local=%s",
+            str(user_id),
+            str(tz_name or "UTC"),
+            now_local.isoformat(),
+            today_local.isoformat(),
+            bool(has_today),
+            int(streak_days),
+            [d.isoformat() for d in sorted(active_dates, reverse=True)[:14]],
+            recent_completed,
+        )
+    except Exception:
+        logger.exception("Failed to log streak snapshot diagnostics for user_id=%s", str(user_id))
 
     return has_today, streak_days, runs[0].completed_at
 
@@ -714,37 +738,36 @@ async def complete_workout(
     return await _complete_run(run, payload, current_user, tz_name=tz_name)
 
 
-# Removed: not used by frontend
+@router.post("/workouts/{workout_id}/feedback", status_code=status.HTTP_200_OK)
 async def workout_feedback(workout_id: PydanticObjectId, payload: WorkoutFeedbackIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    w = await _get_owned_workout_or_404(workout_id, current_user.id)
-
     fb = _normalize_feedback(payload.difficulty)  # âœ… Feedback enum
 
-    run = await _get_last_run_for_workout(w.id, current_user.id)
-    if not run:
-        run = await _create_run_for_workout(w, current_user.id)
+    run, w = await _resolve_run_and_workout_for_id(workout_id, current_user.id)
+    if w is None and run.workout_ref_id is not None:
+        w = await UserWorkout.get(run.workout_ref_id)
 
     run.difficulty_feedback = fb
     await run.save()
-    recent_runs = (
-        await WorkoutRun.find(
-            WorkoutRun.user_id == current_user.id,
-            WorkoutRun.workout_ref_id == w.id,
-            WorkoutRun.difficulty_feedback != None,
+    adjustment = None
+    if w is not None:
+        recent_runs = (
+            await WorkoutRun.find(
+                WorkoutRun.user_id == current_user.id,
+                WorkoutRun.workout_ref_id == w.id,
+                WorkoutRun.difficulty_feedback != None,
+            )
+            .sort("-started_at")
+            .limit(3)
+            .to_list()
         )
-        .sort("-started_at")
-        .limit(3)
-        .to_list()
-    )
 
-    # order oldest â†’ newest
-    recent_runs = list(reversed(recent_runs))
-    recent_feedbacks = [r.difficulty_feedback for r in recent_runs]
-
-    adjustment = _calculate_load_adjustment(recent_feedbacks)
+        # order oldest â†’ newest
+        recent_runs = list(reversed(recent_runs))
+        recent_feedbacks = [r.difficulty_feedback for r in recent_runs]
+        adjustment = _calculate_load_adjustment(recent_feedbacks)
 
     # store server decision (minimal, non-breaking)
     run.load_adjustment = adjustment  # "increase" | "decrease" | None
@@ -754,7 +777,7 @@ async def workout_feedback(workout_id: PydanticObjectId, payload: WorkoutFeedbac
 
     return {
         "status": "ok",
-        "workout_id": str(w.id),
+        "workout_id": str(w.id) if w is not None else None,
         "run_id": str(run.id),
         "difficulty": _fb_to_str(fb),
         "adjustment": adjustment,

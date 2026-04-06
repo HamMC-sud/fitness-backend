@@ -78,6 +78,8 @@ class WorkoutRun(BaseDoc):
 
     rating_stars: Optional[int] = Field(default=None, ge=1, le=5)
     difficulty_feedback: Optional[Feedback] = None
+    needs_intro: Optional[bool] = None
+    load_adjustment: Optional[str] = None
 
     exercise_results: List[WorkoutRunExerciseResult] = Field(default_factory=list)
 

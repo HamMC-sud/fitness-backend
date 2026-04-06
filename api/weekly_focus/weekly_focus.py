@@ -181,11 +181,19 @@ async def get_weekly_focus(request: Request, current_user=Depends(get_current_us
             )
         )
 
-    streak_days = 0
+    weekly_streak_days = 0
     d = today_local
     while d >= start_local_date and d in active_dates:
-        streak_days += 1
+        weekly_streak_days += 1
         d = d - timedelta(days=1)
+
+    # Keep streak value consistent with profile/workout endpoints (global workout streak).
+    profile_streak = 0
+    try:
+        profile_streak = int(getattr(getattr(current_user, "stats", None), "streak_days", 0) or 0)
+    except Exception:
+        profile_streak = 0
+    streak_days = profile_streak if profile_streak > 0 else weekly_streak_days
 
     return WeeklyFocusOut(
         week_start_utc=start_utc.replace(tzinfo=timezone.utc).isoformat(),

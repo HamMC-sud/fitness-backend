@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,6 +11,10 @@ from models import Achievement, UserAchievement
 from schemas.achievements import AchievementProgressListOut, AchievementProgressOut
 
 router = APIRouter(tags=["achievements"])
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _clamp_to_max(progress: float, max_progress: float) -> float:
@@ -56,6 +61,42 @@ async def _ensure_user_achievements(user_id, catalog_docs: List[Achievement]) ->
     return by_code
 
 
+async def _sync_streak_achievements_from_stats(
+    current_user,
+    catalog_docs: List[Achievement],
+    by_code: dict[str, UserAchievement],
+) -> None:
+    """
+    Keep streak achievements in sync with current user streak on read.
+    This avoids stale progress values when users open achievements screens.
+    """
+    try:
+        streak_days = int(getattr(getattr(current_user, "stats", None), "streak_days", 0) or 0)
+    except Exception:
+        streak_days = 0
+    streak_days = max(0, streak_days)
+
+    for c in catalog_docs:
+        code = str(getattr(c, "achievement_code", "") or "")
+        if not code.startswith("str_"):
+            continue
+
+        doc = by_code.get(code)
+        if not doc:
+            continue
+
+        max_progress = float(getattr(c, "max_progress", 100) or 100)
+        target_progress = max(0.0, min(float(streak_days), max_progress))
+        current_progress = float(getattr(doc, "progress", 0) or 0)
+        if target_progress <= current_progress:
+            continue
+
+        doc.progress = target_progress
+        if target_progress >= max_progress and getattr(doc, "unlocked_at", None) is None:
+            doc.unlocked_at = utcnow()
+        await doc.save()
+
+
 def _to_progress_out(catalog: Achievement, user_doc: Optional[UserAchievement]) -> AchievementProgressOut:
     max_progress = float(getattr(catalog, "max_progress", 100) or 100)
     progress = float(getattr(user_doc, "progress", 0) or 0) if user_doc else 0.0
@@ -80,6 +121,7 @@ async def get_achievements_progress(current_user=Depends(get_current_user)):
         return AchievementProgressListOut(items=[])
 
     by_code = await _ensure_user_achievements(current_user.id, catalog_docs)
+    await _sync_streak_achievements_from_stats(current_user, catalog_docs, by_code)
     items = [_to_progress_out(c, by_code.get(c.achievement_code)) for c in catalog_docs]
     return AchievementProgressListOut(items=items)
 
@@ -97,4 +139,5 @@ async def get_achievement_progress(achievement_id: str, current_user=Depends(get
         raise HTTPException(status_code=404, detail="Achievement not found")
 
     by_code = await _ensure_user_achievements(current_user.id, [target])
+    await _sync_streak_achievements_from_stats(current_user, [target], by_code)
     return _to_progress_out(target, by_code.get(achievement_id))

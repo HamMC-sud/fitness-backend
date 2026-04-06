@@ -16,6 +16,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from api.auth.config import get_current_user
 from api.ai.request_understanding import (
     apply_understanding_to_meta,
+    detect_plan_intent,
+    detect_plan_regeneration_intent,
+    has_explicit_rest_day_request,
     parse_plan_request,
     validate_plan_distribution,
 )
@@ -32,8 +35,6 @@ from models import (
 )
 from models.enums import AiRequestStatus, AiRequestType, Equipment, Injury, SubscriptionStatus
 from schemas.ai import (
-    AiAdjustIn,
-    AiAdjustOut,
     AiChatIn,
     AiChatHistoryOut,
     AiChatMessageOut,
@@ -53,14 +54,12 @@ from schemas.ai import (
     AiSwapOptionOut,
     AiSwapOptionsOut,
     AiApplySwapIn,
-    AiRerollIn,
-    AiRerollOut,
     RewardedGrantIn,
     RewardedGrantOut,
 )
 
 router = APIRouter(tags=["ai"])
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 YC_API_KEY_SECRET = (os.getenv("YC_API_KEY_SECRET") or "").strip()
 YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or "").strip()
@@ -197,6 +196,19 @@ async def is_premium_user(user_id: PydanticObjectId) -> bool:
     )
 
 
+async def _ensure_plan_adjustment_access(current_user: Any) -> None:
+    """
+    Plan day editing/swapping is a Premium-only feature.
+    Free users can still use one monthly reroll via chat flow.
+    """
+    if await is_premium_user(current_user.id):
+        return
+    raise HTTPException(
+        403,
+        "Plan adjustment is available on Premium. Free users have one monthly reroll via AI chat.",
+    )
+
+
 async def get_or_create_usage(user_id: PydanticObjectId, period: str) -> AiUsageMonthly:
     rec = await AiUsageMonthly.find_one(
         AiUsageMonthly.user_id == user_id,
@@ -214,10 +226,6 @@ async def get_or_create_usage(user_id: PydanticObjectId, period: str) -> AiUsage
     )
     await rec.insert()
     return rec
-
-
-async def has_child_reroll(parent_plan_id: PydanticObjectId) -> bool:
-    return await AiPlan.find_one(AiPlan.reroll_of_plan_id == parent_plan_id) is not None
 
 
 async def get_active_plan(user_id: PydanticObjectId) -> Optional[AiPlan]:
@@ -896,57 +904,64 @@ async def archive_active_plans(user_id: PydanticObjectId) -> None:
     ).update({"$set": {"status": "archived"}})
 
 
-def _detect_plan_intent(text: str) -> bool:
-    """Return True if user message is asking to generate a training plan."""
-    lower = text.lower()
-    # Must contain a generation verb AND a plan noun
-    gen_verbs = {"generate", "create", "make", "build", "give me", "i need",
-                 "создай", "сделай", "составь", "дай", "хочу",
-                 "сгенерируй", "напиши", "подготовь", "помоги", "придумай"}
-    plan_nouns = {"plan", "program", "schedule", "workout", "training",
-                  "план", "программу", "расписание", "тренировк", "тренировки",
-                  "упражнени"}
-    has_verb = any(v in lower for v in gen_verbs)
-    has_noun = any(n in lower for n in plan_nouns)
-    return has_verb and has_noun
+def _month_bounds_utc(dt: datetime) -> tuple[datetime, datetime]:
+    start = datetime(dt.year, dt.month, 1, tzinfo=timezone.utc)
+    if dt.month == 12:
+        end = datetime(dt.year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end = datetime(dt.year, dt.month + 1, 1, tzinfo=timezone.utc)
+    return start, end
+
+
+async def has_monthly_reroll(user_id: PydanticObjectId) -> bool:
+    now = utcnow()
+    month_start, month_end = _month_bounds_utc(now)
+    return await AiRequest.find_one(
+        AiRequest.user_id == user_id,
+        AiRequest.type == AiRequestType.reroll,
+        AiRequest.status == AiRequestStatus.ok,
+        AiRequest.created_at >= month_start,
+        AiRequest.created_at < month_end,
+    ) is not None
 
 
 def _extract_plan_duration_days(text: str) -> int:
     """Parse requested duration in days from a user message. Defaults to 30."""
-    lower = text.lower()
+    lower = re.sub(r"\s+", " ", text.lower()).strip().replace("ё", "е")
 
-    _WORD_NUMS = {
+    word_nums = {
         "one": 1, "two": 2, "three": 3, "four": 4,
         "одну": 1, "одна": 1, "две": 2, "три": 3, "четыре": 4,
     }
 
-    # numeric: "2 weeks", "1 month", "10 days"
-    m = re.search(r'(\d+)\s*(?:week|weeks|неделю|недели|недель)', lower)
+    week_units = r"(?:week|weeks|nedelyu|nedeli|nedel|неделю|недели|недель|неделя)"
+    month_units = r"(?:month|months|mesyac|mesyaca|mesyacev|месяц|месяца|месяцев)"
+    day_units = r"(?:day|days|den|dnya|dney|день|дня|дней)"
+
+    m = re.search(rf"(\d+)\s*{week_units}", lower)
     if m:
         return min(int(m.group(1)) * 7, 90)
 
-    m = re.search(r'(\d+)\s*(?:month|months|месяц|месяца|месяцев)', lower)
+    m = re.search(rf"(\d+)\s*{month_units}", lower)
     if m:
         return min(int(m.group(1)) * 30, 90)
 
-    m = re.search(r'(\d+)\s*(?:day|days|день|дня|дней)', lower)
+    m = re.search(rf"(\d+)\s*{day_units}", lower)
     if m:
         return max(7, min(int(m.group(1)), 90))
 
-    # word numbers: "one week", "two weeks", "одну неделю"
-    for word, num in _WORD_NUMS.items():
-        if re.search(rf'{word}\s+(?:week|weeks|неделю|недели|недель)', lower):
+    for word, num in word_nums.items():
+        if re.search(rf"{word}\s*{week_units}", lower):
             return min(num * 7, 90)
-        if re.search(rf'{word}\s+(?:month|months|месяц|месяца|месяцев)', lower):
+        if re.search(rf"{word}\s*{month_units}", lower):
             return min(num * 30, 90)
 
-    # bare keywords without a number → default to 1 unit
-    if re.search(r'\b(?:неделю|неделя|на неделю|week)\b', lower):
+    if re.search(rf"\b(?:{week_units}|на неделю|na nedelyu)\b", lower):
         return 7
-    if re.search(r'\b(?:месяц|на месяц|month)\b', lower):
+    if re.search(rf"\b(?:{month_units}|на месяц|na mesyac)\b", lower):
         return 30
 
-    return 30  # default
+    return 30
 
 
 async def yandex_chat_completion(
@@ -984,8 +999,7 @@ async def build_limits(user_id: PydanticObjectId) -> AiLimitsOut:
     period = period_yyyy_mm(now)
 
     premium = await is_premium_user(user_id)
-    active_plan = await get_active_plan(user_id)
-    reroll_used = bool(active_plan and await has_child_reroll(active_plan.id))
+    reroll_used = await has_monthly_reroll(user_id)
 
     if premium:
         return AiLimitsOut(
@@ -1087,6 +1101,9 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
 
     days = await _try_generate_plan_with_yandex(current_user, meta, total_days=30)
     if not days:
+        logger.warning("AI generate-plan fallback to local builder: user_id=%s", str(current_user.id))
+        days = await build_plan_days(current_user, meta, total_days=30)
+    if not days:
         await fail_ai_request(
             req,
             "AI did not return a valid plan JSON. Plan was not created.",
@@ -1110,57 +1127,6 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
     await plan.insert()
 
     return AiGenerateOut(request_id=str(req.id), plan=plan_to_out(plan))
-
-
-# Removed: not used by frontend
-@router.post("/ai/reroll", response_model=AiRerollOut)
-async def ai_reroll_plan(payload: AiRerollIn, current_user=Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(401, "Unauthorized")
-
-    try:
-        plan_id = PydanticObjectId(payload.plan_id)
-    except Exception:
-        raise HTTPException(400, "Invalid plan_id")
-
-    plan = await AiPlan.get(plan_id)
-    if not plan or plan.user_id != current_user.id:
-        raise HTTPException(404, "Plan not found")
-
-    if await has_child_reroll(plan.id):
-        raise HTTPException(403, "Free reroll already used for this plan")
-
-    merged_meta = dict(plan.created_from or {})
-    merged_meta.update(payload.prompt_meta or {})
-    merged_meta["_reroll_nonce"] = utcnow().isoformat()
-
-    req = await create_ai_request(
-        user_id=current_user.id,
-        req_type=AiRequestType.reroll,
-        prompt_meta=merged_meta,
-    )
-
-    days = await _try_generate_plan_with_yandex(current_user, merged_meta, total_days=30)
-    if not days:
-        await fail_ai_request(
-            req,
-            "AI did not return a valid reroll plan JSON. Reroll was not created.",
-            status_code=503,
-        )
-
-    await archive_active_plans(current_user.id)
-
-    new_plan = AiPlan(
-        user_id=current_user.id,
-        status="active",
-        created_from=merged_meta,
-        days=days,
-        version=int(plan.version or 1) + 1,
-        reroll_of_plan_id=plan.id,
-    )
-    await new_plan.insert()
-
-    return AiRerollOut(request_id=str(req.id), plan=plan_to_out(new_plan))
 
 
 @router.get("/ai/plan", response_model=AiPlanOut)
@@ -1406,13 +1372,14 @@ async def ai_chat_history(
 async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
-    if not await is_premium_user(current_user.id):
-        raise HTTPException(403, "Premium required")
-
-    req = await create_ai_request(
-        user_id=current_user.id,
-        req_type=AiRequestType.chat,
-        prompt_meta=payload.meta or {},
+    premium = await is_premium_user(current_user.id)
+    message_text = str(payload.text or "")
+    logger.info(
+        "AI chat message: user_id=%s thread_id=%s premium=%s text=%s",
+        str(current_user.id),
+        str(payload.thread_id or ""),
+        premium,
+        message_text[:2000],
     )
 
     thread = None
@@ -1443,10 +1410,115 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     await user_message.insert()
 
     action: Optional[Dict[str, Any]] = None
+    regen_intent = detect_plan_regeneration_intent(payload.text)
+    plan_intent = detect_plan_intent(payload.text)
+    logger.info(
+        "AI chat intent: user_id=%s regen_intent=%s plan_intent=%s",
+        str(current_user.id),
+        bool(regen_intent),
+        bool(plan_intent),
+    )
 
-    if _detect_plan_intent(payload.text):
+    if regen_intent:
+        active_plan = await get_active_plan(current_user.id)
+        if not active_plan:
+            logger.info("AI chat regeneration skipped: user_id=%s reason=no_active_plan", str(current_user.id))
+            assistant_text = "No active plan found to regenerate. Generate a plan first."
+        else:
+            try:
+                understanding = parse_plan_request(payload.text, payload.meta or {})
+                prompt_meta = apply_understanding_to_meta(dict(active_plan.created_from or {}), understanding)
+            except Exception:
+                prompt_meta = dict(active_plan.created_from or {})
+                prompt_meta.update(payload.meta or {})
+
+            prompt_meta = _apply_adjustments_to_meta(prompt_meta, payload.meta or {}, payload.text)
+            total_days = len(active_plan.days or []) or 30
+
+            if premium:
+                regen_req = await create_ai_request(
+                    user_id=current_user.id,
+                    req_type=AiRequestType.adjust,
+                    prompt_meta=prompt_meta,
+                )
+                try:
+                    days = await _try_generate_plan_with_yandex(current_user, prompt_meta, total_days=total_days)
+                    if not days:
+                        await fail_ai_request(
+                            regen_req,
+                            "AI did not return a valid regenerated plan JSON. Regeneration was not created.",
+                            status_code=503,
+                        )
+
+                    await archive_active_plans(current_user.id)
+                    regenerated_plan = AiPlan(
+                        user_id=current_user.id,
+                        status="active",
+                        created_from=prompt_meta,
+                        days=days,
+                        version=int(active_plan.version or 1) + 1,
+                        reroll_of_plan_id=active_plan.id,
+                    )
+                    await regenerated_plan.insert()
+
+                    assistant_text = "I regenerated your current plan with updated parameters."
+                    action = {
+                        "type": "plan_regenerated",
+                        "plan_id": str(regenerated_plan.id),
+                        "base_plan_id": str(active_plan.id),
+                        "total_days": total_days,
+                    }
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.exception("Plan regeneration from chat failed: %s", e)
+                    assistant_text = "Something went wrong regenerating your plan. Please try again."
+            else:
+                if await has_monthly_reroll(current_user.id):
+                    assistant_text = (
+                        "Your free reroll for this month is already used. "
+                        "Upgrade to Premium for unlimited plan adjustments."
+                    )
+                else:
+                    reroll_req = await create_ai_request(
+                        user_id=current_user.id,
+                        req_type=AiRequestType.reroll,
+                        prompt_meta=prompt_meta,
+                    )
+                    try:
+                        days = await _try_generate_plan_with_yandex(current_user, prompt_meta, total_days=total_days)
+                        if not days:
+                            await fail_ai_request(
+                                reroll_req,
+                                "AI did not return a valid reroll plan JSON. Reroll was not created.",
+                                status_code=503,
+                            )
+
+                        await archive_active_plans(current_user.id)
+                        rerolled_plan = AiPlan(
+                            user_id=current_user.id,
+                            status="active",
+                            created_from=prompt_meta,
+                            days=days,
+                            version=int(active_plan.version or 1) + 1,
+                            reroll_of_plan_id=active_plan.id,
+                        )
+                        await rerolled_plan.insert()
+
+                        assistant_text = "Your plan was rerolled with updated parameters."
+                        action = {
+                            "type": "plan_rerolled",
+                            "plan_id": str(rerolled_plan.id),
+                            "base_plan_id": str(active_plan.id),
+                            "total_days": total_days,
+                        }
+                    except HTTPException:
+                        raise
+                    except Exception as e:
+                        logger.exception("Plan reroll from chat failed: %s", e)
+                        assistant_text = "Something went wrong rerolling your plan. Please try again."
+    elif detect_plan_intent(payload.text):
         # Check generation limits
-        premium = await is_premium_user(current_user.id)
         usage: Optional[AiUsageMonthly] = None
         can_generate = True
 
@@ -1456,6 +1528,18 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
             can_generate = usage.used < (usage.base_limit + usage.extra_from_rewarded)
 
         if not can_generate:
+            logger.info(
+                "AI chat generation blocked: user_id=%s premium=%s used=%s limit=%s",
+                str(current_user.id),
+                bool(premium),
+                int(getattr(usage, "used", 0) or 0) if usage is not None else None,
+                (
+                    int(getattr(usage, "base_limit", 0) or 0)
+                    + int(getattr(usage, "extra_from_rewarded", 0) or 0)
+                )
+                if usage is not None
+                else None,
+            )
             assistant_text = (
                 "You've used all your plan generation credits for this month. "
                 "Watch a rewarded ad to get more, or upgrade to Premium."
@@ -1465,13 +1549,27 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                 understanding = parse_plan_request(payload.text, payload.meta or {})
                 total_days = int(understanding.total_days)
                 meta = apply_understanding_to_meta(payload.meta or {}, understanding)
+                enforce_rest_distribution = has_explicit_rest_day_request(payload.text, payload.meta or {})
+                logger.info(
+                    "AI chat generation started: user_id=%s total_days=%s enforce_rest_distribution=%s",
+                    str(current_user.id),
+                    int(total_days),
+                    bool(enforce_rest_distribution),
+                )
                 gen_req = await create_ai_request(
                     user_id=current_user.id,
                     req_type=AiRequestType.generate_plan,
                     prompt_meta=meta,
                 )
                 days = await _try_generate_plan_with_yandex(current_user, meta, total_days=total_days)
-                if days and not validate_plan_distribution(
+                if not days:
+                    logger.warning(
+                        "AI chat generation fallback to local builder: user_id=%s total_days=%s",
+                        str(current_user.id),
+                        int(total_days),
+                    )
+                    days = await build_plan_days(current_user, meta, total_days=total_days)
+                if enforce_rest_distribution and days and not validate_plan_distribution(
                     days,
                     total_days=understanding.total_days,
                     rest_days=understanding.rest_days,
@@ -1479,7 +1577,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                 ):
                     # Keep generation dependent on structured data and force distribution consistency.
                     days = await build_plan_days(current_user, meta, total_days=total_days)
-                if days and not validate_plan_distribution(
+                if enforce_rest_distribution and days and not validate_plan_distribution(
                     days,
                     total_days=understanding.total_days,
                     rest_days=understanding.rest_days,
@@ -1508,15 +1606,32 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                     duration_label = f"{weeks} week{'s' if weeks != 1 else ''}" if total_days % 7 == 0 else f"{total_days} days"
                     assistant_text = f"Your {duration_label} training plan is ready! Opening it now."
                     action = {"type": "plan_generated", "plan_id": str(plan.id), "total_days": total_days}
+                    logger.info(
+                        "AI chat generation success: user_id=%s plan_id=%s total_days=%s",
+                        str(current_user.id),
+                        str(plan.id),
+                        int(total_days),
+                    )
                 else:
+                    logger.info("AI chat generation empty result: user_id=%s", str(current_user.id))
                     assistant_text = "I couldn't generate a plan right now. Please try again in a moment."
             except ValueError as e:
+                logger.info("AI chat generation validation failed: user_id=%s error=%s", str(current_user.id), str(e))
                 assistant_text = f"Plan request is inconsistent: {str(e)}"
             except Exception as e:
                 logger.exception("Plan generation from chat failed: %s", e)
                 assistant_text = "Something went wrong generating your plan. Please try again."
     else:
-        assistant_text = await yandex_chat_completion(payload.text, payload.meta or {}, history=history)
+        logger.info("AI chat no-plan intent branch: user_id=%s premium=%s", str(current_user.id), bool(premium))
+        if not premium:
+            assistant_text = "AI coach chat with questions is available on Premium."
+        else:
+            await create_ai_request(
+                user_id=current_user.id,
+                req_type=AiRequestType.chat,
+                prompt_meta=payload.meta or {},
+            )
+            assistant_text = await yandex_chat_completion(payload.text, payload.meta or {}, history=history)
 
     assistant_message = AiChatMessage(
         thread_id=thread.id,
@@ -1682,55 +1797,6 @@ async def _build_template_for_existing_plan_day(
     )
 
 
-@router.post("/ai/adjust-plan", response_model=AiAdjustOut)
-async def ai_adjust_plan(payload: AiAdjustIn, current_user=Depends(get_current_user)):
-    if not current_user:
-        raise HTTPException(401, "Unauthorized")
-    if not await is_premium_user(current_user.id):
-        raise HTTPException(403, "Premium required")
-
-    try:
-        plan_id = PydanticObjectId(payload.plan_id)
-    except Exception:
-        raise HTTPException(400, "Invalid plan_id")
-
-    base_plan = await AiPlan.get(plan_id)
-    if not base_plan or base_plan.user_id != current_user.id:
-        raise HTTPException(404, "Plan not found")
-
-    prompt_meta = dict(base_plan.created_from or {})
-    prompt_meta.update(payload.prompt_meta or {})
-    prompt_meta = _apply_adjustments_to_meta(prompt_meta, payload.adjustments or {}, payload.note)
-
-    req = await create_ai_request(
-        user_id=current_user.id,
-        req_type=AiRequestType.adjust,
-        prompt_meta=prompt_meta,
-    )
-
-    days = await _try_generate_plan_with_yandex(current_user, prompt_meta, total_days=30)
-    if not days:
-        await fail_ai_request(
-            req,
-            "AI did not return a valid adjusted plan JSON. Adjusted plan was not created.",
-            status_code=503,
-        )
-
-    await archive_active_plans(current_user.id)
-
-    adjusted_plan = AiPlan(
-        user_id=current_user.id,
-        status="active",
-        created_from=prompt_meta,
-        days=days,
-        version=int(base_plan.version or 1) + 1,
-        reroll_of_plan_id=base_plan.id,
-    )
-    await adjusted_plan.insert()
-
-    return AiAdjustOut(request_id=str(req.id), plan=plan_to_out(adjusted_plan))
-
-
 @router.get("/ai/plan/weeks", response_model=AiPlanWeeksOut)
 async def ai_plan_weeks(current_user=Depends(get_current_user)):
     if not current_user:
@@ -1798,6 +1864,7 @@ async def ai_plan_day_edit(
 ):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
+    await _ensure_plan_adjustment_access(current_user)
 
     plan = await get_active_plan(current_user.id)
     if not plan:
@@ -1862,6 +1929,7 @@ async def ai_plan_day_edit(
 async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
+    await _ensure_plan_adjustment_access(current_user)
 
     plan = await get_active_plan(current_user.id)
     if not plan:
@@ -1923,6 +1991,7 @@ async def ai_plan_day_apply_swap(
 ):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
+    await _ensure_plan_adjustment_access(current_user)
 
     plan = await get_active_plan(current_user.id)
     if not plan:

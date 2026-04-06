@@ -1482,6 +1482,27 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _coerce_meta_dict(meta: Any) -> dict[str, Any]:
+    """Safely coerce optional metadata payload into a plain dict."""
+    if meta is None:
+        return {}
+    if isinstance(meta, dict):
+        return meta
+    if hasattr(meta, "model_dump"):
+        try:
+            dumped = meta.model_dump()
+            return dumped if isinstance(dumped, dict) else {}
+        except Exception:
+            return {}
+    if hasattr(meta, "dict"):
+        try:
+            dumped = meta.dict()
+            return dumped if isinstance(dumped, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
 def _unique_keep_order(values: list[str]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -2342,6 +2363,95 @@ def understanding_to_dict(understanding: PlanRequestUnderstanding) -> dict[str, 
 
 def parse_plan_request_to_dict(prompt_text: str, meta: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     return understanding_to_dict(parse_plan_request(prompt_text, meta))
+
+
+def detect_plan_intent(text: str) -> bool:
+    """Return True if user message is asking to generate a training plan."""
+    lower = re.sub(r"\s+", " ", text.lower()).strip().replace("ё", "е")
+    gen_verbs = {
+        "generate", "create", "make", "build", "give me", "i need",
+        "создай", "сделай", "составь", "дай", "хочу", "сгенерируй", "напиши", "подготовь", "помоги",
+        "sozday", "sdelai", "sostav", "hochu", "sgenerirui",
+    }
+    plan_nouns = {
+        "plan", "program", "schedule", "workout", "training",
+        "план", "програм", "расписан", "тренировк", "упражнен",
+        "programma", "raspisanie", "trenirovka",
+    }
+    has_verb = any(v in lower for v in gen_verbs)
+    has_noun = any(n in lower for n in plan_nouns)
+    return has_verb and has_noun
+
+
+def detect_plan_regeneration_intent(text: str) -> bool:
+    """Return True if user asks to regenerate/adjust an existing plan."""
+    lower = re.sub(r"\s+", " ", text.lower()).strip().replace("ё", "е")
+    plan_nouns = {"plan", "program", "schedule", "workout", "training", "routine", "план", "програм", "расписан", "тренировк", "programma", "raspisan", "trenirovka"}
+    regen_verbs = {
+        "regenerate", "reroll", "adjust", "modify", "change", "update", "rebuild", "rework",
+        "переген", "рерол", "скоррект", "измени", "поменя", "обнови", "передел",
+        "peredel", "izmeni", "pomenya", "obnovi", "korrekt", "sdelay po drugomu", "sdelai po drugomu",
+    }
+    current_plan_refs = {
+        "current plan", "existing plan", "same plan", "this plan", "my plan", "active plan",
+        "тот же план", "этот план", "текущий план", "мой план",
+        "tot je plan", "etot plan", "tekushiy plan", "moi plan",
+    }
+    param_change_markers = {
+        "parameter", "parameters", "settings", "intensity", "duration", "days per week",
+        "нагруз", "интенсив", "длитель", "параметр",
+        "dni v nedelyu", "intensiv", "dlitel", "parametr",
+    }
+    negative_new_plan_markers = {"new plan", "create plan", "generate plan", "plan from scratch", "с нуля", "новый план", "sozday plan", "sgenerirui plan"}
+
+    direct_patterns = (
+        r"\b(?:same|current|existing|this)\s+(?:plan|program|schedule)\b.*\b(?:but|with)\b",
+        r"\b(?:тот|этот|текущ).{0,16}план\b.*\b(?:но|с)\b",
+        r"\b(?:tot|etot|tekush).{0,16}plan\b.*\b(?:no|s)\b",
+    )
+    if any(re.search(pattern, lower) for pattern in direct_patterns):
+        return True
+
+    has_plan = any(token in lower for token in plan_nouns)
+    has_regen_action = any(token in lower for token in regen_verbs)
+    has_current_ref = any(token in lower for token in current_plan_refs)
+    has_param_change = any(token in lower for token in param_change_markers)
+    asks_new_plan = any(token in lower for token in negative_new_plan_markers)
+
+    if asks_new_plan and not has_current_ref and not has_regen_action:
+        return False
+    if has_plan and has_regen_action:
+        return True
+    return has_plan and has_current_ref and has_param_change
+
+
+def has_explicit_rest_day_request(prompt_text: str, meta: Optional[dict[str, Any]] = None) -> bool:
+    """
+    Return True only when user explicitly asks for rest/recovery-day constraints.
+    Used to avoid enforcing strict rest-day validation when user did not ask for it.
+    """
+    normalized = _normalized_text(prompt_text or "")
+    metadata = _coerce_meta_dict(meta)
+
+    if _contains_any(normalized, REST_MARKERS):
+        return True
+    if _contains_any(normalized, STRICTNESS_MARKERS):
+        return True
+
+    if metadata.get("rest_days") is not None:
+        return True
+    if metadata.get("rest_days_strict") is not None:
+        return True
+
+    pref_rest = metadata.get("preferred_rest_days")
+    if isinstance(pref_rest, list) and len(pref_rest) > 0:
+        return True
+
+    pref_workout = metadata.get("preferred_workout_days")
+    if isinstance(pref_workout, list) and len(pref_workout) > 0:
+        return True
+
+    return False
 
 
 def summarize_understanding(understanding: PlanRequestUnderstanding) -> str:

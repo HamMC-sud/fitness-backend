@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Optional, Any
 
 from beanie.odm.fields import PydanticObjectId
@@ -12,6 +13,54 @@ from models.content import Exercise
 from utils.fitness_metrics import build_metrics_block, seconds_to_minutes
 
 router = APIRouter(tags=["content"])
+
+_DISCOVER_WORKTYPE_ALIASES: dict[str, tuple[WorkoutType, Optional[Equipment]]] = {
+    # Direct labels
+    "strength": (WorkoutType.strength, None),
+    "cardio": (WorkoutType.cardio, None),
+    "hiit": (WorkoutType.hiit, None),
+    "yoga": (WorkoutType.yoga, None),
+    "stretching": (WorkoutType.stretching, None),
+    # Common grouped labels from client UI
+    "cardio_hiit": (WorkoutType.cardio, None),
+    "core": (WorkoutType.strength, None),
+    "core_abs": (WorkoutType.strength, None),
+    "core_and_abs": (WorkoutType.strength, None),
+    "abs": (WorkoutType.strength, None),
+    "bodyweight": (WorkoutType.strength, Equipment.home),
+    "dumbbells": (WorkoutType.strength, Equipment.gym),
+    "mobility": (WorkoutType.stretching, None),
+    "relaxation": (WorkoutType.yoga, None),
+    "legs_glutes": (WorkoutType.strength, None),
+    "upper_body": (WorkoutType.strength, None),
+    "arms": (WorkoutType.strength, None),
+}
+
+
+def _normalize_discover_worktype(value: str) -> tuple[WorkoutType, Optional[Equipment]]:
+    raw_input = str(value or "").strip()
+    if not raw_input:
+        raise ValueError("empty worktype")
+
+    # Accept camelCase/PascalCase inputs from clients as well.
+    raw = re.sub(r"(?<!^)(?=[A-Z])", "_", raw_input).lower()
+
+    try:
+        return WorkoutType.normalize(raw), None
+    except Exception:
+        pass
+
+    token = (
+        raw.replace("-", "_")
+        .replace(" ", "_")
+        .replace("&", "_")
+        .replace("/", "_")
+    )
+    token = "_".join(part for part in token.split("_") if part)
+    mapped = _DISCOVER_WORKTYPE_ALIASES.get(token)
+    if mapped is None:
+        raise ValueError(f"Unsupported worktype: {value}")
+    return mapped
 
 
 class SimilarExerciseIn(BaseModel):
@@ -273,15 +322,24 @@ async def discover_worktype_details(
     status: str = "active",
 ):
     try:
-        wtype = WorkoutType((worktype or "").strip().lower())
+        wtype, implied_equipment = _normalize_discover_worktype(worktype)
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid worktype")
+        supported = sorted(_DISCOVER_WORKTYPE_ALIASES.keys())
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Invalid worktype",
+                "received": worktype,
+                "supported_labels": supported,
+            },
+        )
+    effective_equipment = equipment or implied_equipment
 
     filters: list[Any] = [Exercise.status == status, {"workout_type": wtype.value}]
     if level:
         filters.append(Exercise.difficulty == level)
-    if equipment:
-        filters.append({"equipment": {"$in": equipment_db_aliases(equipment)}})
+    if effective_equipment:
+        filters.append({"equipment": {"$in": equipment_db_aliases(effective_equipment)}})
 
     exercises = await Exercise.find(*filters).sort("-created_at").to_list()
     if not exercises:
@@ -367,8 +425,10 @@ async def discover_worktype_details(
 @router.get("/discover/workouts/{template_id}")
 async def discover_workout_details(template_id: PydanticObjectId):
     ex = await Exercise.get(template_id)
-    if not ex or ex.status != "active":
-        raise HTTPException(status_code=404, detail="Workout not found")
+    if not ex:
+        raise HTTPException(status_code=404, detail="Workout template not found")
+    if ex.status != "active":
+        raise HTTPException(status_code=404, detail="Workout template is inactive")
 
     wm = _derive_exercise_workout_metrics(ex)
     media = getattr(ex, "media", None)
