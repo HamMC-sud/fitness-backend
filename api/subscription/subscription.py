@@ -22,6 +22,8 @@ from models.subscription import Subscription, SubscriptionPlan, SubscriptionTran
 from models.users import User
 from schemas.subscription import (
     CancelOut,
+    PremiumActivateByProductIn,
+    PremiumActivateByProductOut,
     PromoActivateIn,
     PromoBatchCreateIn,
     PromoBatchCreateOut,
@@ -369,6 +371,54 @@ async def activate_subscription(payload: SubscriptionActivateIn, current_user=De
         userId=str(user.id),
         isPremium=bool(getattr(user.flags, "is_premium", False)),
         premiumUntil=getattr(user.flags, "premium_until", None),
+    )
+
+
+@router.post("/subscription/activate-premium", response_model=PremiumActivateByProductOut)
+async def activate_premium_by_product(payload: PremiumActivateByProductIn, current_user=Depends(get_current_user)):
+    require_auth(current_user)
+
+    product_id = (payload.product_id or "").strip()
+    duration_days = SUBSCRIPTION_DURATIONS.get(product_id)
+    if duration_days is None:
+        raise HTTPException(status_code=400, detail="Invalid product_id")
+
+    platform = (payload.platform or "").strip().lower()
+    if platform == "google_play":
+        source = SubscriptionSource.googleplay
+    elif platform == "apple":
+        source = SubscriptionSource.appstore
+    else:
+        raise HTTPException(status_code=400, detail="Invalid platform")
+
+    plan_code_by_days = {
+        30: "plan_30d",
+        180: "plan_180d",
+        365: "plan_365d",
+    }
+    plan_code = plan_code_by_days.get(int(duration_days), f"plan_{int(duration_days)}d")
+
+    sub = await upsert_subscription(
+        user_id=current_user.id,
+        plan_code=plan_code,
+        source=source,
+        add_days=int(duration_days),
+        tx_id=None,
+    )
+
+    status, is_active, in_grace = compute_subscription_status(sub)
+    out = sub_to_out(sub)
+    out.status = status
+
+    return PremiumActivateByProductOut(
+        platform=platform,
+        product_name=(payload.product_name or "").strip(),
+        product_id=product_id,
+        duration_days=int(duration_days),
+        subscription=out,
+        is_active=is_active,
+        in_grace=in_grace,
+        expires_at=sub.expires_at,
     )
 
 

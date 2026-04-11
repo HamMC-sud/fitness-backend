@@ -54,6 +54,9 @@ from schemas.ai import (
     AiSwapOptionOut,
     AiSwapOptionsOut,
     AiApplySwapIn,
+    AiExerciseSwapOptionOut,
+    AiExerciseSwapOptionsOut,
+    AiApplyExerciseSwapIn,
     RewardedGrantIn,
     RewardedGrantOut,
 )
@@ -488,6 +491,249 @@ def _extract_json(text: str) -> Optional[dict]:
     return None
 
 
+def _normalize_goal_values(values: Any) -> list[str]:
+    raw_values = _as_str_list(values)
+    mapping = {
+        "lose_weight": "lose_weight",
+        "weight_loss": "lose_weight",
+        "fat_loss": "lose_weight",
+        "burn_calories": "lose_weight",
+        "calorie_burn": "lose_weight",
+        "build_muscle": "build_muscle",
+        "muscle_gain": "build_muscle",
+        "hypertrophy": "build_muscle",
+        "endurance": "endurance",
+        "cardio": "endurance",
+        "stamina": "endurance",
+        "flexibility": "flexibility",
+        "mobility": "flexibility",
+        "stretching": "flexibility",
+        "general_fitness": "get_fitter",
+        "fitness": "get_fitter",
+        "get_fitter": "get_fitter",
+    }
+
+    out: list[str] = []
+    for item in raw_values:
+        key = item.strip().lower().replace("-", "_").replace(" ", "_")
+        normalized = mapping.get(key, key)
+        if normalized in {"lose_weight", "build_muscle", "endurance", "flexibility", "get_fitter"} and normalized not in out:
+            out.append(normalized)
+    return out
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _meta_without_duration_overrides(meta: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned = dict(meta or {})
+    for key in ("total_days", "rest_days", "rest_days_strict", "workouts_per_week", "days_per_week"):
+        cleaned.pop(key, None)
+    return cleaned
+
+
+def _extract_explicit_schedule_overrides(prompt_text: str) -> Dict[str, Any]:
+    text = re.sub(r"\s+", " ", str(prompt_text or "").lower()).strip().replace("ё", "е")
+    if not text:
+        return {}
+
+    day_units = r"(?:day|days|den|dnya|dney|день|дня|дней)"
+    rest_tokens = r"(?:rest|relax|off|recovery|отдых|выходн|otdyh|vihodn)"
+
+    out: Dict[str, Any] = {}
+
+    rest_match = re.search(rf"\b(\d+)\s*{day_units}\s*{rest_tokens}\b", text)
+    if not rest_match:
+        rest_match = re.search(rf"\b{rest_tokens}\s*(?:for|na|на)?\s*(\d+)\s*{day_units}\b", text)
+    if rest_match:
+        out["rest_days"] = _coerce_int(rest_match.group(1), default=0, lo=0, hi=364)
+        out["rest_days_strict"] = True
+
+    total_patterns = [
+        rf"\b(?:in|for|over|within|na|на)\s*(\d+)\s*{day_units}\b",
+        rf"\b(\d+)\s*{day_units}\s*(?:plan|program|workout|training|трениров|план)\b",
+        rf"\b(\d+)\s*{day_units}\b",
+    ]
+    for pat in total_patterns:
+        m = re.search(pat, text)
+        if m:
+            out["total_days"] = _coerce_int(m.group(1), default=30, lo=1, hi=365)
+            break
+
+    workouts_match = re.search(
+        r"\b(\d+)\s*(?:workouts?|sessions?|trainings?|тренировок|тренировки|trenirovok)\s*(?:per week|a week|в неделю|v nedelyu)?\b",
+        text,
+    )
+    if workouts_match:
+        out["workouts_per_week"] = _coerce_int(workouts_match.group(1), default=4, lo=1, hi=7)
+        out["days_per_week"] = int(out["workouts_per_week"])
+
+    if "total_days" in out and "rest_days" in out:
+        active_days = max(1, int(out["total_days"]) - int(out["rest_days"]))
+        out["workouts_per_week"] = max(1, min(7, active_days))
+        out["days_per_week"] = int(out["workouts_per_week"])
+
+    return out
+
+
+async def _ai_understand_plan_prompt(prompt_text: str, base_meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    text = str(prompt_text or "").strip()
+    if not text:
+        return None
+
+    profile_hint = {
+        "goals": _as_str_list(base_meta.get("goals")),
+        "equipment": _as_str_list(base_meta.get("equipment")),
+        "injuries": _as_str_list(base_meta.get("injuries")),
+        "days_per_week": base_meta.get("days_per_week") or base_meta.get("workouts_per_week"),
+        "duration_min": base_meta.get("duration_min") or base_meta.get("session_minutes"),
+        "intensity": base_meta.get("intensity"),
+    }
+    default_total_days = _coerce_int(base_meta.get("total_days"), default=30, lo=1, hi=365)
+
+    system_prompt = (
+        "You extract structured fitness-plan request parameters from free user text. "
+        "Return strict JSON only, no markdown. "
+        "Interpret colloquial Russian, transliterated Russian (Latin letters), typos, and mixed RU/EN speech. "
+        "Infer user intent, not literal wording. "
+        "Normalize goals to: lose_weight|build_muscle|endurance|flexibility|get_fitter. "
+        "If user asks to burn calories, lose fat, slim down, or similar, map to lose_weight. "
+        "If duration/workout frequency is not explicit, choose realistic defaults using profile_hint and defaults. "
+        "Never return explanation text outside JSON."
+    )
+    user_prompt = {
+        "user_text": text,
+        "profile_hint": profile_hint,
+        "defaults": {"total_days": default_total_days},
+        "output_schema": {
+            "total_days": "int 1..365",
+            "workouts_per_week": "int 1..7",
+            "rest_days": "int 0..364 or null",
+            "rest_days_strict": "bool",
+            "goals": ["lose_weight|build_muscle|endurance|flexibility|get_fitter"],
+            "intensity": "low|moderate|high",
+            "duration_min": "int 10..120",
+            "equipment": ["string"],
+            "injuries": ["string"],
+            "notes": "string",
+        },
+        "examples": [
+            {
+                "input": "mne nujen trenirovok shtobi sjigat kalorii po bolshe",
+                "output": {
+                    "total_days": 30,
+                    "workouts_per_week": 5,
+                    "rest_days": 2,
+                    "rest_days_strict": False,
+                    "goals": ["lose_weight"],
+                    "intensity": "moderate",
+                    "duration_min": 40,
+                },
+            },
+            {
+                "input": "сделай план на 14 дней, 5 тренировок в неделю, хочу похудеть",
+                "output": {
+                    "total_days": 14,
+                    "workouts_per_week": 5,
+                    "rest_days": 2,
+                    "rest_days_strict": True,
+                    "goals": ["lose_weight"],
+                    "intensity": "moderate",
+                    "duration_min": 40,
+                },
+            },
+            {
+                "input": "need plan 1 month, more cardio, burn fat, beginner",
+                "output": {
+                    "total_days": 30,
+                    "workouts_per_week": 4,
+                    "rest_days": 3,
+                    "rest_days_strict": False,
+                    "goals": ["lose_weight", "endurance"],
+                    "intensity": "low",
+                    "duration_min": 30,
+                },
+            },
+        ],
+    }
+
+    text_out = await yandex_completion(
+        [
+            {"role": "system", "text": system_prompt},
+            {"role": "user", "text": json.dumps(user_prompt, ensure_ascii=True)},
+        ],
+        temperature=0.1,
+        max_tokens=900,
+    )
+    if not text_out:
+        return None
+
+    obj = _extract_json(text_out)
+    if not isinstance(obj, dict):
+        return None
+
+    total_days = _coerce_int(obj.get("total_days"), default=default_total_days, lo=1, hi=365)
+    workouts_per_week = _coerce_int(
+        obj.get("workouts_per_week"),
+        default=_coerce_int(base_meta.get("workouts_per_week") or base_meta.get("days_per_week"), default=4, lo=1, hi=7),
+        lo=1,
+        hi=7,
+    )
+
+    rest_days_raw = obj.get("rest_days")
+    rest_days: Optional[int]
+    try:
+        rest_days = int(rest_days_raw) if rest_days_raw is not None else None
+    except Exception:
+        rest_days = None
+    if rest_days is not None:
+        rest_days = max(0, min(total_days - 1, rest_days))
+
+    intensity = _normalize_intensity(obj.get("intensity"))
+    duration_min = _coerce_int(
+        obj.get("duration_min"),
+        default=_coerce_int(base_meta.get("duration_min") or base_meta.get("session_minutes"), default=35, lo=10, hi=120),
+        lo=10,
+        hi=120,
+    )
+    goals = _normalize_goal_values(obj.get("goals"))
+    equipment = _normalize_equipment_values(obj.get("equipment"))
+    injuries = _normalize_injury_values(obj.get("injuries"))
+
+    out: Dict[str, Any] = {
+        "total_days": int(total_days),
+        "workouts_per_week": int(workouts_per_week),
+        "days_per_week": int(workouts_per_week),
+        "duration_min": int(duration_min),
+    }
+    if rest_days is not None:
+        out["rest_days"] = int(rest_days)
+        out["rest_days_strict"] = _coerce_bool(obj.get("rest_days_strict"), default=True)
+        out["days_per_week"] = max(1, min(7, int(total_days - rest_days)))
+    if intensity:
+        out["intensity"] = intensity
+    if goals:
+        out["goals"] = goals
+    if equipment:
+        out["equipment"] = equipment
+    if injuries:
+        out["injuries"] = injuries
+    if obj.get("notes"):
+        out["notes"] = _as_str(obj.get("notes"))
+
+    return out
+
+
 async def yandex_completion(
     messages: list[dict[str, str]],
     *,
@@ -754,7 +1000,7 @@ async def _try_generate_plan_with_yandex(
     start = utcnow().date().isoformat()
     system_prompt = (
         "You are a fitness planner. Return strict JSON only. "
-        "Build a safe 30-day plan with workout/recovery distribution, concrete exercises "
+        f"Build a safe {int(total_days)}-day plan with workout/recovery distribution, concrete exercises "
         "with sets and reps/duration, and progression notes."
     )
     user_prompt = {
@@ -1092,17 +1338,69 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
         if usage.used >= (usage.base_limit + usage.extra_from_rewarded):
             raise HTTPException(403, "AI limit reached")
 
-    meta = payload.prompt_meta or {}
+    base_meta = dict(payload.prompt_meta or {})
+    if payload.total_days is not None:
+        base_meta["total_days"] = int(payload.total_days)
+    if payload.workouts_per_week is not None:
+        base_meta["workouts_per_week"] = int(payload.workouts_per_week)
+
+    prompt_text = str(payload.text or "").strip()
+    enforce_rest_distribution = False
+    if prompt_text:
+        explicit_overrides = _extract_explicit_schedule_overrides(prompt_text)
+        ai_meta = await _ai_understand_plan_prompt(prompt_text, base_meta)
+        if ai_meta:
+            meta = dict(base_meta)
+            meta.update(ai_meta)
+            meta.update(explicit_overrides)
+            total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
+            enforce_rest_distribution = bool(meta.get("rest_days") is not None and meta.get("rest_days_strict", False))
+        else:
+            try:
+                parse_meta = _meta_without_duration_overrides(base_meta)
+                understanding = parse_plan_request(prompt_text, parse_meta)
+            except ValueError as e:
+                raise HTTPException(422, f"Plan request is inconsistent: {str(e)}")
+            meta = apply_understanding_to_meta(base_meta, understanding)
+            meta.update(explicit_overrides)
+            total_days = int(understanding.total_days)
+            enforce_rest_distribution = has_explicit_rest_day_request(prompt_text, parse_meta)
+    else:
+        meta = base_meta
+        total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
+
     req = await create_ai_request(
         user_id=current_user.id,
         req_type=AiRequestType.generate_plan,
         prompt_meta=meta,
     )
 
-    days = await _try_generate_plan_with_yandex(current_user, meta, total_days=30)
+    days = await _try_generate_plan_with_yandex(current_user, meta, total_days=total_days)
     if not days:
-        logger.warning("AI generate-plan fallback to local builder: user_id=%s", str(current_user.id))
-        days = await build_plan_days(current_user, meta, total_days=30)
+        logger.warning(
+            "AI generate-plan fallback to local builder: user_id=%s total_days=%s",
+            str(current_user.id),
+            int(total_days),
+        )
+        days = await build_plan_days(current_user, meta, total_days=total_days)
+    if enforce_rest_distribution and days and not validate_plan_distribution(
+        days,
+        total_days=int(meta.get("total_days", total_days)),
+        rest_days=meta.get("rest_days"),
+        strict=bool(meta.get("rest_days_strict", False)),
+    ):
+        days = await build_plan_days(current_user, meta, total_days=total_days)
+    if enforce_rest_distribution and days and not validate_plan_distribution(
+        days,
+        total_days=int(meta.get("total_days", total_days)),
+        rest_days=meta.get("rest_days"),
+        strict=bool(meta.get("rest_days_strict", False)),
+    ):
+        await fail_ai_request(
+            req,
+            "Generated plan does not match requested rest-day distribution.",
+            status_code=422,
+        )
     if not days:
         await fail_ai_request(
             req,
@@ -1546,10 +1844,22 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
             )
         else:
             try:
-                understanding = parse_plan_request(payload.text, payload.meta or {})
-                total_days = int(understanding.total_days)
-                meta = apply_understanding_to_meta(payload.meta or {}, understanding)
-                enforce_rest_distribution = has_explicit_rest_day_request(payload.text, payload.meta or {})
+                base_meta = dict(payload.meta or {})
+                explicit_overrides = _extract_explicit_schedule_overrides(payload.text)
+                ai_meta = await _ai_understand_plan_prompt(payload.text, base_meta)
+                if ai_meta:
+                    meta = dict(base_meta)
+                    meta.update(ai_meta)
+                    meta.update(explicit_overrides)
+                    total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
+                    enforce_rest_distribution = bool(meta.get("rest_days") is not None and meta.get("rest_days_strict", False))
+                else:
+                    parse_meta = _meta_without_duration_overrides(base_meta)
+                    understanding = parse_plan_request(payload.text, parse_meta)
+                    total_days = int(understanding.total_days)
+                    meta = apply_understanding_to_meta(base_meta, understanding)
+                    meta.update(explicit_overrides)
+                    enforce_rest_distribution = has_explicit_rest_day_request(payload.text, parse_meta)
                 logger.info(
                     "AI chat generation started: user_id=%s total_days=%s enforce_rest_distribution=%s",
                     str(current_user.id),
@@ -1571,17 +1881,17 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                     days = await build_plan_days(current_user, meta, total_days=total_days)
                 if enforce_rest_distribution and days and not validate_plan_distribution(
                     days,
-                    total_days=understanding.total_days,
-                    rest_days=understanding.rest_days,
-                    strict=understanding.rest_days_strict,
+                    total_days=int(meta.get("total_days", total_days)),
+                    rest_days=meta.get("rest_days"),
+                    strict=bool(meta.get("rest_days_strict", False)),
                 ):
                     # Keep generation dependent on structured data and force distribution consistency.
                     days = await build_plan_days(current_user, meta, total_days=total_days)
                 if enforce_rest_distribution and days and not validate_plan_distribution(
                     days,
-                    total_days=understanding.total_days,
-                    rest_days=understanding.rest_days,
-                    strict=understanding.rest_days_strict,
+                    total_days=int(meta.get("total_days", total_days)),
+                    rest_days=meta.get("rest_days"),
+                    strict=bool(meta.get("rest_days_strict", False)),
                 ):
                     await fail_ai_request(
                         gen_req,
@@ -1797,6 +2107,59 @@ async def _build_template_for_existing_plan_day(
     )
 
 
+def _find_exercise_index_in_template(workout_template: Dict[str, Any], exercise_id: str) -> int:
+    exercises = list(workout_template.get("exercises") or [])
+    target = str(exercise_id or "").strip()
+    for idx, item in enumerate(exercises):
+        if str((item or {}).get("exercise_id") or "").strip() == target:
+            return idx
+    return -1
+
+
+def _build_replacement_exercise_item(
+    *,
+    old_item: Dict[str, Any],
+    ex_obj: Exercise,
+    language: str,
+) -> Dict[str, Any]:
+    mode = _as_str(getattr(ex_obj, "mode", "")).strip().lower() or "reps"
+    media = getattr(ex_obj, "media", None)
+    defaults = getattr(ex_obj, "defaults", None)
+    default_reps = int(getattr(defaults, "reps", 0) or 0) if defaults else 0
+    default_duration = int(getattr(defaults, "duration_seconds", 0) or 0) if defaults else 0
+
+    sets_value = _coerce_int(old_item.get("sets"), default=3, lo=1, hi=10)
+    rest_seconds = _coerce_int(old_item.get("rest_seconds"), default=60, lo=15, hi=300)
+
+    item: Dict[str, Any] = {
+        "exercise_id": str(ex_obj.id),
+        "exercise_code": getattr(ex_obj, "code", None),
+        "name": _pick_i18n_name(getattr(ex_obj, "name", None), language),
+        "mode": mode,
+        "sets": sets_value,
+        "rest_seconds": rest_seconds,
+        "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
+        "video_url": getattr(media, "video_url", None) if media else None,
+    }
+
+    if mode == "time":
+        old_duration = old_item.get("duration_seconds")
+        try:
+            old_duration = int(old_duration) if old_duration is not None else None
+        except Exception:
+            old_duration = None
+        item["duration_seconds"] = int(old_duration or default_duration or 30)
+    else:
+        old_reps = old_item.get("reps")
+        try:
+            old_reps = int(old_reps) if old_reps is not None else None
+        except Exception:
+            old_reps = None
+        item["reps"] = int(old_reps or default_reps or 12)
+
+    return item
+
+
 @router.get("/ai/plan/weeks", response_model=AiPlanWeeksOut)
 async def ai_plan_weeks(current_user=Depends(get_current_user)):
     if not current_user:
@@ -1983,7 +2346,191 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
     return AiSwapOptionsOut(plan_id=str(plan.id), date=date, items=items)
 
 
+@router.get("/ai/plan/day/exercise-swaps", response_model=AiExerciseSwapOptionsOut)
+async def ai_plan_day_exercise_swaps(
+    date: str,
+    exercise_id: str,
+    limit: int = 5,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+    await _ensure_plan_adjustment_access(current_user)
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    idx = _find_day_index(plan, date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    day_obj = plan.days[idx]
+    if str(getattr(day_obj, "type", "recovery")) != "workout":
+        raise HTTPException(400, "Day is not a workout")
+
+    wt = dict(getattr(day_obj, "workout_template", None) or {})
+    ex_idx = _find_exercise_index_in_template(wt, exercise_id)
+    if ex_idx < 0:
+        raise HTTPException(404, "Exercise not found in this day")
+
+    existing_exercises = list(wt.get("exercises") or [])
+    old_item = dict(existing_exercises[ex_idx] or {})
+    old_exercise_id = str(old_item.get("exercise_id") or "").strip()
+    day_focus = str(wt.get("focus") or "").strip().lower()
+
+    meta = dict(plan.created_from or {})
+    inputs = _merge_prompt_with_profile(current_user, meta)
+    target_types = _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
+    if day_focus:
+        target_types = [day_focus] + [t for t in target_types if t != day_focus]
+
+    injuries = set(_as_str_list(inputs.get("injuries")))
+    equipment = set(_as_str_list(inputs.get("equipment")))
+    catalog = await _load_exercises_for_planning(
+        injuries=injuries,
+        equipment=equipment,
+        target_types=set(target_types),
+    )
+
+    safe_limit = max(1, min(int(limit), 10))
+    language = _as_str(inputs.get("language") or getattr(current_user, "language", "en")) or "en"
+
+    def _collect_options(source: list[Exercise], reason: str, max_items: int, used_ids: set[str]) -> list[AiExerciseSwapOptionOut]:
+        rng = random.Random(f"exswap:{current_user.id}:{date}:{exercise_id}:{reason}")
+        shuffled = list(source)
+        rng.shuffle(shuffled)
+        out_items: list[AiExerciseSwapOptionOut] = []
+        for ex in shuffled:
+            ex_id = str(ex.id)
+            if ex_id == old_exercise_id or ex_id in used_ids:
+                continue
+            replacement = _build_replacement_exercise_item(old_item=old_item, ex_obj=ex, language=language)
+            out_items.append(
+                AiExerciseSwapOptionOut(
+                    swap_id=f"exswap_{len(used_ids) + len(out_items)}",
+                    exercise=replacement,
+                    reason=reason,
+                )
+            )
+            if len(out_items) >= max_items:
+                break
+        return out_items
+
+    items: list[AiExerciseSwapOptionOut] = []
+    used_ids: set[str] = set()
+    focused = _collect_options(
+        source=catalog,
+        reason="Similar day focus and available for your profile constraints.",
+        max_items=safe_limit,
+        used_ids=used_ids,
+    )
+    items.extend(focused)
+    used_ids.update(str((i.exercise or {}).get("exercise_id") or "") for i in focused)
+
+    # Fallback: widen search if focused pool is too narrow.
+    if len(items) < safe_limit:
+        broad_catalog = await _load_exercises_for_planning(
+            injuries=injuries,
+            equipment=equipment,
+            target_types=set(),
+        )
+        extra = _collect_options(
+            source=broad_catalog,
+            reason="Closest available alternative from your allowed exercise pool.",
+            max_items=safe_limit - len(items),
+            used_ids=used_ids,
+        )
+        items.extend(extra)
+
+    if not items:
+        raise HTTPException(404, "No replacement exercise found")
+
+    return AiExerciseSwapOptionsOut(
+        plan_id=str(plan.id),
+        date=date,
+        exercise_id=str(exercise_id),
+        items=items,
+    )
+
+
+@router.post("/ai/plan/day/exercise-swap", response_model=AiPlanDayDetailOut)
+async def ai_plan_day_apply_exercise_swap(
+    date: str,
+    payload: AiApplyExerciseSwapIn,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+    await _ensure_plan_adjustment_access(current_user)
+
+    if not payload.swap_id and not payload.new_exercise_id:
+        raise HTTPException(400, "Either swap_id or new_exercise_id is required")
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    idx = _find_day_index(plan, date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    day_obj = plan.days[idx]
+    if str(getattr(day_obj, "type", "recovery")) != "workout":
+        raise HTTPException(400, "Day is not a workout")
+
+    wt = dict(getattr(day_obj, "workout_template", None) or {})
+    exercises = list(wt.get("exercises") or [])
+    ex_idx = _find_exercise_index_in_template(wt, payload.exercise_id)
+    if ex_idx < 0:
+        raise HTTPException(404, "Exercise not found in this day")
+
+    replacement_item: Optional[Dict[str, Any]] = None
+    if payload.swap_id:
+        swaps = await ai_plan_day_exercise_swaps(
+            date=date,
+            exercise_id=payload.exercise_id,
+            limit=10,
+            current_user=current_user,
+        )
+        chosen = next((s for s in swaps.items if s.swap_id == payload.swap_id), None)
+        if not chosen:
+            raise HTTPException(404, "Swap option not found")
+        replacement_item = dict(chosen.exercise or {})
+    else:
+        try:
+            new_id = PydanticObjectId(payload.new_exercise_id)
+        except Exception:
+            raise HTTPException(400, "Invalid new_exercise_id")
+        ex_obj = await Exercise.get(new_id)
+        if not ex_obj or str(getattr(ex_obj, "status", "")) != "active":
+            raise HTTPException(404, "Replacement exercise not found")
+
+        meta = dict(plan.created_from or {})
+        inputs = _merge_prompt_with_profile(current_user, meta)
+        language = _as_str(inputs.get("language") or getattr(current_user, "language", "en")) or "en"
+        replacement_item = _build_replacement_exercise_item(
+            old_item=dict(exercises[ex_idx] or {}),
+            ex_obj=ex_obj,
+            language=language,
+        )
+
+    exercises[ex_idx] = replacement_item
+    wt["exercises"] = exercises
+    day_obj.workout_template = wt
+
+    plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
+    day_obj = plan.days[idx]
+    return AiPlanDayDetailOut(
+        plan_id=str(plan.id),
+        date=str(getattr(day_obj, "date", date)),
+        type=str(getattr(day_obj, "type", "workout")),
+        workout_template=getattr(day_obj, "workout_template", None),
+    )
+
+
 @router.post("/ai/plan/day/swap", response_model=AiPlanDayDetailOut)
+@router.post("/ai/plan/day/workout-swap", response_model=AiPlanDayDetailOut)
 async def ai_plan_day_apply_swap(
     date: str,
     payload: AiApplySwapIn,

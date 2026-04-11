@@ -91,6 +91,23 @@ class PurchaseVerifyOut(BaseModel):
     expires_at: Optional[datetime] = None
 
 
+class PremiumActivateByProductIn(BaseModel):
+    platform: Literal["google_play", "apple"]
+    product_name: str = Field(min_length=1, max_length=128)
+    product_id: str = Field(min_length=1, max_length=64)
+
+
+class PremiumActivateByProductOut(BaseModel):
+    platform: str
+    product_name: str
+    product_id: str
+    duration_days: int
+    subscription: SubscriptionOut
+    is_active: bool
+    in_grace: bool
+    expires_at: Optional[datetime] = None
+
+
 class SubscriptionActivateIn(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

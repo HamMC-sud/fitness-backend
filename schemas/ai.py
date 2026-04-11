@@ -33,6 +33,9 @@ class AiPlanOut(BaseModel):
 
 
 class AiGenerateIn(BaseModel):
+    text: Optional[str] = Field(default=None, min_length=1, max_length=8000)
+    total_days: Optional[int] = Field(default=None, ge=1, le=365)
+    workouts_per_week: Optional[int] = Field(default=None, ge=1, le=7)
     prompt_meta: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -169,3 +172,22 @@ class AiSwapOptionsOut(BaseModel):
 
 class AiApplySwapIn(BaseModel):
     swap_id: str = Field(min_length=1, max_length=64)
+
+
+class AiExerciseSwapOptionOut(BaseModel):
+    swap_id: str
+    exercise: Dict[str, Any] = Field(default_factory=dict)
+    reason: Optional[str] = None
+
+
+class AiExerciseSwapOptionsOut(BaseModel):
+    plan_id: str
+    date: str
+    exercise_id: str
+    items: List[AiExerciseSwapOptionOut] = Field(default_factory=list)
+
+
+class AiApplyExerciseSwapIn(BaseModel):
+    exercise_id: str = Field(min_length=1, max_length=64)
+    swap_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    new_exercise_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
