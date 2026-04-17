@@ -1,8 +1,10 @@
 import os
 import time
 import smtplib
+import socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import formatdate, make_msgid
 
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -12,21 +14,8 @@ SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
 
 
-def send_verification_email(
-    receiver_email: str,
-    code: str,
-    ttl_seconds: int,
-) -> None:
-    """
-    Send verification email with retry and safe error handling.
-    Will NOT crash the application.
-    """
-
-    if not SMTP_USER or not SMTP_PASSWORD:
-        raise RuntimeError("SMTP_USER / SMTP_PASSWORD are not configured")
-
+def _build_message(receiver_email: str, code: str, ttl_seconds: int) -> MIMEMultipart:
     ttl_minutes = max(1, ttl_seconds // 60)
-
     subject = "Your verification code"
 
     html = f"""
@@ -54,36 +43,86 @@ def send_verification_email(
     message["Subject"] = subject
     message["From"] = SMTP_FROM
     message["To"] = receiver_email
+    message["Date"] = formatdate(localtime=True)
+    message["Message-ID"] = make_msgid()
 
-    message.attach(MIMEText(text, "plain"))
-    message.attach(MIMEText(html, "html"))
+    message.attach(MIMEText(text, "plain", "utf-8"))
+    message.attach(MIMEText(html, "html", "utf-8"))
 
-    # retry config
-    max_attempts = 3
-    delay_seconds = 2
+    return message
+
+
+def _send_message(receiver_email: str, message: MIMEMultipart) -> None:
+    if SMTP_PORT == 465:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(message, from_addr=SMTP_FROM, to_addrs=[receiver_email])
+        return
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        server.ehlo()
+
+        if SMTP_PORT == 587:
+            server.starttls()
+            server.ehlo()
+
+        server.login(SMTP_USER, SMTP_PASSWORD)
+        server.send_message(message, from_addr=SMTP_FROM, to_addrs=[receiver_email])
+
+
+def send_verification_email(
+    receiver_email: str,
+    code: str,
+    ttl_seconds: int,
+) -> bool:
+    """
+    Returns:
+        True  -> email sent
+        False -> email was not sent
+    """
+
+    if not SMTP_USER or not SMTP_PASSWORD:
+        raise RuntimeError("SMTP_USER / SMTP_PASSWORD are not configured")
+
+    message = _build_message(receiver_email, code, ttl_seconds)
+
+    max_attempts = 5
+    base_delay_seconds = 2
 
     for attempt in range(1, max_attempts + 1):
         try:
-            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-
-                server.login(SMTP_USER, SMTP_PASSWORD)
-
-                server.sendmail(
-                    SMTP_FROM,
-                    receiver_email,
-                    message.as_string(),
-                )
-
+            _send_message(receiver_email, message)
             print(f"[EMAIL] sent to {receiver_email}")
-            return
+            return True
 
-        except Exception as e:
-            print(f"[EMAIL ERROR] attempt {attempt}/{max_attempts}: {e}")
+        except smtplib.SMTPAuthenticationError as e:
+            print(f"[EMAIL AUTH ERROR] {e}")
+            return False
+
+        except smtplib.SMTPRecipientsRefused as e:
+            print(f"[EMAIL RECIPIENT ERROR] {e}")
+            return False
+
+        except (
+            smtplib.SMTPServerDisconnected,
+            smtplib.SMTPConnectError,
+            smtplib.SMTPHeloError,
+            smtplib.SMTPDataError,
+            smtplib.SMTPResponseException,
+            socket.timeout,
+            TimeoutError,
+        ) as e:
+            print(f"[EMAIL RETRYABLE ERROR] attempt {attempt}/{max_attempts}: {e}")
 
             if attempt < max_attempts:
-                time.sleep(delay_seconds)
+                delay = base_delay_seconds * (2 ** (attempt - 1))
+                time.sleep(delay)
             else:
                 print(f"[EMAIL FAILED] could not send to {receiver_email}")
+                return False
+
+        except Exception as e:
+            print(f"[EMAIL UNKNOWN ERROR] {e}")
+            return False
+
+    return False

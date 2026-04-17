@@ -147,7 +147,7 @@ class AiPlanDayDetailOut(BaseModel):
 
 
 class AiPlanDayEditIn(BaseModel):
-    duration_min: Optional[int] = Field(default=None, ge=10, le=120)
+    duration_min: Optional[int] = Field(default=None, ge=1, le=120)
     intensity: Optional[str] = None  # low|moderate|high or beginner|intermediate|advanced
     mark_rest_day: Optional[bool] = None
     delete_session: Optional[bool] = None

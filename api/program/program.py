@@ -207,26 +207,104 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
         if out_new:
             return out_new
 
+    def _resolve_rep_intervals_count(
+        mode: str,
+        target_reps: Optional[int],
+        target_duration_seconds: Optional[int],
+    ) -> int:
+        # Fallback strategy when defaults.sets_reps is absent:
+        # split one set into 1..3 intervals based on load.
+        if mode == "reps":
+            reps_value = int(target_reps or 0)
+            if reps_value >= 12:
+                return 3
+            if reps_value >= 6:
+                return 2
+            return 1
+
+        duration_value = int(target_duration_seconds or 0)
+        if duration_value >= 90:
+            return 3
+        if duration_value >= 45:
+            return 2
+        return 1
+
     out: list[dict[str, Any]] = []
     for p in set_plan:
         target_duration = p.get("target_duration_seconds")
         if target_duration is None and media_duration > 0:
             target_duration = media_duration
+        target_reps = p.get("target_reps")
+
+        intervals_count = _resolve_rep_intervals_count(
+            mode=mode_value,
+            target_reps=target_reps if target_reps is not None else None,
+            target_duration_seconds=int(target_duration) if target_duration is not None else None,
+        )
+
+        reps_payload: list[dict[str, Any]] = []
+        if mode_value == "reps" and target_reps is not None:
+            total_reps = int(target_reps)
+            if intervals_count <= 1:
+                reps_payload = [
+                    {
+                        "rep_no": 1,
+                        "mode": mode_value,
+                        "target": total_reps,
+                        "duration_seconds": int(target_duration) if target_duration is not None else None,
+                        "video_url": video_url,
+                        "thumbnail_url": thumbnail_url,
+                    }
+                ]
+            else:
+                base = total_reps // intervals_count
+                remainder = total_reps % intervals_count
+                for idx in range(intervals_count):
+                    rep_target = base + (1 if idx < remainder else 0)
+                    reps_payload.append(
+                        {
+                            "rep_no": idx + 1,
+                            "mode": mode_value,
+                            "target": rep_target,
+                            "duration_seconds": int(target_duration) if target_duration is not None else None,
+                            "video_url": video_url,
+                            "thumbnail_url": thumbnail_url,
+                        }
+                    )
+        else:
+            total_seconds = int(target_duration) if target_duration is not None else None
+            if total_seconds is None or intervals_count <= 1:
+                reps_payload = [
+                    {
+                        "rep_no": 1,
+                        "mode": mode_value,
+                        "target": target_reps,
+                        "duration_seconds": total_seconds,
+                        "video_url": video_url,
+                        "thumbnail_url": thumbnail_url,
+                    }
+                ]
+            else:
+                base = total_seconds // intervals_count
+                remainder = total_seconds % intervals_count
+                for idx in range(intervals_count):
+                    rep_seconds = base + (1 if idx < remainder else 0)
+                    reps_payload.append(
+                        {
+                            "rep_no": idx + 1,
+                            "mode": mode_value,
+                            "target": target_reps,
+                            "duration_seconds": rep_seconds,
+                            "video_url": video_url,
+                            "thumbnail_url": thumbnail_url,
+                        }
+                    )
 
         out.append(
             {
                 "set_no": int(p["set_no"]),
                 "rest_seconds_after": int(p["rest_seconds_after"]),
-                "reps": [
-                    {
-                        "rep_no": 1,
-                        "mode": mode_value,
-                        "target": p.get("target_reps"),
-                        "duration_seconds": int(target_duration) if target_duration is not None else None,
-                        "video_url": video_url,
-                        "thumbnail_url": thumbnail_url,
-                    }
-                ],
+                "reps": reps_payload,
             }
         )
     return out

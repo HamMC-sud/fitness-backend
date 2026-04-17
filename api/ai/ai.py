@@ -173,6 +173,27 @@ def _weekly_slots(workouts_per_week: int) -> set[int]:
     return {min(6, round(i * (6 / max(1, k - 1)))) for i in range(k)}
 
 
+def _distributed_slots(total_days: int, workout_days: int) -> set[int]:
+    total = max(1, int(total_days))
+    workouts = max(0, min(int(workout_days), total))
+    if workouts <= 0:
+        return set()
+    if workouts >= total:
+        return set(range(total))
+
+    # Evenly spread exact workout count across a finite horizon.
+    slots: set[int] = set()
+    placed = 0
+    for day_idx in range(total):
+        expected = round(((day_idx + 1) * workouts) / total)
+        if expected > placed:
+            slots.add(day_idx)
+            placed = expected
+        if placed >= workouts:
+            break
+    return slots
+
+
 async def is_premium_user(user_id: PydanticObjectId) -> bool:
     sub = await Subscription.find_one(Subscription.user_id == user_id)
     if not sub:
@@ -926,7 +947,20 @@ async def build_plan_days(
     )
 
     start = utcnow().date()
-    slots = _weekly_slots(_coerce_int(inputs.get("days_per_week"), default=4, lo=1, hi=7))
+    strict_rest = bool(prompt_meta.get("rest_days_strict", False))
+    rest_days_raw = prompt_meta.get("rest_days")
+    if strict_rest and rest_days_raw is not None:
+        try:
+            rest_days = int(rest_days_raw)
+        except Exception:
+            rest_days = 0
+        rest_days = max(0, min(int(total_days) - 1, rest_days))
+        workout_days = max(1, int(total_days) - rest_days)
+        absolute_slots = _distributed_slots(int(total_days), workout_days)
+        slots = None
+    else:
+        slots = _weekly_slots(_coerce_int(inputs.get("days_per_week"), default=4, lo=1, hi=7))
+        absolute_slots = None
     nonce = seed_nonce or str(prompt_meta.get("_reroll_nonce") or "")
 
     days: list[Dict[str, Any]] = []
@@ -934,7 +968,8 @@ async def build_plan_days(
     for i in range(total_days):
         d = start + timedelta(days=i)
         weekday = i % 7
-        if weekday in slots:
+        is_workout_day = (i in absolute_slots) if absolute_slots is not None else (weekday in slots)
+        if is_workout_day:
             week_idx = i // 7
             workout_template = _build_workout_template(
                 day_date=d,
@@ -1925,6 +1960,8 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                 else:
                     logger.info("AI chat generation empty result: user_id=%s", str(current_user.id))
                     assistant_text = "I couldn't generate a plan right now. Please try again in a moment."
+            except HTTPException:
+                raise
             except ValueError as e:
                 logger.info("AI chat generation validation failed: user_id=%s error=%s", str(current_user.id), str(e))
                 assistant_text = f"Plan request is inconsistent: {str(e)}"
@@ -2130,11 +2167,28 @@ def _build_replacement_exercise_item(
 
     sets_value = _coerce_int(old_item.get("sets"), default=3, lo=1, hi=10)
     rest_seconds = _coerce_int(old_item.get("rest_seconds"), default=60, lo=15, hi=300)
+    ru_name = _pick_i18n_name(getattr(ex_obj, "name", None), "ru")
+    en_name = _pick_i18n_name(getattr(ex_obj, "name", None), "en")
+    chosen_name = _pick_i18n_name(getattr(ex_obj, "name", None), language)
+    duration_min = max(1, int((getattr(media, "duration_seconds", 0) or 0) / 60))
+    difficulty = str(getattr(getattr(ex_obj, "difficulty", None), "value", getattr(ex_obj, "difficulty", "")) or "").lower()
+    level_en = {"beginner": "Beginner", "intermediate": "Intermediate", "advanced": "Advanced"}.get(difficulty, "Beginner")
+    level_ru = {"beginner": "Начальный", "intermediate": "Средний", "advanced": "Продвинутый"}.get(difficulty, "Начальный")
 
     item: Dict[str, Any] = {
         "exercise_id": str(ex_obj.id),
         "exercise_code": getattr(ex_obj, "code", None),
-        "name": _pick_i18n_name(getattr(ex_obj, "name", None), language),
+        "name": chosen_name,
+        "title": {
+            "ru": ru_name,
+            "en": en_name,
+        },
+        "subtitle": {
+            "ru": f"{level_ru} - {duration_min} мин",
+            "en": f"{level_en} - {duration_min} min",
+        },
+        "level": difficulty or "beginner",
+        "duration_min": duration_min,
         "mode": mode,
         "sets": sets_value,
         "rest_seconds": rest_seconds,
@@ -2158,6 +2212,145 @@ def _build_replacement_exercise_item(
         item["reps"] = int(old_reps or default_reps or 12)
 
     return item
+
+
+def _exercise_difficulty_value(ex_obj: Exercise) -> str:
+    return str(getattr(getattr(ex_obj, "difficulty", None), "value", getattr(ex_obj, "difficulty", "")) or "").lower()
+
+
+async def _expand_day_exercises_for_duration(
+    *,
+    current_user: Any,
+    plan: AiPlan,
+    day_iso: str,
+    workout_template: Dict[str, Any],
+    target_duration_min: int,
+) -> Dict[str, Any]:
+    wt = dict(workout_template or {})
+    exercises = list(wt.get("exercises") or [])
+    if not exercises:
+        wt["duration_min"] = int(target_duration_min)
+        return wt
+
+    current_duration = _coerce_int(wt.get("duration_min"), default=0, lo=0, hi=600)
+    wt["duration_min"] = int(target_duration_min)
+    # Scale exercise count by total day duration.
+    # 6 min per exercise heuristic with bounds [2..8].
+    target_count = max(2, min(8, int((int(target_duration_min) + 5) // 6)))
+    if int(target_duration_min) < int(current_duration) and len(exercises) > target_count:
+        wt["exercises"] = exercises[:target_count]
+        return wt
+    if len(exercises) >= target_count:
+        wt["exercises"] = exercises
+        return wt
+
+    meta = dict(plan.created_from or {})
+    inputs = _merge_prompt_with_profile(current_user, meta)
+    language = _as_str(inputs.get("language") or getattr(current_user, "language", "en")) or "en"
+    focus = str(wt.get("focus") or "").strip().lower()
+    target_types = [focus] if focus else _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
+
+    injuries = set(_as_str_list(inputs.get("injuries")))
+    equipment = set(_as_str_list(inputs.get("equipment")))
+    focused_catalog = await _load_exercises_for_planning(
+        injuries=injuries,
+        equipment=equipment,
+        target_types=set(target_types),
+    )
+
+    # Keep complexity consistent with user's level when possible.
+    preferred_level = str(inputs.get("level") or "").strip().lower()
+    catalog = list(focused_catalog)
+    if preferred_level in {"beginner", "intermediate", "advanced"}:
+        same_level = [ex for ex in focused_catalog if _exercise_difficulty_value(ex) == preferred_level]
+        if same_level:
+            catalog = same_level
+
+    existing_ids = {str((item or {}).get("exercise_id") or "").strip() for item in exercises}
+    existing_ids.discard("")
+    if not catalog:
+        return wt
+
+    # Preserve style (sets/rest/reps) from existing day.
+    style_item = dict(exercises[0] or {})
+    rng = random.Random(f"expand:{current_user.id}:{day_iso}:{target_duration_min}:{len(exercises)}")
+    shuffled = list(catalog)
+    rng.shuffle(shuffled)
+
+    for ex in shuffled:
+        ex_id = str(ex.id)
+        if ex_id in existing_ids:
+            continue
+        exercises.append(
+            _build_replacement_exercise_item(
+                old_item=style_item,
+                ex_obj=ex,
+                language=language,
+            )
+        )
+        existing_ids.add(ex_id)
+        if len(exercises) >= target_count:
+            break
+
+    # Fallback: widen pool to any workout type (still respecting injuries/equipment),
+    # then relax level preference if still not enough unique exercises.
+    if len(exercises) < target_count:
+        broad_catalog = await _load_exercises_for_planning(
+            injuries=injuries,
+            equipment=equipment,
+            target_types=set(),
+        )
+
+        fallback_pool = list(broad_catalog)
+        if preferred_level in {"beginner", "intermediate", "advanced"}:
+            same_level_broad = [ex for ex in broad_catalog if _exercise_difficulty_value(ex) == preferred_level]
+            if same_level_broad:
+                fallback_pool = same_level_broad
+
+        rng2 = random.Random(f"expand:broad:{current_user.id}:{day_iso}:{target_duration_min}:{len(exercises)}")
+        shuffled2 = list(fallback_pool)
+        rng2.shuffle(shuffled2)
+        for ex in shuffled2:
+            ex_id = str(ex.id)
+            if ex_id in existing_ids:
+                continue
+            exercises.append(
+                _build_replacement_exercise_item(
+                    old_item=style_item,
+                    ex_obj=ex,
+                    language=language,
+                )
+            )
+            existing_ids.add(ex_id)
+            if len(exercises) >= target_count:
+                break
+
+    if len(exercises) < target_count and preferred_level in {"beginner", "intermediate", "advanced"}:
+        broad_catalog = await _load_exercises_for_planning(
+            injuries=injuries,
+            equipment=equipment,
+            target_types=set(),
+        )
+        rng3 = random.Random(f"expand:relaxed-level:{current_user.id}:{day_iso}:{target_duration_min}:{len(exercises)}")
+        shuffled3 = list(broad_catalog)
+        rng3.shuffle(shuffled3)
+        for ex in shuffled3:
+            ex_id = str(ex.id)
+            if ex_id in existing_ids:
+                continue
+            exercises.append(
+                _build_replacement_exercise_item(
+                    old_item=style_item,
+                    ex_obj=ex,
+                    language=language,
+                )
+            )
+            existing_ids.add(ex_id)
+            if len(exercises) >= target_count:
+                break
+
+    wt["exercises"] = exercises
+    return wt
 
 
 @router.get("/ai/plan/weeks", response_model=AiPlanWeeksOut)
@@ -2263,7 +2456,14 @@ async def ai_plan_day_edit(
             )
 
         if "duration_min" in patch and patch["duration_min"] is not None:
-            wt["duration_min"] = int(patch["duration_min"])
+            requested_duration = int(patch["duration_min"])
+            wt = await _expand_day_exercises_for_duration(
+                current_user=current_user,
+                plan=plan,
+                day_iso=date,
+                workout_template=wt,
+                target_duration_min=requested_duration,
+            )
         if "intensity" in patch and patch["intensity"]:
             norm = _normalize_intensity(patch["intensity"])
             if not norm:
