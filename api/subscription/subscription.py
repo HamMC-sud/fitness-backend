@@ -5,9 +5,12 @@ import io
 import os
 import secrets
 import string
+import uuid
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple
 
+import httpx
 from beanie.odm.fields import PydanticObjectId
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
@@ -17,11 +20,15 @@ from starlette.concurrency import run_in_threadpool
 
 from api.auth.config import get_current_user
 from models.enums import PromoStatus, SubscriptionSource, SubscriptionStatus
+from models.landing_payment import LandingYooKassaOrder
 from models.promo import PromoCode, PromoCodeBatch, PromoRedemption
 from models.subscription import Subscription, SubscriptionPlan, SubscriptionTransaction
 from models.users import User
 from schemas.subscription import (
     CancelOut,
+    LandingYooKassaInitIn,
+    LandingYooKassaInitOut,
+    LandingYooKassaOrderStatusOut,
     PremiumActivateByProductIn,
     PremiumActivateByProductOut,
     PromoActivateIn,
@@ -349,6 +356,135 @@ def build_web_checkout_url(transaction_id: str) -> Optional[str]:
     return f"{base}{sep}transaction_id={transaction_id}"
 
 
+def _money_to_decimal(value: Any) -> Decimal:
+    try:
+        dec = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid amount in plan web price")
+
+    if dec <= Decimal("0"):
+        raise HTTPException(status_code=400, detail="Plan web price amount must be greater than 0")
+
+    return dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _format_money(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP):.2f}"
+
+
+def _resolve_web_plan_price(plan: SubscriptionPlan) -> Tuple[Decimal, str]:
+    prices = dict(getattr(plan, "prices", {}) or {})
+    web_price = prices.get(SubscriptionSource.web.value)
+
+    if not isinstance(web_price, dict):
+        raise HTTPException(status_code=400, detail="Plan has no web price configured")
+
+    amount = _money_to_decimal(web_price.get("amount"))
+    currency = str(web_price.get("currency") or "RUB").strip().upper()
+    if len(currency) != 3:
+        raise HTTPException(status_code=400, detail="Invalid currency in plan web price")
+    return amount, currency
+
+
+def _resolve_yookassa_credentials() -> Tuple[str, str]:
+    shop_id = (os.getenv("YOOKASSA_SHOP_ID") or "").strip()
+    secret_key = (os.getenv("YOOKASSA_SECRET_KEY") or "").strip()
+
+    if not shop_id:
+        raise HTTPException(status_code=500, detail="YOOKASSA_SHOP_ID is not configured")
+    if not secret_key:
+        raise HTTPException(status_code=500, detail="YOOKASSA_SECRET_KEY is not configured")
+
+    return shop_id, secret_key
+
+
+def _resolve_return_url(payload_return_url: Optional[str]) -> str:
+    return_url = (
+        (payload_return_url or "").strip()
+        or (os.getenv("YOOKASSA_RETURN_URL") or "").strip()
+        or (os.getenv("PAYMENT_WEB_CHECKOUT_URL") or "").strip()
+    )
+    if not return_url:
+        raise HTTPException(status_code=500, detail="Return URL is not configured")
+    return return_url
+
+
+async def _resolve_promocode_discount(promocode: Optional[str]) -> Tuple[Optional[str], int]:
+    code = normalize_code(promocode or "")
+    if not code:
+        return None, 0
+
+    promo = await PromoCode.find_one(PromoCode.code == code)
+    if not promo:
+        raise HTTPException(status_code=400, detail="Invalid promo code")
+    if promo.status != PromoStatus.active:
+        raise HTTPException(status_code=400, detail="Promo code disabled")
+    if _promo_is_expired(promo):
+        raise HTTPException(status_code=400, detail="Promo code expired")
+
+    remaining = max(0, int(promo.max_uses) - int(promo.used_count))
+    if remaining <= 0:
+        raise HTTPException(status_code=400, detail="Promo code limit reached or expired")
+
+    return code, int(getattr(promo, "discount_percent", 0) or 0)
+
+
+async def _create_yookassa_payment(
+    *,
+    shop_id: str,
+    secret_key: str,
+    amount: Decimal,
+    currency: str,
+    return_url: str,
+    description: str,
+    metadata: Dict[str, str],
+) -> Dict[str, Any]:
+    payload = {
+        "amount": {
+            "value": _format_money(amount),
+            "currency": currency,
+        },
+        "capture": True,
+        "confirmation": {
+            "type": "redirect",
+            "return_url": return_url,
+        },
+        "description": description,
+        "metadata": metadata,
+    }
+
+    headers = {"Idempotence-Key": str(uuid.uuid4())}
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.yookassa.ru/v3/payments",
+                json=payload,
+                headers=headers,
+                auth=(shop_id, secret_key),
+            )
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Cannot reach YooKassa")
+
+    if response.status_code >= 400:
+        detail = "YooKassa rejected payment creation"
+        try:
+            err = response.json()
+            message = err.get("description") or err.get("type")
+            if message:
+                detail = f"{detail}: {message}"
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=detail)
+
+    try:
+        data = response.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invalid YooKassa response")
+
+    return data
+
+
 async def create_plan(payload: SubscriptionPlanCreateIn, current_user=Depends(get_current_user)):
     require_auth(current_user)
 
@@ -419,6 +555,203 @@ async def activate_premium_by_product(payload: PremiumActivateByProductIn, curre
         is_active=is_active,
         in_grace=in_grace,
         expires_at=sub.expires_at,
+    )
+
+
+@router.post("/subscription/web/yookassa/init", response_model=LandingYooKassaInitOut)
+async def init_web_yookassa_payment(payload: LandingYooKassaInitIn):
+    tariff = (payload.tariff or "").strip()
+    plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == tariff, SubscriptionPlan.status == "active")
+    if not plan:
+        available = await SubscriptionPlan.find(SubscriptionPlan.status == "active").to_list()
+        available_codes = [p.code for p in available]
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "Tariff not found",
+                "requested_tariff": tariff,
+                "available_tariffs": available_codes,
+            },
+        )
+
+    base_amount, currency = _resolve_web_plan_price(plan)
+    promo_code, discount_percent = await _resolve_promocode_discount(payload.promocode)
+
+    amount = base_amount
+    if discount_percent > 0:
+        amount = (base_amount * Decimal(100 - discount_percent) / Decimal(100)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+        if amount <= Decimal("0"):
+            amount = Decimal("0.01")
+
+    email_lc = str(payload.email).lower().strip()
+    order_uid = uuid.uuid4().hex
+    return_url = _resolve_return_url(payload.return_url)
+    shop_id, secret_key = _resolve_yookassa_credentials()
+
+    yookassa_data = await _create_yookassa_payment(
+        shop_id=shop_id,
+        secret_key=secret_key,
+        amount=amount,
+        currency=currency,
+        return_url=return_url,
+        description=f"Subscription {plan.code}",
+        metadata={
+            "order_uid": order_uid,
+            "tariff": tariff,
+            "email": email_lc,
+            "promo": promo_code or "",
+        },
+    )
+
+    payment_id = str(yookassa_data.get("id") or "").strip()
+    payment_status = str(yookassa_data.get("status") or "").strip()
+    confirmation_url = str((yookassa_data.get("confirmation") or {}).get("confirmation_url") or "").strip()
+    if not payment_id or not confirmation_url:
+        raise HTTPException(status_code=502, detail="YooKassa response missing payment data")
+
+    order = LandingYooKassaOrder(
+        order_uid=order_uid,
+        fio=(payload.fio or "").strip(),
+        email=email_lc,
+        tariff=tariff,
+        plan_code=plan.code,
+        promocode=promo_code,
+        discount_percent=discount_percent,
+        amount=float(amount),
+        currency=currency,
+        return_url=return_url,
+        yookassa_payment_id=payment_id,
+        yookassa_status=payment_status or "pending",
+        confirmation_url=confirmation_url,
+        metadata={
+            "tariff": tariff,
+            "email": email_lc,
+            "promo": promo_code,
+        },
+        payload=yookassa_data,
+    )
+    await order.insert()
+
+    return LandingYooKassaInitOut(
+        order_id=order_uid,
+        payment_id=payment_id,
+        payment_status=payment_status or "pending",
+        confirmation_url=confirmation_url,
+        plan_code=plan.code,
+        tariff=tariff,
+        amount=float(amount),
+        currency=currency,
+        discount_percent=discount_percent,
+        promocode=promo_code,
+    )
+
+
+@router.post("/subscription/web/yookassa/webhook", response_model=YooKassaWebhookOut)
+async def yookassa_webhook(payload: Dict[str, Any], x_webhook_token: Optional[str] = Header(default=None)):
+    if not webhook_token_ok(x_webhook_token):
+        raise HTTPException(status_code=401, detail="Invalid webhook token")
+
+    event = str(payload.get("event") or "").strip()
+    payment_obj = payload.get("object") if isinstance(payload.get("object"), dict) else {}
+    payment_id = str(payment_obj.get("id") or "").strip()
+    payment_status = str(payment_obj.get("status") or "").strip().lower()
+
+    if not payment_id:
+        raise HTTPException(status_code=400, detail="Missing payment id")
+
+    order = await LandingYooKassaOrder.find_one(LandingYooKassaOrder.yookassa_payment_id == payment_id)
+    if not order:
+        return YooKassaWebhookOut(ok=True)
+
+    order.yookassa_status = payment_status or order.yookassa_status
+    order.payload = payload
+
+    if payment_status != "succeeded":
+        await order.save()
+        return YooKassaWebhookOut(ok=True)
+
+    if order.activated_at is not None and order.linked_user_id is not None:
+        await order.save()
+        return YooKassaWebhookOut(ok=True)
+
+    user = await User.find_one(User.email == str(order.email).lower().strip())
+    if not user:
+        order.activation_error = "User with this email is not found"
+        await order.save()
+        return YooKassaWebhookOut(ok=True)
+
+    plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == order.plan_code, SubscriptionPlan.status == "active")
+    if not plan:
+        order.activation_error = "Plan not found or inactive"
+        await order.save()
+        return YooKassaWebhookOut(ok=True)
+
+    provider_tx_id = payment_id
+    tx = await SubscriptionTransaction.find_one(
+        {"source": SubscriptionSource.web.value, "store.provider_tx_id": provider_tx_id}
+    )
+    if not tx:
+        tx = SubscriptionTransaction(
+            user_id=user.id,
+            source=SubscriptionSource.web,
+            plan_code=plan.code,
+            amount=order.amount,
+            currency=order.currency,
+            store={
+                "status": "verified",
+                "verified_at": utcnow().isoformat(),
+                "provider": "yookassa",
+                "provider_tx_id": provider_tx_id,
+                "event": event,
+                "payload": payment_obj,
+            },
+            promo={
+                "code": order.promocode,
+                "discount_percent": order.discount_percent,
+            },
+        )
+        await tx.insert()
+
+    sub = await upsert_subscription(
+        user_id=user.id,
+        plan_code=plan.code,
+        source=SubscriptionSource.web,
+        add_days=int(plan.duration_days),
+        tx_id=tx.id,
+    )
+
+    order.linked_user_id = user.id
+    order.activated_at = utcnow()
+    order.activation_error = None
+    order.yookassa_status = payment_status or "succeeded"
+    order.metadata = {
+        **dict(order.metadata or {}),
+        "subscription_id": str(sub.id),
+        "user_id": str(user.id),
+    }
+    await order.save()
+    return YooKassaWebhookOut(ok=True)
+
+
+@router.get("/subscription/web/yookassa/order/{order_id}", response_model=LandingYooKassaOrderStatusOut)
+async def yookassa_order_status(order_id: str):
+    oid = (order_id or "").strip()
+    if not oid:
+        raise HTTPException(status_code=400, detail="order_id is required")
+
+    order = await LandingYooKassaOrder.find_one(LandingYooKassaOrder.order_uid == oid)
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    return LandingYooKassaOrderStatusOut(
+        order_id=order.order_uid,
+        payment_status=order.yookassa_status,
+        activated=bool(order.activated_at and order.linked_user_id),
+        user_id=str(order.linked_user_id) if order.linked_user_id else None,
+        activated_at=order.activated_at,
+        activation_error=order.activation_error,
     )
 
 

@@ -18,6 +18,7 @@ from .progress import (
 )
 from .achievements import Achievement
 from .subscription import SubscriptionPlan, Subscription, SubscriptionTransaction
+from .landing_payment import LandingYooKassaOrder
 from .promo import PromoCodeBatch, PromoCode, PromoRedemption
 from .ai import (
     AiUsageMonthly, AiPlan, AiRequest,
@@ -42,6 +43,7 @@ ALL_MODELS = [
     BodyMeasurement,
     AnalyticsEvent,
     SubscriptionPlan, Subscription, SubscriptionTransaction,
+    LandingYooKassaOrder,
     PromoCodeBatch, PromoCode, PromoRedemption,
     AiUsageMonthly, AiPlan, AiRequest,
     AiChatThread, AiChatMessage, AiDailyRecommendation, RewardedGrant,

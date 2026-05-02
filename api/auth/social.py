@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional, Set
@@ -18,20 +19,27 @@ from schemas.register import TokenOut
 from schemas.social import AppleSocialIn, GoogleSocialIn, VkSocialIn
 
 router = APIRouter(tags=["auth-social"])
+logger = logging.getLogger(__name__)
 
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.131")
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or "").strip()
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
 
-GOOGLE_ALLOWED_AUDIENCES: Set[str] = {
-    v.strip()
-    for v in [
+def _collect_google_audiences() -> Set[str]:
+    values = [
         *(os.getenv("GOOGLE_CLIENT_IDS", "").split(",")),
         os.getenv("GOOGLE_WEB_CLIENT_ID", ""),
+        os.getenv("GOOGLE_ANDROID_CLIENT_ID", ""),
+        os.getenv("GOOGLE_IOS_CLIENT_ID", ""),
+        os.getenv("WEB_CLIENT_ID", ""),
+        os.getenv("ANDROID_CLIENT_ID", ""),
+        os.getenv("IOS_CLIENT_ID", ""),
     ]
-    if v and v.strip()
-}
+    return {v.strip() for v in values if v and v.strip()}
+
+
+GOOGLE_ALLOWED_AUDIENCES: Set[str] = _collect_google_audiences()
 
 
 def sha256(s: str) -> str:
@@ -86,6 +94,28 @@ async def vk_fetch_user_id(access_token: str) -> str:
 
 
 async def google_verify_id_token(id_token: str) -> Dict[str, Any]:
+    decoded_claims: Dict[str, Any] = {}
+    try:
+        decoded_claims = jwt.decode(
+            id_token,
+            options={
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+                "verify_iss": False,
+            },
+        )
+    except Exception:
+        logger.warning("Google ID token decode failed")
+
+    logger.info(
+        "Google ID token decoded claims: aud=%s azp=%s iss=%s sub=%s",
+        decoded_claims.get("aud"),
+        decoded_claims.get("azp"),
+        decoded_claims.get("iss"),
+        decoded_claims.get("sub"),
+    )
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(GOOGLE_TOKENINFO_URL, params={"id_token": id_token})
@@ -101,10 +131,26 @@ async def google_verify_id_token(id_token: str) -> Dict[str, Any]:
 
     aud = str(claims.get("aud") or "").strip()
     if GOOGLE_ALLOWED_AUDIENCES and aud not in GOOGLE_ALLOWED_AUDIENCES:
+        logger.warning(
+            "Google token audience mismatch: expected_aud=%s actual_aud=%s azp=%s iss=%s sub=%s",
+            sorted(GOOGLE_ALLOWED_AUDIENCES),
+            aud,
+            claims.get("azp"),
+            claims.get("iss"),
+            claims.get("sub"),
+        )
         raise HTTPException(status_code=401, detail="Google token audience mismatch")
 
     iss = str(claims.get("iss") or "").strip()
     if iss not in {"accounts.google.com", "https://accounts.google.com"}:
+        logger.warning(
+            "Google token issuer mismatch: expected_iss=%s actual_iss=%s aud=%s azp=%s sub=%s",
+            ["accounts.google.com", "https://accounts.google.com"],
+            iss,
+            aud,
+            claims.get("azp"),
+            claims.get("sub"),
+        )
         raise HTTPException(status_code=401, detail="Google token issuer mismatch")
 
     exp_raw = claims.get("exp")
@@ -115,7 +161,25 @@ async def google_verify_id_token(id_token: str) -> Dict[str, Any]:
 
     now_ts = int(datetime.now(timezone.utc).timestamp())
     if exp <= now_ts:
+        logger.warning(
+            "Google token expired: exp=%s now=%s aud=%s azp=%s iss=%s sub=%s",
+            exp,
+            now_ts,
+            aud,
+            claims.get("azp"),
+            iss,
+            claims.get("sub"),
+        )
         raise HTTPException(status_code=401, detail="Google token expired")
+
+    logger.info(
+        "Google token verified: expected_aud=%s actual_aud=%s azp=%s iss=%s sub=%s",
+        sorted(GOOGLE_ALLOWED_AUDIENCES),
+        aud,
+        claims.get("azp"),
+        iss,
+        claims.get("sub"),
+    )
 
     return claims
 

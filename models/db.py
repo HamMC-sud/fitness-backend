@@ -1,9 +1,11 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 from urllib.parse import urlparse
 
-load_dotenv()
+ROOT_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
+load_dotenv(dotenv_path=ROOT_ENV_PATH, override=True)
 
 
 def _db_name_from_uri(uri: str) -> str | None:

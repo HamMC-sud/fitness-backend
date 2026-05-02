@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from models.enums import SubscriptionSource, SubscriptionStatus, PromoStatus
 
@@ -205,3 +205,33 @@ class YooKassaWebhookIn(BaseModel):
 
 class YooKassaWebhookOut(BaseModel):
     ok: bool
+
+
+class LandingYooKassaInitIn(BaseModel):
+    fio: str = Field(min_length=2, max_length=120)
+    email: EmailStr
+    tariff: str = Field(min_length=1, max_length=64)
+    promocode: Optional[str] = Field(default=None, max_length=64)
+    return_url: Optional[str] = Field(default=None, max_length=2048)
+
+
+class LandingYooKassaInitOut(BaseModel):
+    order_id: str
+    payment_id: str
+    payment_status: str
+    confirmation_url: str
+    plan_code: str
+    tariff: str
+    amount: float
+    currency: str
+    discount_percent: int = 0
+    promocode: Optional[str] = None
+
+
+class LandingYooKassaOrderStatusOut(BaseModel):
+    order_id: str
+    payment_status: str
+    activated: bool
+    user_id: Optional[str] = None
+    activated_at: Optional[datetime] = None
+    activation_error: Optional[str] = None
