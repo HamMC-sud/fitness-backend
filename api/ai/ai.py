@@ -34,6 +34,7 @@ from models import (
     Subscription,
 )
 from models.enums import AiRequestStatus, AiRequestType, Equipment, Injury, SubscriptionStatus
+from utils.exercise_video_parser import parse_exercise_video_from_url
 from schemas.ai import (
     AiChatIn,
     AiChatHistoryOut,
@@ -890,12 +891,63 @@ def _build_workout_template(
     sets = min(5, base_sets + (1 if week_idx >= 2 else 0))
     rest_seconds = 75 if intensity == "low" else 45 if intensity == "high" else 60
 
+    def _build_set_plan_payload(
+        *,
+        mode: str,
+        sets_count: int,
+        rest_seconds_after: int,
+        base_reps: Optional[int],
+        base_duration_seconds: Optional[int],
+        video_url: Optional[str],
+        thumbnail_url: Optional[str],
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for set_no in range(1, int(sets_count) + 1):
+            rep_rows: list[dict[str, Any]] = []
+            if mode == "time":
+                base_sec = int(base_duration_seconds or 30)
+                variant_targets = [base_sec, max(10, base_sec - 5), base_sec + 5]
+                for idx, seconds_value in enumerate(variant_targets, start=1):
+                    rep_rows.append(
+                        {
+                            "rep_no": idx,
+                            "mode": mode,
+                            "target_reps": None,
+                            "target_duration_seconds": int(seconds_value),
+                            "video_url": video_url,
+                            "thumbnail_url": thumbnail_url,
+                        }
+                    )
+            else:
+                base_rep_value = int(base_reps or 12)
+                variant_targets = [base_rep_value, max(1, base_rep_value - 2), base_rep_value + 2]
+                for idx, reps_value in enumerate(variant_targets, start=1):
+                    rep_rows.append(
+                        {
+                            "rep_no": idx,
+                            "mode": mode,
+                            "target_reps": int(reps_value),
+                            "target_duration_seconds": None,
+                            "video_url": video_url,
+                            "thumbnail_url": thumbnail_url,
+                        }
+                    )
+            out.append(
+                {
+                    "set_no": set_no,
+                    "rest_seconds_after": int(rest_seconds_after),
+                    "reps": rep_rows,
+                }
+            )
+        return out
+
     exercise_items: list[dict[str, Any]] = []
     for ex in selected:
         mode = _as_str(ex.mode)
         default_reps = getattr(ex.defaults, "reps", None) if ex.defaults else None
         default_dur = getattr(ex.defaults, "duration_seconds", None) if ex.defaults else None
         media = getattr(ex, "media", None)
+        video_meta = parse_exercise_video_from_url(getattr(media, "video_url", None) if media else None)
 
         item: dict[str, Any] = {
             "exercise_id": str(ex.id),
@@ -906,11 +958,22 @@ def _build_workout_template(
             "rest_seconds": rest_seconds,
             "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
             "video_url": getattr(media, "video_url", None) if media else None,
+            **video_meta,
         }
+        set_plan = _build_set_plan_payload(
+            mode=mode,
+            sets_count=sets,
+            rest_seconds_after=rest_seconds,
+            base_reps=int(default_reps) if default_reps is not None else None,
+            base_duration_seconds=int(default_dur) if default_dur is not None else None,
+            video_url=getattr(media, "video_url", None) if media else None,
+            thumbnail_url=getattr(media, "thumbnail_url", None) if media else None,
+        )
         if mode == "time":
             item["duration_seconds"] = int(default_dur or 30)
         else:
             item["reps"] = int(default_reps or (10 if intensity == "low" else 12 if intensity == "moderate" else 14))
+        item["set_plan"] = set_plan
         exercise_items.append(item)
 
     goal_label = goals[0] if goals else "get_fitter"
@@ -1142,6 +1205,55 @@ async def _try_generate_plan_with_yandex(
                             row["thumbnail_url"] = getattr(media, "thumbnail_url", None) if media else None
                         if not row.get("video_url"):
                             row["video_url"] = getattr(media, "video_url", None) if media else None
+                        row.update(parse_exercise_video_from_url(row.get("video_url")))
+
+                    mode_value = str(row.get("mode") or "reps").strip().lower()
+                    sets_value = _coerce_int(row.get("sets"), default=3, lo=1, hi=10)
+                    rest_seconds = _coerce_int(row.get("rest_seconds"), default=60, lo=0, hi=600)
+                    existing_set_plan = row.get("set_plan")
+                    if not isinstance(existing_set_plan, list) or not existing_set_plan:
+                        if mode_value == "time":
+                            base_seconds = _coerce_int(row.get("duration_seconds"), default=30, lo=5, hi=3600)
+                            row["set_plan"] = [
+                                {
+                                    "set_no": set_no,
+                                    "rest_seconds_after": rest_seconds,
+                                    "reps": [
+                                        {
+                                            "rep_no": rep_no,
+                                            "mode": mode_value,
+                                            "target_reps": None,
+                                            "target_duration_seconds": max(10, base_seconds + (rep_no - 2) * 5),
+                                            "video_url": row.get("video_url"),
+                                            "thumbnail_url": row.get("thumbnail_url"),
+                                            **parse_exercise_video_from_url(row.get("video_url")),
+                                        }
+                                        for rep_no in range(1, 4)
+                                    ],
+                                }
+                                for set_no in range(1, sets_value + 1)
+                            ]
+                        else:
+                            base_reps = _coerce_int(row.get("reps"), default=12, lo=1, hi=500)
+                            row["set_plan"] = [
+                                {
+                                    "set_no": set_no,
+                                    "rest_seconds_after": rest_seconds,
+                                    "reps": [
+                                        {
+                                            "rep_no": rep_no,
+                                            "mode": mode_value,
+                                            "target_reps": max(1, base_reps + (rep_no - 2) * 2),
+                                            "target_duration_seconds": None,
+                                            "video_url": row.get("video_url"),
+                                            "thumbnail_url": row.get("thumbnail_url"),
+                                            **parse_exercise_video_from_url(row.get("video_url")),
+                                        }
+                                        for rep_no in range(1, 4)
+                                    ],
+                                }
+                                for set_no in range(1, sets_value + 1)
+                            ]
 
                     enriched_exercises.append(row)
                 wt["exercises"] = enriched_exercises
@@ -2161,6 +2273,7 @@ def _build_replacement_exercise_item(
 ) -> Dict[str, Any]:
     mode = _as_str(getattr(ex_obj, "mode", "")).strip().lower() or "reps"
     media = getattr(ex_obj, "media", None)
+    video_meta = parse_exercise_video_from_url(getattr(media, "video_url", None) if media else None)
     defaults = getattr(ex_obj, "defaults", None)
     default_reps = int(getattr(defaults, "reps", 0) or 0) if defaults else 0
     default_duration = int(getattr(defaults, "duration_seconds", 0) or 0) if defaults else 0
@@ -2194,7 +2307,11 @@ def _build_replacement_exercise_item(
         "rest_seconds": rest_seconds,
         "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
         "video_url": getattr(media, "video_url", None) if media else None,
+        **video_meta,
     }
+
+    set_count = _coerce_int(old_item.get("sets"), default=sets_value, lo=1, hi=10)
+    rep_variations = _coerce_int(old_item.get("rep_variations"), default=3, lo=1, hi=6)
 
     if mode == "time":
         old_duration = old_item.get("duration_seconds")
@@ -2202,14 +2319,54 @@ def _build_replacement_exercise_item(
             old_duration = int(old_duration) if old_duration is not None else None
         except Exception:
             old_duration = None
-        item["duration_seconds"] = int(old_duration or default_duration or 30)
+        resolved_duration = int(old_duration or default_duration or 30)
+        item["duration_seconds"] = resolved_duration
+        item["set_plan"] = [
+            {
+                "set_no": set_no,
+                "rest_seconds_after": rest_seconds,
+                "reps": [
+                    {
+                        "rep_no": rep_no,
+                        "mode": mode,
+                        "target_reps": None,
+                        "target_duration_seconds": max(10, resolved_duration + (rep_no - 2) * 5),
+                        "video_url": getattr(media, "video_url", None) if media else None,
+                        "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
+                        **video_meta,
+                    }
+                    for rep_no in range(1, rep_variations + 1)
+                ],
+            }
+            for set_no in range(1, set_count + 1)
+        ]
     else:
         old_reps = old_item.get("reps")
         try:
             old_reps = int(old_reps) if old_reps is not None else None
         except Exception:
             old_reps = None
-        item["reps"] = int(old_reps or default_reps or 12)
+        resolved_reps = int(old_reps or default_reps or 12)
+        item["reps"] = resolved_reps
+        item["set_plan"] = [
+            {
+                "set_no": set_no,
+                "rest_seconds_after": rest_seconds,
+                "reps": [
+                    {
+                        "rep_no": rep_no,
+                        "mode": mode,
+                        "target_reps": max(1, resolved_reps + (rep_no - 2) * 2),
+                        "target_duration_seconds": None,
+                        "video_url": getattr(media, "video_url", None) if media else None,
+                        "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
+                        **video_meta,
+                    }
+                    for rep_no in range(1, rep_variations + 1)
+                ],
+            }
+            for set_no in range(1, set_count + 1)
+        ]
 
     return item
 

@@ -11,6 +11,7 @@ from pydantic import AliasChoices, BaseModel, Field
 from models.enums import WorkoutType, Difficulty, Equipment, ExerciseMode
 from models.content import Exercise
 from utils.fitness_metrics import build_metrics_block, seconds_to_minutes
+from utils.exercise_video_parser import parse_exercise_video_from_url
 
 router = APIRouter(tags=["content"])
 
@@ -165,6 +166,7 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
     media_duration = int(getattr(media, "duration_seconds", 0) or 0) if media else 0
     video_url = getattr(media, "video_url", None) if media else None
     thumbnail_url = getattr(media, "thumbnail_url", None) if media else None
+    video_meta = parse_exercise_video_from_url(video_url)
     defaults = getattr(ex, "defaults", None)
 
     # New column: defaults.sets_reps allows several reps objects per set.
@@ -194,6 +196,7 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
                         "duration_seconds": int(target_seconds) if target_seconds is not None else None,
                         "video_url": video_url,
                         "thumbnail_url": thumbnail_url,
+                        **video_meta,
                     }
                 )
             if reps_payload:
@@ -254,6 +257,7 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
                         "duration_seconds": int(target_duration) if target_duration is not None else None,
                         "video_url": video_url,
                         "thumbnail_url": thumbnail_url,
+                        **video_meta,
                     }
                 ]
             else:
@@ -269,6 +273,7 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
                             "duration_seconds": int(target_duration) if target_duration is not None else None,
                             "video_url": video_url,
                             "thumbnail_url": thumbnail_url,
+                            **video_meta,
                         }
                     )
         else:
@@ -282,6 +287,7 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
                         "duration_seconds": total_seconds,
                         "video_url": video_url,
                         "thumbnail_url": thumbnail_url,
+                        **video_meta,
                     }
                 ]
             else:
@@ -297,6 +303,7 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
                             "duration_seconds": rep_seconds,
                             "video_url": video_url,
                             "thumbnail_url": thumbnail_url,
+                            **video_meta,
                         }
                     )
 

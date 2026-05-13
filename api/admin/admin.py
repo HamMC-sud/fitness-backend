@@ -84,6 +84,7 @@ from schemas.subscription import (
     SubscriptionPlanCreateIn,
     SubscriptionPlanOut,
 )
+from utils.exercise_video_parser import parse_exercise_video_filename, parse_exercise_video_from_url
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 admin_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/admin/login", auto_error=False)
@@ -636,6 +637,7 @@ async def admin_upload_exercise_media(
         "folder": _safe_path_segment(folder_key),
         "thumbnail_url": doc.media.thumbnail_url,
         "video_url": doc.media.video_url,
+        **parse_exercise_video_from_url(doc.media.video_url),
     }
 
 
@@ -1544,6 +1546,9 @@ async def admin_import_exercise_media_mapping(
             video_name = _validate_existing_media_filename(
                 row.get("video_file_name") or row.get("video") or row.get("video_filename")
             )
+            parsed_video_meta = parse_exercise_video_filename(video_name) if video_name else {
+                "video_mode": None, "repetitions": None, "duration_seconds": None
+            }
             thumb_name = _validate_existing_media_filename(
                 row.get("thumbnail_file_name")
                 or row.get("thumbnail")
@@ -1558,6 +1563,8 @@ async def admin_import_exercise_media_mapping(
                 duration_seconds = int(duration_raw)
                 if duration_seconds <= 0 or duration_seconds > 3600:
                     raise ValueError("duration_seconds must be in range 1..3600")
+            elif parsed_video_meta["duration_seconds"] is not None:
+                duration_seconds = int(round(float(parsed_video_meta["duration_seconds"])))
 
             if not any([video_name, thumb_name, duration_seconds is not None]):
                 raise ValueError("nothing to update for this row")
@@ -1587,6 +1594,7 @@ async def admin_import_exercise_media_mapping(
 
             row_result["status"] = "updated"
             row_result["changes"] = changes
+            row_result["video_meta"] = parsed_video_meta
             updated += 1
         except Exception as e:
             msg = str(e)

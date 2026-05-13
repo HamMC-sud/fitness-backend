@@ -28,6 +28,7 @@ from .admin import AdminUser
 from .social import SocialAccount
 from .health import UserHealthStepDaily
 from .content_library import ContentAsset
+from .notification_history import NotificationHistory
 
 ALL_MODELS = [
     User,
@@ -51,6 +52,7 @@ ALL_MODELS = [
     SocialAccount,
     UserHealthStepDaily,
     ContentAsset,
+    NotificationHistory,
 ]
 
 
