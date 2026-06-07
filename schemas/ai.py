@@ -20,6 +20,10 @@ class AiLimitsOut(BaseModel):
 class AiPlanDayOut(BaseModel):
     date: str
     type: str
+    type_label: Optional[str] = None
+    title: Optional[str] = None
+    focus: Optional[str] = None
+    focus_label: Optional[str] = None
     workout_template: Optional[Dict[str, Any]] = None
 
 
@@ -123,10 +127,12 @@ class AiPlanDayCardOut(BaseModel):
     date: str
     weekday: str
     type: str
+    type_label: Optional[str] = None
     title: str
     duration_min: Optional[int] = None
     intensity: Optional[str] = None
     focus: Optional[str] = None
+    focus_label: Optional[str] = None
 
 
 class AiPlanWeekOut(BaseModel):
@@ -143,6 +149,10 @@ class AiPlanDayDetailOut(BaseModel):
     plan_id: str
     date: str
     type: str
+    type_label: Optional[str] = None
+    title: Optional[str] = None
+    focus: Optional[str] = None
+    focus_label: Optional[str] = None
     workout_template: Optional[Dict[str, Any]] = None
 
 
@@ -161,6 +171,8 @@ class AiSwapOptionOut(BaseModel):
     duration_min: int
     intensity: str
     focus: str
+    focus_label: Optional[str] = None
+    type_label: Optional[str] = None
     workout_template: Dict[str, Any] = Field(default_factory=dict)
 
 

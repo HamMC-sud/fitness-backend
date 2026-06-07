@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,6 +13,8 @@ from schemas.notifications import (
     NotificationHistoryItemOut,
     NotificationHistoryListOut,
     NotificationHistoryPaginationOut,
+    ReminderSettingsIn,
+    ReminderSettingsOut,
 )
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
@@ -39,6 +42,22 @@ def _to_out(item) -> NotificationHistoryItemOut:
         is_read=bool(item.is_read),
         created_at=item.created_at,
         updated_at=item.updated_at,
+    )
+
+
+def _reminder_settings_out(user: User) -> ReminderSettingsOut:
+    reminder_settings = getattr(user, "reminder_settings", None)
+    return ReminderSettingsOut(
+        enabled=bool(getattr(reminder_settings, "enabled", False)),
+        days_of_week=list(getattr(reminder_settings, "days_of_week", []) or []),
+        time=str(getattr(reminder_settings, "time", "09:00") or "09:00"),
+        timezone=str(
+            getattr(reminder_settings, "timezone", None)
+            or getattr(user, "timezone", None)
+            or "UTC"
+        ),
+        notification_permission=getattr(reminder_settings, "notification_permission", None),
+        updated_at=getattr(reminder_settings, "updated_at", None),
     )
 
 
@@ -78,3 +97,53 @@ async def get_history(
         ),
         unread_count=unread_count,
     )
+
+
+@router.get("/reminders", response_model=ReminderSettingsOut)
+@router.get("/reminder-settings", response_model=ReminderSettingsOut)
+async def get_reminder_settings(current_user: User = Depends(get_current_user)):
+    user = _require_auth(current_user)
+    return _reminder_settings_out(user)
+
+
+@router.put("/reminders", response_model=ReminderSettingsOut)
+@router.patch("/reminders", response_model=ReminderSettingsOut)
+@router.put("/reminder-settings", response_model=ReminderSettingsOut)
+@router.patch("/reminder-settings", response_model=ReminderSettingsOut)
+async def save_reminder_settings(
+    payload: ReminderSettingsIn,
+    current_user: User = Depends(get_current_user),
+):
+    user = _require_auth(current_user)
+    existing = _reminder_settings_out(user)
+
+    merged = ReminderSettingsOut(
+        enabled=payload.enabled if payload.enabled is not None else existing.enabled,
+        days_of_week=payload.days_of_week if payload.days_of_week is not None else existing.days_of_week,
+        time=payload.time if payload.time is not None else existing.time,
+        timezone=payload.timezone if payload.timezone is not None else existing.timezone,
+        notification_permission=(
+            payload.notification_permission
+            if payload.notification_permission is not None
+            else existing.notification_permission
+        ),
+        updated_at=datetime.utcnow(),
+    )
+
+    await User.find_one(User.id == user.id).update(
+        {
+            "$set": {
+                "reminder_settings.enabled": merged.enabled,
+                "reminder_settings.days_of_week": merged.days_of_week,
+                "reminder_settings.time": merged.time,
+                "reminder_settings.timezone": merged.timezone,
+                "reminder_settings.notification_permission": merged.notification_permission,
+                "reminder_settings.updated_at": merged.updated_at,
+            }
+        }
+    )
+
+    refreshed = await User.get(user.id)
+    if not refreshed:
+        raise HTTPException(status_code=404, detail="User not found")
+    return _reminder_settings_out(refreshed)

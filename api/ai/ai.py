@@ -34,7 +34,7 @@ from models import (
     Subscription,
 )
 from models.enums import AiRequestStatus, AiRequestType, Equipment, Injury, SubscriptionStatus
-from utils.exercise_video_parser import parse_exercise_video_from_url
+from utils.exercise_video_parser import ensure_existing_media_url, parse_exercise_video_from_url
 from schemas.ai import (
     AiChatIn,
     AiChatHistoryOut,
@@ -65,10 +65,14 @@ from schemas.ai import (
 router = APIRouter(tags=["ai"])
 logger = logging.getLogger("uvicorn.error")
 
-YC_API_KEY_SECRET = (os.getenv("YC_API_KEY_SECRET") or "").strip()
-YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or "").strip()
-YC_GPT_MODEL_URI = (os.getenv("YC_GPT_MODEL_URI") or "").strip()
-YC_COMPLETION_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+YC_API_KEY_SECRET = (os.getenv("YC_API_KEY_SECRET") or os.getenv("YANDEX_API_KEY") or "").strip()
+YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or os.getenv("YANDEX_FOLDER_ID") or "").strip()
+YC_GPT_MODEL_URI = (os.getenv("YC_GPT_MODEL_URI") or os.getenv("YANDEX_GPT_MODEL_URI") or "").strip()
+YC_COMPLETION_URL = (
+    os.getenv("YC_COMPLETION_URL")
+    or os.getenv("YANDEX_COMPLETION_URL")
+    or "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+).strip()
 
 
 def utcnow() -> datetime:
@@ -167,6 +171,326 @@ def _pick_i18n_name(name_obj: Any, language: str) -> str:
     return "Exercise"
 
 
+def _is_russian_language(language: str) -> bool:
+    return str(language or "").strip().lower().startswith("ru")
+
+
+def _localized_goal_label(goal: str, language: str) -> str:
+    if not _is_russian_language(language):
+        return goal
+    return {
+        "lose_weight": "снижение веса",
+        "build_muscle": "набор мышц",
+        "get_fitter": "общая форма",
+        "endurance": "выносливость",
+        "flexibility": "гибкость",
+        "strength": "сила",
+        "cardio": "кардио",
+        "hiit": "HIIT",
+        "stretching": "растяжка",
+        "yoga": "йога",
+    }.get(str(goal or "").strip().lower(), "общая форма")
+
+
+def _localized_type_label(value: str, language: str) -> str:
+    token = str(value or "").strip().lower()
+    if _is_russian_language(language):
+        return {
+            "workout": "Тренировка",
+            "recovery": "Восстановление",
+            "rest": "Отдых",
+            "strength": "Силовая тренировка",
+            "cardio": "Кардио",
+            "hiit": "HIIT",
+            "mobility": "Мобильность",
+            "flexibility": "Растяжка",
+            "stretching": "Растяжка",
+            "endurance": "Выносливость",
+            "yoga": "Йога",
+        }.get(token, token or "Тренировка")
+    return {
+        "workout": "Workout",
+        "recovery": "Recovery",
+        "rest": "Rest",
+        "strength": "Strength",
+        "cardio": "Cardio",
+        "hiit": "HIIT",
+        "mobility": "Mobility",
+        "flexibility": "Flexibility",
+        "stretching": "Stretching",
+        "endurance": "Endurance",
+        "yoga": "Yoga",
+    }.get(token, token or "Workout")
+
+
+def _localized_recovery_day_title(language: str) -> str:
+    return "День восстановления" if _is_russian_language(language) else "Recovery day"
+
+
+def _localized_weekday(day_iso: str, language: str) -> str:
+    try:
+        weekday_idx = datetime.strptime(day_iso, "%Y-%m-%d").weekday()
+    except Exception:
+        return ""
+    if _is_russian_language(language):
+        return ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"][weekday_idx]
+    return ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"][weekday_idx]
+
+
+def _localized_progression_note(week_idx: int, intensity: str, language: str) -> str:
+    if not _is_russian_language(language):
+        return _progression_note(week_idx, intensity)
+    level = (intensity or "moderate").lower()
+    if week_idx == 0:
+        return "Неделя 1: сосредоточьтесь на технике и регулярности."
+    if week_idx == 1:
+        return "Неделя 2: добавьте 1 подход к ключевым упражнениям, если восстановление хорошее."
+    if week_idx == 2:
+        return "Неделя 3: увеличьте повторения или время на 10-15%, сохраняя технику."
+    if level == "high":
+        return "Неделя 4+: повышайте нагрузку постепенно и оставляйте 1-2 повтора в запасе."
+    return "Неделя 4+: продолжайте прогрессию нагрузки и сохраняйте хотя бы один лёгкий день."
+
+
+def _localized_swap_title(language: str) -> str:
+    return "Замена тренировки" if _is_russian_language(language) else "Swap workout"
+
+
+def _localized_swap_reason(kind: str, language: str) -> str:
+    if not _is_russian_language(language):
+        if kind == "focused":
+            return "Similar day focus and available for your profile constraints."
+        if kind == "fallback":
+            return "Closest available alternative from your allowed exercise pool."
+        return kind
+    if kind == "focused":
+        return "Похоже по фокусу дня и подходит под ограничения вашего профиля."
+    if kind == "fallback":
+        return "Ближайшая доступная альтернатива из разрешённого вам пула упражнений."
+    return kind
+
+
+def _localized_ai_chat_text(key: str, language: str) -> str:
+    if not _is_russian_language(language):
+        mapping = {
+            "no_active_plan_to_regenerate": "No active plan found to regenerate. Generate a plan first.",
+            "premium_chat_only": "AI coach chat with questions is available on Premium.",
+        }
+        return mapping.get(key, key)
+    mapping = {
+        "no_active_plan_to_regenerate": "Активный план для пересборки не найден. Сначала сгенерируйте план.",
+        "premium_chat_only": "Чат с AI-тренером и вопросами доступен на Premium.",
+    }
+    return mapping.get(key, key)
+
+
+def _localized_safety_messages(language: str) -> list[str]:
+    if _is_russian_language(language):
+        return [
+            "Остановитесь, если появляется резкая боль.",
+            "Ставьте технику выше скорости и веса.",
+        ]
+    return [
+        "Stop if sharp pain appears.",
+        "Prioritize form over speed or load.",
+    ]
+
+
+def _localized_workout_title(goal_label: str, language: str) -> str:
+    if _is_russian_language(language):
+        return f"Тренировка: {goal_label}"
+    return f"AI {goal_label} session"
+
+
+def _normalize_plan_day_language(day_obj: dict[str, Any], language: str) -> dict[str, Any]:
+    normalized = dict(day_obj)
+    day_type = str(normalized.get("type") or "").lower()
+    normalized["type_label"] = _localized_type_label(day_type, language)
+    if day_type != "workout":
+        normalized["title"] = _localized_recovery_day_title(language)
+        normalized["focus"] = None
+        normalized["focus_label"] = None
+        return normalized
+
+    workout_template = dict(normalized.get("workout_template") or {})
+    focus_value = str(workout_template.get("focus") or "").strip().lower()
+    focus_label = str(workout_template.get("focus_label") or _localized_type_label(focus_value, language))
+    if focus_value:
+        workout_template["focus_label"] = focus_label
+        workout_template["category_label"] = focus_label
+    workout_template["type_label"] = normalized["type_label"]
+    goal_label = _localized_goal_label(focus_value or "get_fitter", language)
+    workout_template["title"] = str(workout_template.get("title") or _localized_workout_title(goal_label, language))
+    if not workout_template.get("progression_note"):
+        workout_template["progression_note"] = _localized_progression_note(
+            0,
+            str(workout_template.get("intensity") or "moderate"),
+            language,
+        )
+    workout_template["safety"] = _localized_safety_messages(language)
+    normalized["workout_template"] = workout_template
+    normalized["title"] = str(workout_template.get("title") or _localized_workout_title(goal_label, language))
+    normalized["focus"] = focus_value or None
+    normalized["focus_label"] = focus_label if focus_value else None
+    return normalized
+
+
+def _media_public_prefix_from_urls(*urls: Any) -> str:
+    marker = "/upload_exercises/"
+    for url in urls:
+        raw = str(url or "").strip()
+        idx = raw.find(marker)
+        if idx > 0:
+            return raw[:idx].rstrip("/")
+    return (
+        os.getenv("MEDIA_PUBLIC_BASE_URL")
+        or os.getenv("PUBLIC_BASE_URL")
+        or os.getenv("API_PUBLIC_BASE_URL")
+        or ""
+    ).strip().rstrip("/")
+
+
+def _basename_from_media_url(url: Any) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    raw = raw.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
+    return raw.rsplit("/", 1)[-1].strip()
+
+
+def _resolve_existing_exercise_mp4_url(
+    exercise_code: Any,
+    *,
+    preferred_url: Any = None,
+    thumbnail_url: Any = None,
+) -> Optional[str]:
+    code = str(exercise_code or "").strip().strip("/")
+    if not code or "/" in code or "\\" in code:
+        return None
+
+    media_dir = os.path.join(os.getcwd(), "upload_exercises", code)
+    if not os.path.isdir(media_dir):
+        logger.warning(
+            "AI plan video enrichment skipped: exercise_code=%s media_dir=%s reason=dir_missing",
+            code,
+            media_dir,
+        )
+        return None
+
+    candidates: list[str] = []
+    preferred_name = _basename_from_media_url(preferred_url)
+    if preferred_name.lower().endswith(".mp4"):
+        candidates.append(preferred_name)
+
+    try:
+        mp4_names = sorted(
+            name
+            for name in os.listdir(media_dir)
+            if name.lower().endswith(".mp4") and os.path.isfile(os.path.join(media_dir, name))
+        )
+    except OSError as exc:
+        logger.warning(
+            "AI plan video enrichment skipped: exercise_code=%s media_dir=%s reason=list_failed error=%s",
+            code,
+            media_dir,
+            str(exc),
+        )
+        return None
+
+    candidates.extend(mp4_names)
+
+    seen: set[str] = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        local_path = os.path.join(media_dir, name)
+        if os.path.isfile(local_path):
+            public_path = f"/upload_exercises/{code}/{name}"
+            prefix = _media_public_prefix_from_urls(preferred_url, thumbnail_url)
+            resolved = f"{prefix}{public_path}" if prefix else public_path
+            if not preferred_name or name != preferred_name:
+                logger.info(
+                    "AI plan video enrichment fallback: exercise_code=%s preferred=%s resolved=%s local_path=%s",
+                    code,
+                    preferred_name or None,
+                    resolved,
+                    local_path,
+                )
+            return resolved
+
+    logger.warning(
+        "AI plan video enrichment skipped: exercise_code=%s media_dir=%s reason=no_mp4",
+        code,
+        media_dir,
+    )
+    return None
+
+
+def _enrich_saved_plan_exercise_media(item: Any) -> Dict[str, Any]:
+    row = dict(item or {})
+    exercise_code = row.get("exercise_code")
+    thumbnail_url = row.get("thumbnail_url")
+    original_video_url = row.get("video_url")
+
+    video_url = ensure_existing_media_url(original_video_url, kind="video") if original_video_url else None
+    if not video_url:
+        video_url = _resolve_existing_exercise_mp4_url(
+            exercise_code,
+            preferred_url=original_video_url,
+            thumbnail_url=thumbnail_url,
+        )
+
+    if video_url:
+        row["video_url"] = video_url
+        row.update(parse_exercise_video_from_url(video_url))
+
+    set_plan = row.get("set_plan")
+    if isinstance(set_plan, list):
+        fixed_sets: list[dict[str, Any]] = []
+        for set_row in set_plan:
+            fixed_set = dict(set_row or {})
+            reps = fixed_set.get("reps")
+            if isinstance(reps, list):
+                fixed_reps: list[dict[str, Any]] = []
+                for rep_row in reps:
+                    fixed_rep = dict(rep_row or {})
+                    if video_url and not fixed_rep.get("video_url"):
+                        fixed_rep["video_url"] = video_url
+                        fixed_rep.update(parse_exercise_video_from_url(video_url))
+                    if thumbnail_url and not fixed_rep.get("thumbnail_url"):
+                        fixed_rep["thumbnail_url"] = thumbnail_url
+                    fixed_reps.append(fixed_rep)
+                fixed_set["reps"] = fixed_reps
+            fixed_sets.append(fixed_set)
+        row["set_plan"] = fixed_sets
+
+    return row
+
+
+def _workout_template_for_output(workout_template: Any, language: str, day_type: str = "workout") -> Optional[Dict[str, Any]]:
+    if not workout_template or str(day_type or "").lower() != "workout":
+        return None
+    wt = dict(workout_template)
+    focus_value = str(wt.get("focus") or "").strip().lower()
+    if focus_value:
+        focus_label = str(wt.get("focus_label") or _localized_type_label(focus_value, language))
+        wt["focus_label"] = focus_label
+        wt["category_label"] = focus_label
+    wt["type_label"] = _localized_type_label(day_type, language)
+    if not wt.get("title"):
+        wt["title"] = _localized_workout_title(
+            _localized_goal_label(focus_value or "get_fitter", language),
+            language,
+        )
+
+    exercises = wt.get("exercises")
+    if isinstance(exercises, list):
+        wt["exercises"] = [_enrich_saved_plan_exercise_media(item) for item in exercises]
+
+    return wt
+
+
 def _weekly_slots(workouts_per_week: int) -> set[int]:
     k = _coerce_int(workouts_per_week, default=4, lo=1, hi=7)
     if k >= 7:
@@ -260,13 +584,28 @@ async def get_active_plan(user_id: PydanticObjectId) -> Optional[AiPlan]:
     ).sort("-created_at").first_or_none()
 
 
-def plan_to_out(plan: AiPlan) -> AiPlanOut:
+def plan_to_out(plan: AiPlan, language: str = "en") -> AiPlanOut:
     return AiPlanOut(
         id=str(plan.id),
         status=plan.status,
         version=plan.version,
         reroll_of_plan_id=str(plan.reroll_of_plan_id) if plan.reroll_of_plan_id else None,
-        days=[AiPlanDayOut.model_validate(d.model_dump()) for d in (plan.days or [])],
+        days=[
+            AiPlanDayOut(
+                date=str(getattr(d, "date", "")),
+                type=str(getattr(d, "type", "recovery")),
+                type_label=_day_type_label(d, language),
+                title=_day_title(d, language),
+                focus=_day_focus(d),
+                focus_label=_day_focus_label(d, language),
+                workout_template=_workout_template_for_output(
+                    getattr(d, "workout_template", None),
+                    language,
+                    str(getattr(d, "type", "recovery")),
+                ),
+            )
+            for d in (plan.days or [])
+        ],
         created_at=plan.created_at,
     )
 
@@ -294,6 +633,7 @@ def _daily_rec_to_out(rec: AiDailyRecommendation) -> AiDailyRecommendationOut:
 
 async def _build_daily_recommendation(current_user: Any, day_iso: str) -> tuple[str, Dict[str, Any]]:
     plan = await get_active_plan(current_user.id)
+    language = _as_str(getattr(current_user, "language", "en")) or "en"
     if plan:
         for d in (plan.days or []):
             if str(getattr(d, "date", "")) != day_iso:
@@ -301,22 +641,34 @@ async def _build_daily_recommendation(current_user: Any, day_iso: str) -> tuple[
             d_type = str(getattr(d, "type", "recovery"))
             wt = getattr(d, "workout_template", None) or {}
             if d_type == "workout":
-                title = str(wt.get("title") or "Workout session")
+                title = str(wt.get("title") or ("Тренировка" if _is_russian_language(language) else "Workout session"))
                 duration = wt.get("duration_min")
                 focus = wt.get("focus")
-                chunks = [f"Today: {title}."]
+                chunks = [f"Сегодня: {title}." if _is_russian_language(language) else f"Today: {title}."]
                 if duration:
-                    chunks.append(f"Duration: {duration} min.")
+                    chunks.append(f"Длительность: {duration} мин." if _is_russian_language(language) else f"Duration: {duration} min.")
                 if focus:
-                    chunks.append(f"Focus: {focus}.")
-                chunks.append("Keep strict form and finish with light stretching.")
+                    focus_label = str(wt.get("focus_label") or _localized_type_label(focus, language))
+                    chunks.append(
+                        f"Фокус: {focus_label}."
+                        if _is_russian_language(language)
+                        else f"Focus: {focus_label}."
+                    )
+                chunks.append(
+                    "Соблюдайте технику и завершите тренировку лёгкой растяжкой."
+                    if _is_russian_language(language)
+                    else "Keep strict form and finish with light stretching."
+                )
                 return " ".join(chunks), {
                     "source": "active_plan",
                     "plan_id": str(plan.id),
                     "type": d_type,
                     "date": day_iso,
                 }
-            return "Rest day. Mobility + light walk 20-30 min.", {
+            return (_localized_recovery_day_title(language) + ". Сделайте мобилити и лёгкую прогулку на 20-30 минут."
+                if _is_russian_language(language)
+                else "Rest day. Mobility + light walk 20-30 min."
+            ), {
                 "source": "active_plan",
                 "plan_id": str(plan.id),
                 "type": d_type,
@@ -324,7 +676,9 @@ async def _build_daily_recommendation(current_user: Any, day_iso: str) -> tuple[
             }
 
     return (
-        "Daily recommendation: 20-30 min brisk walk, 5 min mobility, and drink enough water.",
+        "Рекомендация на день: 20-30 минут быстрой ходьбы, 5 минут мобилити и достаточное количество воды."
+        if _is_russian_language(language)
+        else "Daily recommendation: 20-30 min brisk walk, 5 min mobility, and drink enough water.",
         {"source": "fallback", "date": day_iso},
     )
 
@@ -763,12 +1117,22 @@ async def yandex_completion(
     max_tokens: int = 1400,
 ) -> Optional[str]:
     if not YC_API_KEY_SECRET:
-        logger.warning("Yandex completion skipped: YC_API_KEY_SECRET is empty")
+        logger.warning(
+            "Yandex completion skipped: missing YC_API_KEY_SECRET; endpoint=%s folder_id=%s model_uri=%s",
+            YC_COMPLETION_URL,
+            bool(YC_FOLDER_ID),
+            bool(YC_GPT_MODEL_URI),
+        )
         return None
 
     model_uri = YC_GPT_MODEL_URI or (f"gpt://{YC_FOLDER_ID}/yandexgpt/latest" if YC_FOLDER_ID else "")
     if not model_uri:
-        logger.warning("Yandex completion skipped: model URI is empty (YC_GPT_MODEL_URI/YC_FOLDER_ID)")
+        logger.warning(
+            "Yandex completion skipped: model URI is empty; endpoint=%s YC_FOLDER_ID=%s YC_GPT_MODEL_URI=%s",
+            YC_COMPLETION_URL,
+            bool(YC_FOLDER_ID),
+            bool(YC_GPT_MODEL_URI),
+        )
         return None
 
     body = {
@@ -788,16 +1152,40 @@ async def yandex_completion(
                 headers={"Authorization": f"Api-Key {YC_API_KEY_SECRET}"},
                 json=body,
             )
+    except httpx.TimeoutException as exc:
+        logger.error(
+            "Yandex completion timeout: endpoint=%s model_uri=%s error=%s",
+            YC_COMPLETION_URL,
+            model_uri,
+            str(exc),
+        )
+        return None
+    except httpx.ConnectError as exc:
+        logger.error(
+            "Yandex completion connection error: endpoint=%s model_uri=%s error=%s",
+            YC_COMPLETION_URL,
+            model_uri,
+            str(exc),
+        )
+        return None
     except httpx.HTTPError as exc:
-        logger.error("Yandex completion HTTP error: %s", str(exc))
+        logger.error(
+            "Yandex completion HTTP error: endpoint=%s model_uri=%s error=%s",
+            YC_COMPLETION_URL,
+            model_uri,
+            str(exc),
+        )
         return None
 
     if r.status_code != 200:
-        response_preview = (r.text or "")[:1000]
+        response_preview = (r.text or "")[:500]
+        request_id = r.headers.get("x-request-id") or r.headers.get("x-request-id".title()) or r.headers.get("x-trace-id")
         logger.warning(
-            "Yandex completion non-200 response: status=%s model_uri=%s body=%s",
+            "Yandex completion non-200 response: status=%s endpoint=%s model_uri=%s request_id=%s body=%s",
             r.status_code,
+            YC_COMPLETION_URL,
             model_uri,
+            request_id,
             response_preview,
         )
         return None
@@ -806,9 +1194,13 @@ async def yandex_completion(
         data = r.json()
         return str(data["result"]["alternatives"][0]["message"]["text"]).strip()
     except Exception as exc:
-        response_preview = (r.text or "")[:1000]
+        response_preview = (r.text or "")[:500]
+        request_id = r.headers.get("x-request-id") or r.headers.get("x-request-id".title()) or r.headers.get("x-trace-id")
         logger.error(
-            "Yandex completion parse error: %s; response=%s",
+            "Yandex completion parse error: endpoint=%s model_uri=%s request_id=%s error=%s response=%s",
+            YC_COMPLETION_URL,
+            model_uri,
+            request_id,
             str(exc),
             response_preview,
         )
@@ -877,14 +1269,19 @@ def _build_workout_template(
     exercise_count = max(4, min(8, duration_min // 6))
     selected = pool_shuffled[:exercise_count] if len(pool_shuffled) >= exercise_count else pool_shuffled
     if not selected:
+        goal_label = goals[0] if goals else "get_fitter"
+        focus_label = _localized_type_label(target_type, language)
         return {
-            "title": "AI session",
+            "title": _localized_workout_title(_localized_goal_label(goal_label, language), language),
             "duration_min": duration_min,
             "intensity": intensity,
             "focus": target_type,
-            "progression_note": _progression_note(week_idx, intensity),
+            "focus_label": focus_label,
+            "category_label": focus_label,
+            "type_label": _localized_type_label("workout", language),
+            "progression_note": _localized_progression_note(week_idx, intensity, language),
             "exercises": [],
-            "safety": ["Stop if sharp pain appears.", "Keep technique strict before increasing load."],
+            "safety": _localized_safety_messages(language),
         }
 
     base_sets = {"beginner": 2, "intermediate": 3, "advanced": 4}.get(level, 2)
@@ -947,7 +1344,9 @@ def _build_workout_template(
         default_reps = getattr(ex.defaults, "reps", None) if ex.defaults else None
         default_dur = getattr(ex.defaults, "duration_seconds", None) if ex.defaults else None
         media = getattr(ex, "media", None)
-        video_meta = parse_exercise_video_from_url(getattr(media, "video_url", None) if media else None)
+        thumbnail_url = ensure_existing_media_url(getattr(media, "thumbnail_url", None) if media else None, kind="thumbnail")
+        video_url = ensure_existing_media_url(getattr(media, "video_url", None) if media else None, kind="video")
+        video_meta = parse_exercise_video_from_url(video_url)
 
         item: dict[str, Any] = {
             "exercise_id": str(ex.id),
@@ -956,8 +1355,8 @@ def _build_workout_template(
             "mode": mode,
             "sets": sets,
             "rest_seconds": rest_seconds,
-            "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
-            "video_url": getattr(media, "video_url", None) if media else None,
+            "thumbnail_url": thumbnail_url,
+            "video_url": video_url,
             **video_meta,
         }
         set_plan = _build_set_plan_payload(
@@ -966,8 +1365,8 @@ def _build_workout_template(
             rest_seconds_after=rest_seconds,
             base_reps=int(default_reps) if default_reps is not None else None,
             base_duration_seconds=int(default_dur) if default_dur is not None else None,
-            video_url=getattr(media, "video_url", None) if media else None,
-            thumbnail_url=getattr(media, "thumbnail_url", None) if media else None,
+            video_url=video_url,
+            thumbnail_url=thumbnail_url,
         )
         if mode == "time":
             item["duration_seconds"] = int(default_dur or 30)
@@ -977,17 +1376,18 @@ def _build_workout_template(
         exercise_items.append(item)
 
     goal_label = goals[0] if goals else "get_fitter"
+    focus_label = _localized_type_label(target_type, language)
     return {
-        "title": f"AI {goal_label} session",
+        "title": _localized_workout_title(_localized_goal_label(goal_label, language), language),
         "duration_min": duration_min,
         "intensity": intensity,
         "focus": target_type,
-        "progression_note": _progression_note(week_idx, intensity),
+        "focus_label": focus_label,
+        "category_label": focus_label,
+        "type_label": _localized_type_label("workout", language),
+        "progression_note": _localized_progression_note(week_idx, intensity, language),
         "exercises": exercise_items,
-        "safety": [
-            "Stop if sharp pain appears.",
-            "Prioritize form over speed or load.",
-        ],
+        "safety": _localized_safety_messages(language),
     }
 
 
@@ -1096,11 +1496,19 @@ async def _try_generate_plan_with_yandex(
         )
 
     start = utcnow().date().isoformat()
-    system_prompt = (
-        "You are a fitness planner. Return strict JSON only. "
-        f"Build a safe {int(total_days)}-day plan with workout/recovery distribution, concrete exercises "
-        "with sets and reps/duration, and progression notes."
-    )
+    if _is_russian_language(language):
+        system_prompt = (
+            "Ты фитнес-планировщик. Верни только строгий JSON без markdown. "
+            f"Собери безопасный план на {int(total_days)} дней с распределением тренировок и восстановления, "
+            "конкретными упражнениями, подходами, повторениями или временем, а также рекомендациями по прогрессии. "
+            "Все пользовательские тексты должны быть полностью на русском языке без смешения с английским."
+        )
+    else:
+        system_prompt = (
+            "You are a fitness planner. Return strict JSON only. "
+            f"Build a safe {int(total_days)}-day plan with workout/recovery distribution, concrete exercises "
+            "with sets and reps/duration, and progression notes."
+        )
     user_prompt = {
         "start_date": start,
         "days": total_days,
@@ -1140,6 +1548,8 @@ async def _try_generate_plan_with_yandex(
             "Return only JSON object, without markdown.",
         ],
     }
+    if _is_russian_language(language):
+        user_prompt["rules"].append("All titles, exercise names, notes, tips and recommendations must be in Russian only.")
 
     text = await yandex_completion(
         [
@@ -1199,12 +1609,19 @@ async def _try_generate_plan_with_yandex(
                         row["exercise_id"] = str(ex_obj.id)
                         if not row.get("exercise_code"):
                             row["exercise_code"] = getattr(ex_obj, "code", None)
-                        if not row.get("name"):
-                            row["name"] = _pick_i18n_name(ex_obj.name, language)
+                        row["name"] = _pick_i18n_name(ex_obj.name, language)
                         if not row.get("thumbnail_url"):
-                            row["thumbnail_url"] = getattr(media, "thumbnail_url", None) if media else None
+                            row["thumbnail_url"] = ensure_existing_media_url(
+                                getattr(media, "thumbnail_url", None) if media else None,
+                                kind="thumbnail",
+                            )
                         if not row.get("video_url"):
-                            row["video_url"] = getattr(media, "video_url", None) if media else None
+                            row["video_url"] = ensure_existing_media_url(
+                                getattr(media, "video_url", None) if media else None,
+                                kind="video",
+                            )
+                        else:
+                            row["video_url"] = ensure_existing_media_url(row.get("video_url"), kind="video")
                         row.update(parse_exercise_video_from_url(row.get("video_url")))
 
                     mode_value = str(row.get("mode") or "reps").strip().lower()
@@ -1257,13 +1674,24 @@ async def _try_generate_plan_with_yandex(
 
                     enriched_exercises.append(row)
                 wt["exercises"] = enriched_exercises
+            if _is_russian_language(language):
+                wt["title"] = _localized_workout_title(
+                    _localized_goal_label(str(wt.get("focus") or "get_fitter"), language),
+                    language,
+                )
+                wt["progression_note"] = _localized_progression_note(
+                    i // 7,
+                    str(wt.get("intensity") or "moderate"),
+                    language,
+                )
+                wt["safety"] = _localized_safety_messages(language)
 
         normalized.append(
-            {
+            _normalize_plan_day_language({
                 "date": day_date,
                 "type": d_type,
                 "workout_template": wt,
-            }
+            }, language)
         )
     return normalized
 
@@ -1363,11 +1791,11 @@ async def yandex_chat_completion(
     history: Optional[list[dict[str, str]]] = None,
 ) -> str:
     if not YC_API_KEY_SECRET:
-        return "AI assistant is configured in stub mode. Add YC_API_KEY_SECRET to enable Yandex GPT."
+        return "AI assistant is configured in stub mode. Add YC_API_KEY_SECRET or YANDEX_API_KEY to enable Yandex GPT."
 
     model_uri = YC_GPT_MODEL_URI or (f"gpt://{YC_FOLDER_ID}/yandexgpt/latest" if YC_FOLDER_ID else "")
     if not model_uri:
-        return "AI assistant is configured in stub mode. Add YC_FOLDER_ID or YC_GPT_MODEL_URI for Yandex GPT."
+        return "AI assistant is configured in stub mode. Add YC_FOLDER_ID/YANDEX_FOLDER_ID or YC_GPT_MODEL_URI/YANDEX_GPT_MODEL_URI for Yandex GPT."
 
     sys_text = (
         "You are a fitness assistant. Give safe, concise, actionable advice. "
@@ -1571,7 +1999,10 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
     )
     await plan.insert()
 
-    return AiGenerateOut(request_id=str(req.id), plan=plan_to_out(plan))
+    return AiGenerateOut(
+        request_id=str(req.id),
+        plan=plan_to_out(plan, _as_str(getattr(current_user, "language", "en")) or "en"),
+    )
 
 
 @router.get("/ai/plan", response_model=AiPlanOut)
@@ -1582,7 +2013,7 @@ async def get_current_plan(current_user=Depends(get_current_user)):
     plan = await get_active_plan(current_user.id)
     if not plan:
         raise HTTPException(404, "No active plan")
-    return plan_to_out(plan)
+    return plan_to_out(plan, _as_str(getattr(current_user, "language", "en")) or "en")
 
 
 @router.delete("/ai/plan/{plan_id}", status_code=200)
@@ -1818,6 +2249,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     if not current_user:
         raise HTTPException(401, "Unauthorized")
     premium = await is_premium_user(current_user.id)
+    language = _as_str(getattr(current_user, "language", "en")) or "en"
     message_text = str(payload.text or "")
     logger.info(
         "AI chat message: user_id=%s thread_id=%s premium=%s text=%s",
@@ -1868,7 +2300,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
         active_plan = await get_active_plan(current_user.id)
         if not active_plan:
             logger.info("AI chat regeneration skipped: user_id=%s reason=no_active_plan", str(current_user.id))
-            assistant_text = "No active plan found to regenerate. Generate a plan first."
+            assistant_text = _localized_ai_chat_text("no_active_plan_to_regenerate", language)
         else:
             try:
                 understanding = parse_plan_request(payload.text, payload.meta or {})
@@ -2083,7 +2515,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     else:
         logger.info("AI chat no-plan intent branch: user_id=%s premium=%s", str(current_user.id), bool(premium))
         if not premium:
-            assistant_text = "AI coach chat with questions is available on Premium."
+            assistant_text = _localized_ai_chat_text("premium_chat_only", language)
         else:
             await create_ai_request(
                 user_id=current_user.id,
@@ -2149,12 +2581,16 @@ def _find_day_index(plan: AiPlan, day_iso: str) -> int:
     return -1
 
 
-def _day_title(day_obj: Any) -> str:
+def _day_title(day_obj: Any, language: str = "en") -> str:
     d_type = str(getattr(day_obj, "type", "recovery"))
     wt = getattr(day_obj, "workout_template", None) or {}
     if d_type == "workout":
-        return str(wt.get("title") or "Workout")
-    return str(wt.get("title") or "Recovery day")
+        focus_value = str(wt.get("focus") or "get_fitter")
+        return str(
+            wt.get("title")
+            or _localized_workout_title(_localized_goal_label(focus_value, language), language)
+        )
+    return str(wt.get("title") or _localized_recovery_day_title(language))
 
 
 def _day_duration(day_obj: Any) -> Optional[int]:
@@ -2176,6 +2612,18 @@ def _day_focus(day_obj: Any) -> Optional[str]:
     wt = getattr(day_obj, "workout_template", None) or {}
     v = wt.get("focus")
     return str(v) if v else None
+
+
+def _day_type_label(day_obj: Any, language: str = "en") -> str:
+    return _localized_type_label(str(getattr(day_obj, "type", "recovery")), language)
+
+
+def _day_focus_label(day_obj: Any, language: str = "en") -> Optional[str]:
+    focus = _day_focus(day_obj)
+    if not focus:
+        return None
+    wt = getattr(day_obj, "workout_template", None) or {}
+    return str(wt.get("focus_label") or _localized_type_label(focus, language))
 
 
 def _day_to_dict(day_obj: Any) -> Dict[str, Any]:
@@ -2273,7 +2721,9 @@ def _build_replacement_exercise_item(
 ) -> Dict[str, Any]:
     mode = _as_str(getattr(ex_obj, "mode", "")).strip().lower() or "reps"
     media = getattr(ex_obj, "media", None)
-    video_meta = parse_exercise_video_from_url(getattr(media, "video_url", None) if media else None)
+    thumbnail_url = ensure_existing_media_url(getattr(media, "thumbnail_url", None) if media else None, kind="thumbnail")
+    video_url = ensure_existing_media_url(getattr(media, "video_url", None) if media else None, kind="video")
+    video_meta = parse_exercise_video_from_url(video_url)
     defaults = getattr(ex_obj, "defaults", None)
     default_reps = int(getattr(defaults, "reps", 0) or 0) if defaults else 0
     default_duration = int(getattr(defaults, "duration_seconds", 0) or 0) if defaults else 0
@@ -2305,8 +2755,8 @@ def _build_replacement_exercise_item(
         "mode": mode,
         "sets": sets_value,
         "rest_seconds": rest_seconds,
-        "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
-        "video_url": getattr(media, "video_url", None) if media else None,
+        "thumbnail_url": thumbnail_url,
+        "video_url": video_url,
         **video_meta,
     }
 
@@ -2331,8 +2781,8 @@ def _build_replacement_exercise_item(
                         "mode": mode,
                         "target_reps": None,
                         "target_duration_seconds": max(10, resolved_duration + (rep_no - 2) * 5),
-                        "video_url": getattr(media, "video_url", None) if media else None,
-                        "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
+                        "video_url": video_url,
+                        "thumbnail_url": thumbnail_url,
                         **video_meta,
                     }
                     for rep_no in range(1, rep_variations + 1)
@@ -2358,8 +2808,8 @@ def _build_replacement_exercise_item(
                         "mode": mode,
                         "target_reps": max(1, resolved_reps + (rep_no - 2) * 2),
                         "target_duration_seconds": None,
-                        "video_url": getattr(media, "video_url", None) if media else None,
-                        "thumbnail_url": getattr(media, "thumbnail_url", None) if media else None,
+                        "video_url": video_url,
+                        "thumbnail_url": thumbnail_url,
                         **video_meta,
                     }
                     for rep_no in range(1, rep_variations + 1)
@@ -2518,6 +2968,7 @@ async def ai_plan_weeks(current_user=Depends(get_current_user)):
     plan = await get_active_plan(current_user.id)
     if not plan:
         raise HTTPException(404, "No active plan")
+    language = _as_str(getattr(current_user, "language", "en")) or "en"
 
     weeks: list[AiPlanWeekOut] = []
     days = plan.days or []
@@ -2526,19 +2977,18 @@ async def ai_plan_weeks(current_user=Depends(get_current_user)):
         cards: list[AiPlanDayCardOut] = []
         for d in chunk:
             day_iso = str(getattr(d, "date", ""))
-            try:
-                weekday = datetime.strptime(day_iso, "%Y-%m-%d").strftime("%A").upper()
-            except Exception:
-                weekday = ""
+            weekday = _localized_weekday(day_iso, language)
             cards.append(
                 AiPlanDayCardOut(
                     date=day_iso,
                     weekday=weekday,
                     type=str(getattr(d, "type", "recovery")),
-                    title=_day_title(d),
+                    type_label=_day_type_label(d, language),
+                    title=_day_title(d, language),
                     duration_min=_day_duration(d),
                     intensity=_day_intensity(d),
                     focus=_day_focus(d),
+                    focus_label=_day_focus_label(d, language),
                 )
             )
         weeks.append(AiPlanWeekOut(week_index=(w_idx // 7) + 1, days=cards))
@@ -2560,12 +3010,21 @@ async def ai_plan_day(date: str, current_user=Depends(get_current_user)):
         raise HTTPException(404, "Day not found")
 
     day_obj = plan.days[idx]
-    wt = getattr(day_obj, "workout_template", None) or None
+    language = _as_str(getattr(current_user, "language", "en")) or "en"
+    wt = _workout_template_for_output(
+        getattr(day_obj, "workout_template", None),
+        language,
+        str(getattr(day_obj, "type", "recovery")),
+    )
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
         date=str(getattr(day_obj, "date", date)),
         type=str(getattr(day_obj, "type", "recovery")),
-        workout_template=wt if str(getattr(day_obj, "type", "recovery")) == "workout" else None,
+        type_label=_day_type_label(day_obj, language),
+        title=_day_title(day_obj, language),
+        focus=_day_focus(day_obj),
+        focus_label=_day_focus_label(day_obj, language),
+        workout_template=wt,
     )
 
 
@@ -2637,11 +3096,20 @@ async def ai_plan_day_edit(
     day_obj = plan.days[idx]
 
     final_type = str(getattr(day_obj, "type", "recovery"))
+    language = _as_str(getattr(current_user, "language", "en")) or "en"
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
         date=str(getattr(day_obj, "date", date)),
         type=final_type,
-        workout_template=getattr(day_obj, "workout_template", None) if final_type == "workout" else None,
+        type_label=_day_type_label(day_obj, language),
+        title=_day_title(day_obj, language),
+        focus=_day_focus(day_obj),
+        focus_label=_day_focus_label(day_obj, language),
+        workout_template=_workout_template_for_output(
+            getattr(day_obj, "workout_template", None),
+            language,
+            final_type,
+        ),
     )
 
 
@@ -2666,6 +3134,7 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
     target_types = _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
     injuries = set(_as_str_list(inputs.get("injuries")))
     equipment = set(_as_str_list(inputs.get("equipment")))
+    language = _as_str(inputs.get("language") or getattr(current_user, "language", "en")) or "en"
     exercises = await _load_exercises_for_planning(injuries=injuries, equipment=equipment, target_types=set(target_types))
 
     current_focus = _day_focus(day_obj) or ""
@@ -2692,10 +3161,12 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
         items.append(
             AiSwapOptionOut(
                 swap_id=f"swap_{i}",
-                title=str(template.get("title") or "Swap workout"),
+                title=str(template.get("title") or _localized_swap_title(language)),
                 duration_min=int(template.get("duration_min") or 35),
                 intensity=str(template.get("intensity") or "moderate"),
                 focus=str(template.get("focus") or focus),
+                focus_label=str(template.get("focus_label") or _localized_type_label(str(template.get("focus") or focus), language)),
+                type_label=str(template.get("type_label") or _localized_type_label("workout", language)),
                 workout_template=template,
             )
         )
@@ -2778,7 +3249,7 @@ async def ai_plan_day_exercise_swaps(
     used_ids: set[str] = set()
     focused = _collect_options(
         source=catalog,
-        reason="Similar day focus and available for your profile constraints.",
+        reason=_localized_swap_reason("focused", language),
         max_items=safe_limit,
         used_ids=used_ids,
     )
@@ -2794,7 +3265,7 @@ async def ai_plan_day_exercise_swaps(
         )
         extra = _collect_options(
             source=broad_catalog,
-            reason="Closest available alternative from your allowed exercise pool.",
+            reason=_localized_swap_reason("fallback", language),
             max_items=safe_limit - len(items),
             used_ids=used_ids,
         )
@@ -2878,11 +3349,20 @@ async def ai_plan_day_apply_exercise_swap(
 
     plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
     day_obj = plan.days[idx]
+    language = _as_str(getattr(current_user, "language", "en")) or "en"
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
         date=str(getattr(day_obj, "date", date)),
         type=str(getattr(day_obj, "type", "workout")),
-        workout_template=getattr(day_obj, "workout_template", None),
+        type_label=_day_type_label(day_obj, language),
+        title=_day_title(day_obj, language),
+        focus=_day_focus(day_obj),
+        focus_label=_day_focus_label(day_obj, language),
+        workout_template=_workout_template_for_output(
+            getattr(day_obj, "workout_template", None),
+            language,
+            str(getattr(day_obj, "type", "workout")),
+        ),
     )
 
 
@@ -2920,10 +3400,19 @@ async def ai_plan_day_apply_swap(
     day_obj.workout_template = dict(chosen.workout_template or {})
     plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
     day_obj = plan.days[idx]
+    language = _as_str(getattr(current_user, "language", "en")) or "en"
 
     return AiPlanDayDetailOut(
         plan_id=str(plan.id),
         date=str(getattr(day_obj, "date", date)),
         type="workout",
-        workout_template=getattr(day_obj, "workout_template", None),
+        type_label=_day_type_label(day_obj, language),
+        title=_day_title(day_obj, language),
+        focus=_day_focus(day_obj),
+        focus_label=_day_focus_label(day_obj, language),
+        workout_template=_workout_template_for_output(
+            getattr(day_obj, "workout_template", None),
+            language,
+            "workout",
+        ),
     )

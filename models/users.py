@@ -65,6 +65,15 @@ class UserStats(BaseModel):
     last_activity_at: Optional[datetime] = None
 
 
+class ReminderSettings(BaseModel):
+    enabled: bool = False
+    days_of_week: List[int] = Field(default_factory=list)
+    time: str = "09:00"
+    timezone: str = "UTC"
+    notification_permission: Optional[bool] = None
+    updated_at: Optional[datetime] = None
+
+
 class User(BaseDoc):
     email: Optional[EmailStr] = None
     email_verified: bool = False
@@ -76,6 +85,7 @@ class User(BaseDoc):
     training_rest_seconds: int = Field(default=60, ge=10, le=600)
     timezone: str = "UTC"
     profile: Optional[UserProfile] = None
+    reminder_settings: ReminderSettings = Field(default_factory=ReminderSettings)
     flags: UserFlags = Field(default_factory=UserFlags)
     stats: UserStats = Field(default_factory=UserStats)
 

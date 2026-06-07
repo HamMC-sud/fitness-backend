@@ -25,6 +25,8 @@ VK_API_VERSION = os.getenv("VK_API_VERSION", "5.131")
 APPLE_CLIENT_ID = (os.getenv("APPLE_CLIENT_ID") or "").strip()
 GOOGLE_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo"
 APPLE_JWKS_URL = "https://appleid.apple.com/auth/keys"
+REGISTRATION_COMPLETE_TTL_SECONDS = int(os.getenv("REGISTRATION_COMPLETE_TTL", "1800"))
+SOCIAL_PASSWORD_SENTINEL = "**SOCIAL**"
 
 def _collect_google_audiences() -> Set[str]:
     values = [
@@ -272,21 +274,24 @@ async def get_or_link_social_user(
 async def mark_social_email_verified_for_complete(email: str) -> None:
     email_lc = email.lower().strip()
     record = await VerificationCode.find_one(VerificationCode.email == email_lc)
-    expires_at = now_utc() + timedelta(days=7)
+    expires_at = now_utc() + timedelta(seconds=REGISTRATION_COMPLETE_TTL_SECONDS)
     social_code_hash = hash_code(generate_numeric_code(6))
 
     if record:
         record.verified = True
-        record.password_hash = "__SOCIAL__"
+        record.password_hash = SOCIAL_PASSWORD_SENTINEL
         record.code_hash = social_code_hash
         record.attempts = 0
+        record.created_at = now_utc()
         record.expires_at = expires_at
         record.last_resend = None
         await record.save()
-    else:
+        return
+
+    try:
         await VerificationCode(
             email=email_lc,
-            password_hash="__SOCIAL__",
+            password_hash=SOCIAL_PASSWORD_SENTINEL,
             code_hash=social_code_hash,
             attempts=0,
             verified=True,
@@ -294,6 +299,19 @@ async def mark_social_email_verified_for_complete(email: str) -> None:
             expires_at=expires_at,
             last_resend=None,
         ).insert()
+    except DuplicateKeyError:
+        logger.info("VerificationCode duplicate detected during social profile preparation for %s", email_lc)
+        record = await VerificationCode.find_one(VerificationCode.email == email_lc)
+        if not record:
+            raise HTTPException(status_code=500, detail="Failed to prepare social profile completion")
+        record.verified = True
+        record.password_hash = SOCIAL_PASSWORD_SENTINEL
+        record.code_hash = social_code_hash
+        record.attempts = 0
+        record.created_at = now_utc()
+        record.expires_at = expires_at
+        record.last_resend = None
+        await record.save()
 
 
 @router.post("/auth/social/vk", response_model=TokenOut)

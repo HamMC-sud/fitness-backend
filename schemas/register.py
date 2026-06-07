@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel
 from models.users import UserProfile
 
@@ -28,12 +30,15 @@ class ForgotPasswordIn(BaseModel):
 
 class ResetPasswordIn(BaseModel):
     email: str
+    code: str
     new_password: str
+    confirm_new_password: Optional[str] = None
 
 
 class ChangePasswordIn(BaseModel):
     current_password: str
     new_password: str
+    confirm_new_password: Optional[str] = None
 
 
 class RegisterStartIn(BaseModel):

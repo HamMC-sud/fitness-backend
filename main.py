@@ -1,5 +1,7 @@
 import os
+import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI , WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,9 +11,25 @@ from beanie import init_beanie
 from models import db, client, ALL_MODELS
 from api.api_router import api_router
 
+logger = logging.getLogger(__name__)
+
 # Keep startup directories aligned with mounted static path (/statics -> statics/*).
 os.makedirs("statics", exist_ok=True)
 os.makedirs("upload_exercises", exist_ok=True)
+
+
+def _log_static_mount_status() -> None:
+    statics_dir = Path("statics")
+    uploads_dir = Path("upload_exercises")
+    mp4_count = sum(1 for _ in uploads_dir.rglob("*.mp4")) if uploads_dir.exists() else 0
+    logger.info(
+        "Static mounts ready: /statics -> %s exists=%s; /upload_exercises -> %s exists=%s; mp4_files=%s",
+        statics_dir.resolve(),
+        statics_dir.exists(),
+        uploads_dir.resolve(),
+        uploads_dir.exists(),
+        mp4_count,
+    )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -19,6 +37,7 @@ async def lifespan(app: FastAPI):
         database=db,
         document_models=ALL_MODELS,
     )
+    _log_static_mount_status()
     yield
     client.close()
 

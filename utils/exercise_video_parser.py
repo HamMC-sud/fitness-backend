@@ -8,6 +8,13 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
+_LOCAL_MEDIA_PREFIXES = {
+    "/upload_exercises/": WORKSPACE_ROOT / "upload_exercises",
+    "/statics/": WORKSPACE_ROOT / "statics",
+}
+_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+
 _VIDEO_NAME_RE = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>[rs])$", re.IGNORECASE)
 
 
@@ -45,3 +52,44 @@ def parse_exercise_video_from_url(video_url: Optional[str]) -> ExerciseVideoMeta
         logger.warning("Failed to parse video URL: %s", video_url)
         return {"video_mode": None, "repetitions": None, "duration_seconds": None}
     return parse_exercise_video_filename(file_name)
+
+
+def resolve_local_media_path(media_url: Optional[str]) -> Optional[Path]:
+    if not media_url:
+        return None
+
+    try:
+        parsed = urlparse(media_url)
+        path_value = parsed.path or ""
+    except Exception:
+        logger.warning("Failed to resolve media URL path: %s", media_url)
+        return None
+
+    for prefix, base_dir in _LOCAL_MEDIA_PREFIXES.items():
+        if not path_value.startswith(prefix):
+            continue
+        relative = path_value[len(prefix) :].strip("/")
+        candidate = (base_dir / Path(relative)).resolve()
+        try:
+            candidate.relative_to(base_dir.resolve())
+        except Exception:
+            logger.warning("Rejected media URL outside static roots: %s", media_url)
+            return None
+        return candidate
+    return None
+
+
+def ensure_existing_media_url(media_url: Optional[str], *, kind: str = "file") -> Optional[str]:
+    if not media_url:
+        return None
+
+    local_path = resolve_local_media_path(media_url)
+    if local_path is None:
+        return media_url
+    if not local_path.exists() or not local_path.is_file():
+        logger.warning("Skipping missing %s URL: %s -> %s", kind, media_url, local_path)
+        return None
+    if kind == "video" and local_path.suffix.lower() not in _VIDEO_EXTENSIONS:
+        logger.warning("Skipping non-video URL for video field: %s", media_url)
+        return None
+    return media_url

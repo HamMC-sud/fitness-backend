@@ -11,7 +11,7 @@ from pydantic import AliasChoices, BaseModel, Field
 from models.enums import WorkoutType, Difficulty, Equipment, ExerciseMode
 from models.content import Exercise
 from utils.fitness_metrics import build_metrics_block, seconds_to_minutes
-from utils.exercise_video_parser import parse_exercise_video_from_url
+from utils.exercise_video_parser import ensure_existing_media_url, parse_exercise_video_from_url
 
 router = APIRouter(tags=["content"])
 
@@ -116,6 +116,27 @@ def _pick_i18n_text(i18n_obj: Any, lang: str = "en") -> str:
     return ""
 
 
+def _worktype_label(value: Optional[str], lang: str) -> str:
+    token = str(value or "").strip().lower()
+    if str(lang or "en").lower().startswith("ru"):
+        return {
+            "strength": "Силовая тренировка",
+            "cardio": "Кардио",
+            "hiit": "HIIT",
+            "stretching": "Растяжка",
+            "yoga": "Йога",
+            "mobility": "Мобильность",
+        }.get(token, token)
+    return {
+        "strength": "Strength",
+        "cardio": "Cardio",
+        "hiit": "HIIT",
+        "stretching": "Stretching",
+        "yoga": "Yoga",
+        "mobility": "Mobility",
+    }.get(token, token)
+
+
 def _resolve_set_plan(ex: Exercise, step_duration_default: int) -> list[dict[str, Any]]:
     defaults = getattr(ex, "defaults", None)
     mode_value = str(getattr(ex, "mode", ""))
@@ -164,8 +185,8 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
     media = getattr(ex, "media", None)
     mode_value = str(getattr(ex, "mode", ""))
     media_duration = int(getattr(media, "duration_seconds", 0) or 0) if media else 0
-    video_url = getattr(media, "video_url", None) if media else None
-    thumbnail_url = getattr(media, "thumbnail_url", None) if media else None
+    video_url = ensure_existing_media_url(getattr(media, "video_url", None) if media else None, kind="video")
+    thumbnail_url = ensure_existing_media_url(getattr(media, "thumbnail_url", None) if media else None, kind="thumbnail")
     video_meta = parse_exercise_video_from_url(video_url)
     defaults = getattr(ex, "defaults", None)
 
@@ -430,6 +451,10 @@ async def discover_worktype_details(
     if not exercises:
         return {
             "worktype": wtype.value,
+            "worktype_label": {
+                "ru": _worktype_label(wtype.value, "ru"),
+                "en": _worktype_label(wtype.value, "en"),
+            },
             "category_image": None,
             "totals": {
                 "workouts": 0,
@@ -471,6 +496,10 @@ async def discover_worktype_details(
                 },
                 "level": str(ex.difficulty.value if hasattr(ex.difficulty, "value") else ex.difficulty),
                 "worktype": wtype.value,
+                "worktype_label": {
+                    "ru": _worktype_label(wtype.value, "ru"),
+                    "en": _worktype_label(wtype.value, "en"),
+                },
                 "cover_image": cover_image,
                 "exercise_count": 1,
                 "total_seconds": total_seconds,
@@ -497,6 +526,10 @@ async def discover_worktype_details(
 
     return {
         "worktype": wtype.value,
+        "worktype_label": {
+            "ru": _worktype_label(wtype.value, "ru"),
+            "en": _worktype_label(wtype.value, "en"),
+        },
         "category_image": category_image,
         "totals": {
             "workouts": len(items),
@@ -552,6 +585,20 @@ async def discover_workout_details(template_id: PydanticObjectId):
             if getattr(ex, "workout_type", None)
             else None
         ),
+        "worktype_label": {
+            "ru": _worktype_label(
+                str(ex.workout_type[0].value if hasattr(ex.workout_type[0], "value") else ex.workout_type[0])
+                if getattr(ex, "workout_type", None)
+                else None,
+                "ru",
+            ),
+            "en": _worktype_label(
+                str(ex.workout_type[0].value if hasattr(ex.workout_type[0], "value") else ex.workout_type[0])
+                if getattr(ex, "workout_type", None)
+                else None,
+                "en",
+            ),
+        },
         "level": str(ex.difficulty.value if hasattr(ex.difficulty, "value") else ex.difficulty),
         "totals": {
             "sets": int(wm["total_sets"]),
@@ -607,7 +654,10 @@ async def _discover_similar_workouts(exercise_id: PydanticObjectId, payload: Sim
             duration_seconds = int(getattr(getattr(ex, "defaults", None), "duration_seconds", 0) or 0)
         out_items.append(
             {
-                "video_url": getattr(media, "video_url", None) if media else None,
+                "video_url": ensure_existing_media_url(
+                    getattr(media, "video_url", None) if media else None,
+                    kind="video",
+                ),
                 "duration_seconds": duration_seconds,
             }
         )
