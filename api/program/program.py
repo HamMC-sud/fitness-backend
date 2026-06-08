@@ -1,19 +1,39 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Optional, Any
 
 from beanie.odm.fields import PydanticObjectId
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.encoders import jsonable_encoder
 from pydantic import AliasChoices, BaseModel, Field
 
+from api.auth.config import decode_token, oauth2_scheme
+from models import User
 from models.enums import WorkoutType, Difficulty, Equipment, ExerciseMode
 from models.content import Exercise
 from utils.fitness_metrics import build_metrics_block, seconds_to_minutes
-from utils.exercise_video_parser import ensure_existing_media_url, parse_exercise_video_from_url
+from utils.exercise_video_parser import ensure_existing_media_url, parse_exercise_video_from_url, resolve_local_media_path
+from utils.workout_contract import apply_uniform_rest_seconds, summarize_sets_payload
 
 router = APIRouter(tags=["content"])
+logger = logging.getLogger("uvicorn.error")
+
+
+async def _get_optional_user(token: Optional[str] = Depends(oauth2_scheme)) -> Optional[User]:
+    if not token:
+        return None
+    decoded = decode_token(token)
+    if not decoded or decoded.get("type") != "access":
+        return None
+    sub = decoded.get("sub")
+    if isinstance(sub, dict):
+        sub = sub.get("sub")
+    try:
+        return await User.get(PydanticObjectId(str(sub)))
+    except Exception:
+        return None
 
 _DISCOVER_WORKTYPE_ALIASES: dict[str, tuple[WorkoutType, Optional[Equipment]]] = {
     # Direct labels
@@ -66,13 +86,50 @@ def _normalize_discover_worktype(value: str) -> tuple[WorkoutType, Optional[Equi
 
 class SimilarExerciseIn(BaseModel):
     exercise_id: PydanticObjectId = Field(
-        validation_alias=AliasChoices("exercise_id", "id"),
+        validation_alias=AliasChoices("exercise_id", "id", "exerciseId"),
     )
-    level: Difficulty
-    workouttype: WorkoutType = Field(
-        validation_alias=AliasChoices("workouttype", "workoutType"),
+
+    level: Optional[Difficulty] = None
+
+    workouttype: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("workouttype", "workoutType", "workout_type"),
     )
-    reps: int = Field(ge=1, le=500)
+
+    reps: int = Field(
+        default=1,
+        validation_alias=AliasChoices("reps", "targetReps", "target_reps", "repetitions"),
+        ge=1,
+        le=500,
+    )
+
+    target_duration_seconds: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("targetDurationSeconds", "target_duration_seconds", "duration_seconds"),
+    )
+
+    @classmethod
+    def from_raw_payload(cls, payload: Any) -> "SimilarExerciseIn":
+        try:
+            normalized = cls.model_validate(payload or {})
+            logger.info(
+                "Similar workouts payload normalized: raw_payload=%s normalized_payload=%s exercise_id=%s level=%s workoutType=%s reps=%s targetDurationSeconds=%s",
+                payload,
+                normalized.model_dump(mode="json"),
+                str(normalized.exercise_id),
+                str(getattr(normalized.level, "value", normalized.level) if normalized.level is not None else ""),
+                str(normalized.workouttype or ""),
+                int(normalized.reps),
+                normalized.target_duration_seconds,
+            )
+            return normalized
+        except Exception as exc:
+            logger.info(
+                "Similar workouts payload rejected: raw_payload=%s rejection_reason=%s",
+                payload,
+                str(exc),
+            )
+            raise HTTPException(status_code=400, detail=f"Invalid similar workout payload: {str(exc)}") from exc
 
 
 def equipment_db_aliases(equipment: Equipment) -> list[str]:
@@ -116,6 +173,11 @@ def _pick_i18n_text(i18n_obj: Any, lang: str = "en") -> str:
     return ""
 
 
+def _enum_value_str(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    return str(raw or "").strip()
+
+
 def _worktype_label(value: Optional[str], lang: str) -> str:
     token = str(value or "").strip().lower()
     if str(lang or "en").lower().startswith("ru"):
@@ -139,11 +201,32 @@ def _worktype_label(value: Optional[str], lang: str) -> str:
 
 def _resolve_set_plan(ex: Exercise, step_duration_default: int) -> list[dict[str, Any]]:
     defaults = getattr(ex, "defaults", None)
-    mode_value = str(getattr(ex, "mode", ""))
+    mode_value = _enum_value_str(getattr(ex, "mode", ""))
     default_sets = int(getattr(defaults, "sets", 4) or 4) if defaults else 4
     default_reps = getattr(defaults, "reps", None) if defaults else None
     default_rest = int(getattr(defaults, "rest_seconds_after", 60) or 60) if defaults else 60
     default_duration = int(getattr(defaults, "duration_seconds", 0) or 0) if defaults else 0
+    media = getattr(ex, "media", None)
+    video_url = ensure_existing_media_url(getattr(media, "video_url", None) if media else None, kind="video")
+    video_meta = parse_exercise_video_from_url(video_url)
+    parsed_repetitions = video_meta.get("repetitions")
+    parsed_duration_seconds = video_meta.get("duration_seconds")
+    local_video_path = resolve_local_media_path(video_url) if video_url else None
+    logger.info(
+        "Local exercise video metadata: exercise_code=%s video_url=%s local_path=%s file_exists=%s parsed_video_mode=%s parsed_repetitions=%s parsed_duration_seconds=%s reason=%s",
+        str(getattr(ex, "code", None) or ""),
+        video_url,
+        str(local_video_path) if local_video_path else None,
+        bool(local_video_path and local_video_path.exists()),
+        video_meta.get("video_mode"),
+        parsed_repetitions,
+        parsed_duration_seconds,
+        "parsed" if video_meta.get("video_mode") else "metadata_null",
+    )
+    if mode_value == ExerciseMode.reps.value and default_reps is None and parsed_repetitions is not None:
+        default_reps = int(parsed_repetitions)
+    if default_duration <= 0 and parsed_duration_seconds is not None:
+        default_duration = int(round(float(parsed_duration_seconds)))
     if default_duration <= 0:
         default_duration = int(step_duration_default or 0)
 
@@ -183,7 +266,7 @@ def _resolve_set_plan(ex: Exercise, step_duration_default: int) -> list[dict[str
 
 def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
     media = getattr(ex, "media", None)
-    mode_value = str(getattr(ex, "mode", ""))
+    mode_value = _enum_value_str(getattr(ex, "mode", ""))
     media_duration = int(getattr(media, "duration_seconds", 0) or 0) if media else 0
     video_url = ensure_existing_media_url(getattr(media, "video_url", None) if media else None, kind="video")
     thumbnail_url = ensure_existing_media_url(getattr(media, "thumbnail_url", None) if media else None, kind="thumbnail")
@@ -207,14 +290,24 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
                     continue
                 target_reps = getattr(rep_item, "target_reps", None)
                 target_seconds = getattr(rep_item, "target_duration_seconds", None)
-                if target_seconds is None and media_duration > 0:
+                if mode_value == ExerciseMode.time.value and target_seconds is None and media_duration > 0:
                     target_seconds = media_duration
                 reps_payload.append(
                     {
                         "rep_no": rep_no,
                         "mode": mode_value,
                         "target": int(target_reps) if target_reps is not None else None,
-                        "duration_seconds": int(target_seconds) if target_seconds is not None else None,
+                        "target_reps": int(target_reps) if target_reps is not None else None,
+                        "duration_seconds": (
+                            int(target_seconds)
+                            if mode_value == ExerciseMode.time.value and target_seconds is not None
+                            else None
+                        ),
+                        "target_duration_seconds": (
+                            int(target_seconds)
+                            if mode_value == ExerciseMode.time.value and target_seconds is not None
+                            else None
+                        ),
                         "video_url": video_url,
                         "thumbnail_url": thumbnail_url,
                         **video_meta,
@@ -231,102 +324,44 @@ def _build_sets_payload(ex: Exercise, set_plan: list[dict[str, Any]]) -> list[di
         if out_new:
             return out_new
 
-    def _resolve_rep_intervals_count(
-        mode: str,
-        target_reps: Optional[int],
-        target_duration_seconds: Optional[int],
-    ) -> int:
-        # Fallback strategy when defaults.sets_reps is absent:
-        # split one set into 1..3 intervals based on load.
-        if mode == "reps":
-            reps_value = int(target_reps or 0)
-            if reps_value >= 12:
-                return 3
-            if reps_value >= 6:
-                return 2
-            return 1
-
-        duration_value = int(target_duration_seconds or 0)
-        if duration_value >= 90:
-            return 3
-        if duration_value >= 45:
-            return 2
-        return 1
-
     out: list[dict[str, Any]] = []
     for p in set_plan:
         target_duration = p.get("target_duration_seconds")
-        if target_duration is None and media_duration > 0:
+        if mode_value == ExerciseMode.time.value and target_duration is None and media_duration > 0:
             target_duration = media_duration
         target_reps = p.get("target_reps")
-
-        intervals_count = _resolve_rep_intervals_count(
-            mode=mode_value,
-            target_reps=target_reps if target_reps is not None else None,
-            target_duration_seconds=int(target_duration) if target_duration is not None else None,
-        )
 
         reps_payload: list[dict[str, Any]] = []
         if mode_value == "reps" and target_reps is not None:
             total_reps = int(target_reps)
-            if intervals_count <= 1:
-                reps_payload = [
-                    {
-                        "rep_no": 1,
-                        "mode": mode_value,
-                        "target": total_reps,
-                        "duration_seconds": int(target_duration) if target_duration is not None else None,
-                        "video_url": video_url,
-                        "thumbnail_url": thumbnail_url,
-                        **video_meta,
-                    }
-                ]
-            else:
-                base = total_reps // intervals_count
-                remainder = total_reps % intervals_count
-                for idx in range(intervals_count):
-                    rep_target = base + (1 if idx < remainder else 0)
-                    reps_payload.append(
-                        {
-                            "rep_no": idx + 1,
-                            "mode": mode_value,
-                            "target": rep_target,
-                            "duration_seconds": int(target_duration) if target_duration is not None else None,
-                            "video_url": video_url,
-                            "thumbnail_url": thumbnail_url,
-                            **video_meta,
-                        }
-                    )
+            reps_payload = [
+                {
+                    "rep_no": 1,
+                    "mode": mode_value,
+                    "target": total_reps,
+                    "target_reps": total_reps,
+                    "duration_seconds": None,
+                    "target_duration_seconds": None,
+                    "video_url": video_url,
+                    "thumbnail_url": thumbnail_url,
+                    **video_meta,
+                }
+            ]
         else:
             total_seconds = int(target_duration) if target_duration is not None else None
-            if total_seconds is None or intervals_count <= 1:
-                reps_payload = [
-                    {
-                        "rep_no": 1,
-                        "mode": mode_value,
-                        "target": target_reps,
-                        "duration_seconds": total_seconds,
-                        "video_url": video_url,
-                        "thumbnail_url": thumbnail_url,
-                        **video_meta,
-                    }
-                ]
-            else:
-                base = total_seconds // intervals_count
-                remainder = total_seconds % intervals_count
-                for idx in range(intervals_count):
-                    rep_seconds = base + (1 if idx < remainder else 0)
-                    reps_payload.append(
-                        {
-                            "rep_no": idx + 1,
-                            "mode": mode_value,
-                            "target": target_reps,
-                            "duration_seconds": rep_seconds,
-                            "video_url": video_url,
-                            "thumbnail_url": thumbnail_url,
-                            **video_meta,
-                        }
-                    )
+            reps_payload = [
+                {
+                    "rep_no": 1,
+                    "mode": mode_value,
+                    "target": target_reps,
+                    "target_reps": int(target_reps) if target_reps is not None else None,
+                    "duration_seconds": total_seconds,
+                    "target_duration_seconds": total_seconds,
+                    "video_url": video_url,
+                    "thumbnail_url": thumbnail_url,
+                    **video_meta,
+                }
+            ]
 
         out.append(
             {
@@ -367,6 +402,50 @@ def _aggregate_sets_metrics(sets_payload: list[dict[str, Any]]) -> dict[str, int
     }
 
 
+def _build_set_summaries(sets_payload: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for s in sets_payload:
+        reps_rows = list(s.get("reps", []) or [])
+        total_target_reps = 0
+        total_target_duration_seconds = 0
+        mode_value = None
+        for rep in reps_rows:
+            if mode_value is None:
+                mode_value = str(rep.get("mode") or "")
+            target_reps = rep.get("target_reps", rep.get("target"))
+            target_duration_seconds = (
+                rep.get("target_duration_seconds", rep.get("duration_seconds"))
+                if mode_value == ExerciseMode.time.value
+                else None
+            )
+            if target_reps is not None:
+                total_target_reps += int(target_reps)
+            if target_duration_seconds is not None:
+                total_target_duration_seconds += int(round(float(target_duration_seconds)))
+
+        out.append(
+            {
+                "set_id": int(s.get("set_no", 0)),
+                "reps_count": total_target_reps if total_target_reps > 0 else len(reps_rows),
+                "target_reps": total_target_reps if total_target_reps > 0 else None,
+                "duration_seconds": (
+                    total_target_duration_seconds
+                    if mode_value == ExerciseMode.time.value and total_target_duration_seconds > 0
+                    else None
+                ),
+                "target_duration_seconds": (
+                    total_target_duration_seconds
+                    if mode_value == ExerciseMode.time.value and total_target_duration_seconds > 0
+                    else None
+                ),
+                "rep_variations": len(reps_rows),
+                "mode": mode_value,
+                "rest_seconds_after": int(s.get("rest_seconds_after", 0) or 0),
+            }
+        )
+    return out
+
+
 def _exercise_base_duration_seconds(ex: Exercise) -> int:
     media = getattr(ex, "media", None)
     duration_seconds = int(getattr(media, "duration_seconds", 0) or 0) if media else 0
@@ -376,47 +455,79 @@ def _exercise_base_duration_seconds(ex: Exercise) -> int:
 
 
 def _derive_exercise_workout_metrics(ex: Exercise) -> dict[str, Any]:
-    mode_value = str(getattr(ex, "mode", ""))
+    mode_value = _enum_value_str(getattr(ex, "mode", ""))
     base_duration_seconds = _exercise_base_duration_seconds(ex)
     step_duration = int(base_duration_seconds) if mode_value == ExerciseMode.time.value else None
 
     set_plan = _resolve_set_plan(ex, step_duration or base_duration_seconds)
     sets_payload = _build_sets_payload(ex, set_plan)
-    metrics = _aggregate_sets_metrics(sets_payload)
-
-    rest_between_sets_seconds = 0
-    if len(sets_payload) > 1:
-        for s in sets_payload[:-1]:
-            rest_between_sets_seconds += int((s.get("rest_seconds_after", 0) or 0))
-
-    rest_seconds_after_exercise = int((sets_payload[-1].get("rest_seconds_after", 0) if sets_payload else 0) or 0)
-    active_seconds = int(metrics["timed_intervals_seconds"])
-    planned_total_seconds = active_seconds + rest_between_sets_seconds
-
-    # Fallback for reps-only templates where explicit timed intervals are absent.
-    total_seconds = planned_total_seconds if planned_total_seconds > 0 else base_duration_seconds
-    total_reps = int(metrics["total_reps_target"]) if mode_value == ExerciseMode.reps.value else 0
-
-    set_summaries = [
-        {
-            "set_id": int(s.get("set_no", 0)),
-            "reps_count": len(s.get("reps", []) or []),
-        }
-        for s in sets_payload
-    ]
+    normalized = summarize_sets_payload(sets_payload, fallback_mode=mode_value)
+    total_seconds = int(normalized["planned_total_seconds"] or base_duration_seconds or 0)
 
     return {
         "mode": mode_value,
-        "sets_payload": sets_payload,
-        "set_summaries": set_summaries,
-        "total_sets": int(metrics["total_sets"]),
-        "total_intervals": int(metrics["total_intervals"]),
-        "total_reps": total_reps,
-        "timed_intervals": int(metrics["timed_intervals"]),
-        "timed_intervals_seconds": active_seconds,
-        "rest_between_sets_seconds": int(rest_between_sets_seconds),
-        "rest_seconds_after_exercise": rest_seconds_after_exercise,
+        "sets_payload": normalized["sets_payload"],
+        "set_summaries": normalized["set_summaries"],
+        "total_sets": int(normalized["total_sets"]),
+        "total_intervals": int(normalized["total_intervals"]),
+        "total_reps": int(normalized["total_reps"]),
+        "timed_intervals": int(normalized["timed_intervals"]),
+        "timed_intervals_seconds": int(normalized["timed_intervals_seconds"]),
+        "rest_between_sets_seconds": int(normalized["rest_between_sets_seconds"]),
+        "rest_seconds_after_exercise": int(normalized["rest_seconds_after_exercise"]),
         "planned_total_seconds": int(total_seconds),
+    }
+
+
+def _serialize_workout_exercise(ex: Exercise, rest_seconds_override: Optional[int] = None) -> dict[str, Any]:
+    wm = _derive_exercise_workout_metrics(ex)
+    sets_payload = apply_uniform_rest_seconds(wm["sets_payload"], rest_seconds_override)
+    normalized = summarize_sets_payload(sets_payload, fallback_mode=_enum_value_str(getattr(ex, "mode", "")))
+    media = getattr(ex, "media", None)
+    mode_value = _enum_value_str(getattr(ex, "mode", ""))
+    worktype_value = (
+        str(ex.workout_type[0].value if hasattr(ex.workout_type[0], "value") else ex.workout_type[0])
+        if getattr(ex, "workout_type", None)
+        else None
+    )
+    return {
+        "exercise_id": str(ex.id),
+        "exercise_code": getattr(ex, "code", None),
+        "name": _pick_i18n_text(getattr(ex, "name", None), "en"),
+        "name_i18n": {
+            "ru": _pick_i18n_text(getattr(ex, "name", None), "ru"),
+            "en": _pick_i18n_text(getattr(ex, "name", None), "en"),
+        },
+        "description": _pick_i18n_text(getattr(ex, "description", None), "en"),
+        "description_i18n": {
+            "ru": _pick_i18n_text(getattr(ex, "description", None), "ru"),
+            "en": _pick_i18n_text(getattr(ex, "description", None), "en"),
+        },
+        "mode": mode_value,
+        "workout_type": worktype_value,
+        "worktype_label": {
+            "ru": _worktype_label(worktype_value, "ru"),
+            "en": _worktype_label(worktype_value, "en"),
+        },
+        "level": str(ex.difficulty.value if hasattr(ex.difficulty, "value") else ex.difficulty),
+        "thumbnail_url": ensure_existing_media_url(
+            getattr(media, "thumbnail_url", None) if media else None,
+            kind="thumbnail",
+        ),
+        "video_url": ensure_existing_media_url(
+            getattr(media, "video_url", None) if media else None,
+            kind="video",
+        ),
+        "set_plan": normalized["sets_payload"],
+        "steps": normalized["sets_payload"],
+        "sets": normalized["set_summaries"],
+        "total_sets": int(normalized["total_sets"]),
+        "total_reps": int(normalized["total_reps"]),
+        "total_seconds": int(normalized["planned_total_seconds"]),
+        "total_minutes": int(normalized["total_minutes"]),
+        "rest_between_sets_seconds": int(normalized["rest_between_sets_seconds"]),
+        "rest_seconds_after_exercise": int(normalized["rest_seconds_after_exercise"]),
+        "rest_seconds": int(rest_seconds_override if rest_seconds_override is not None else normalized["rest_seconds_after_exercise"]),
     }
 
 
@@ -426,6 +537,7 @@ async def discover_worktype_details(
     level: Optional[Difficulty] = None,
     equipment: Optional[Equipment] = None,
     status: str = "active",
+    current_user: Optional[User] = Depends(_get_optional_user),
 ):
     try:
         wtype, implied_equipment = _normalize_discover_worktype(worktype)
@@ -469,10 +581,11 @@ async def discover_worktype_details(
     sum_calories = 0.0
     category_image = None
 
+    rest_override = int(getattr(current_user, "training_rest_seconds", 0) or 0) or None
     for ex in exercises:
-        wm = _derive_exercise_workout_metrics(ex)
+        serialized = _serialize_workout_exercise(ex, rest_seconds_override=rest_override)
         media = getattr(ex, "media", None)
-        total_seconds = int(wm["planned_total_seconds"])
+        total_seconds = int(serialized["total_seconds"])
         total_calories = 0.0
         if getattr(ex, "calories_per_minute", None):
             total_calories = float(ex.calories_per_minute or 0) * (total_seconds / 60.0)
@@ -503,24 +616,40 @@ async def discover_worktype_details(
                 "cover_image": cover_image,
                 "exercise_count": 1,
                 "total_seconds": total_seconds,
-                "total_minutes": seconds_to_minutes(total_seconds),
-                "sets": int(wm["total_sets"]),
-                "intervals": int(wm["total_intervals"]),
-                "reps": int(wm["total_reps"]),
-                "timed_intervals_seconds": int(wm["timed_intervals_seconds"]),
+                "total_minutes": int(serialized["total_minutes"]),
+                "sets": int(serialized["total_sets"]),
+                "intervals": int(sum(len(set_row.get("reps") or []) for set_row in serialized["set_plan"])),
+                "reps": int(serialized["total_reps"]),
+                "timed_intervals_seconds": int(sum(
+                    int(rep.get("duration_seconds") or 0)
+                    for set_row in serialized["set_plan"]
+                    for rep in list(set_row.get("reps") or [])
+                    if str(rep.get("mode") or "") == ExerciseMode.time.value
+                )),
                 "total_calories": round(total_calories, 1),
                 "metrics": build_metrics_block(
                     total_seconds=total_seconds,
                     total_calories=round(total_calories, 1),
-                    total_sets=int(wm["total_sets"]),
-                    total_reps=int(wm["total_reps"]),
-                    total_intervals=int(wm["total_intervals"]),
-                    timed_intervals=int(wm["timed_intervals"]),
-                    timed_intervals_seconds=int(wm["timed_intervals_seconds"]),
-                    rest_between_sets_seconds=int(wm["rest_between_sets_seconds"]),
+                    total_sets=int(serialized["total_sets"]),
+                    total_reps=int(serialized["total_reps"]),
+                    total_intervals=int(sum(len(set_row.get("reps") or []) for set_row in serialized["set_plan"])),
+                    timed_intervals=int(sum(
+                        1
+                        for set_row in serialized["set_plan"]
+                        for rep in list(set_row.get("reps") or [])
+                        if str(rep.get("mode") or "") == ExerciseMode.time.value
+                    )),
+                    timed_intervals_seconds=int(sum(
+                        int(rep.get("duration_seconds") or 0)
+                        for set_row in serialized["set_plan"]
+                        for rep in list(set_row.get("reps") or [])
+                        if str(rep.get("mode") or "") == ExerciseMode.time.value
+                    )),
+                    rest_between_sets_seconds=int(serialized["rest_between_sets_seconds"]),
                 ),
                 "exercise_id": str(ex.id),
                 "exercise_code": getattr(ex, "code", None),
+                "set_plan": serialized["set_plan"],
             }
         )
 
@@ -541,7 +670,7 @@ async def discover_worktype_details(
 
 
 @router.get("/discover/workouts/{template_id}")
-async def discover_workout_details(template_id: PydanticObjectId):
+async def discover_workout_details(template_id: PydanticObjectId, current_user: Optional[User] = Depends(_get_optional_user)):
     ex = await Exercise.get(template_id)
     if not ex:
         raise HTTPException(status_code=404, detail="Workout template not found")
@@ -550,7 +679,33 @@ async def discover_workout_details(template_id: PydanticObjectId):
 
     wm = _derive_exercise_workout_metrics(ex)
     media = getattr(ex, "media", None)
-    duration_seconds = int(wm["planned_total_seconds"])
+    source_mode = getattr(ex, "mode", None)
+    source_level = getattr(ex, "difficulty", None)
+    source_worktype = (
+        str(ex.workout_type[0].value if hasattr(ex.workout_type[0], "value") else ex.workout_type[0])
+        if getattr(ex, "workout_type", None)
+        else None
+    )
+
+    companion_filters: list[Any] = [
+        Exercise.status == "active",
+        {"_id": {"$ne": ex.id}},
+    ]
+    if source_level is not None:
+        companion_filters.append(Exercise.difficulty == source_level)
+    if source_mode:
+        companion_filters.append(Exercise.mode == source_mode)
+    if source_worktype:
+        companion_filters.append({"workout_type": source_worktype})
+
+    companion_rows = await Exercise.find(*companion_filters).sort("-created_at").limit(2).to_list()
+    compound_exercises = [ex, *companion_rows]
+    rest_override = int(getattr(current_user, "training_rest_seconds", 0) or 0) or None
+    serialized_exercises = [_serialize_workout_exercise(item, rest_seconds_override=rest_override) for item in compound_exercises]
+
+    total_sets = sum(int(item.get("total_sets", 0) or 0) for item in serialized_exercises)
+    total_reps = sum(int(item.get("total_reps", 0) or 0) for item in serialized_exercises)
+    duration_seconds = sum(int(item.get("total_seconds", 0) or 0) for item in serialized_exercises)
 
     calories = 0.0
     if getattr(ex, "calories_per_minute", None):
@@ -558,6 +713,17 @@ async def discover_workout_details(template_id: PydanticObjectId):
 
     set_summaries = wm["set_summaries"]
     ai_tip = getattr(ex, "ai_technique", None)
+    logger.info(
+        "Workout details payload: exercise_id=%s code=%s mode=%s total_sets=%s total_reps=%s total_seconds=%s exercises_count=%s set_plan=%s",
+        str(ex.id),
+        str(getattr(ex, "code", None) or ""),
+        _enum_value_str(getattr(ex, "mode", "")),
+        int(total_sets),
+        int(total_reps),
+        int(duration_seconds),
+        len(serialized_exercises),
+        wm["sets_payload"],
+    )
 
     return {
         "id": str(ex.id),
@@ -600,28 +766,65 @@ async def discover_workout_details(template_id: PydanticObjectId):
             ),
         },
         "level": str(ex.difficulty.value if hasattr(ex.difficulty, "value") else ex.difficulty),
+        "exercise_count": len(serialized_exercises),
+        "exercises": serialized_exercises,
+        "items": serialized_exercises,
         "totals": {
-            "sets": int(wm["total_sets"]),
-            "reps": int(wm["total_reps"]),
-            "intervals": int(wm["total_intervals"]),
-            "timed_intervals": int(wm["timed_intervals"]),
-            "timed_intervals_seconds": int(wm["timed_intervals_seconds"]),
-            "rest_between_sets_seconds": int(wm["rest_between_sets_seconds"]),
-            "rest_seconds_after_exercise": int(wm["rest_seconds_after_exercise"]),
+            "sets": int(total_sets),
+            "reps": int(total_reps),
+            "intervals": sum(int(sum(len(set_row.get("reps") or []) for set_row in item.get("set_plan", []))) for item in serialized_exercises),
+            "timed_intervals": sum(
+                int(sum(
+                    1
+                    for set_row in item.get("set_plan", [])
+                    for rep in list(set_row.get("reps") or [])
+                    if str(rep.get("mode") or "") == ExerciseMode.time.value
+                ))
+                for item in serialized_exercises
+            ),
+            "timed_intervals_seconds": sum(
+                int(sum(
+                    int(rep.get("duration_seconds") or 0)
+                    for set_row in item.get("set_plan", [])
+                    for rep in list(set_row.get("reps") or [])
+                    if str(rep.get("mode") or "") == ExerciseMode.time.value
+                ))
+                for item in serialized_exercises
+            ),
+            "rest_between_sets_seconds": sum(int(item.get("rest_between_sets_seconds", 0) or 0) for item in serialized_exercises),
+            "rest_seconds_after_exercise": sum(int(item.get("rest_seconds_after_exercise", 0) or 0) for item in serialized_exercises),
             "total_seconds": duration_seconds,
-            "total_minutes": seconds_to_minutes(duration_seconds),
+            "total_minutes": max(1, (duration_seconds + 59) // 60) if duration_seconds > 0 else 0,
             "total_calories": round(calories, 1),
         },
         "metrics": build_metrics_block(
             total_seconds=duration_seconds,
             total_calories=round(calories, 1),
-            total_sets=int(wm["total_sets"]),
-            total_reps=int(wm["total_reps"]),
-            total_intervals=int(wm["total_intervals"]),
-            timed_intervals=int(wm["timed_intervals"]),
-            timed_intervals_seconds=int(wm["timed_intervals_seconds"]),
-            rest_between_sets_seconds=int(wm["rest_between_sets_seconds"]),
+            total_sets=int(total_sets),
+            total_reps=int(total_reps),
+            total_intervals=sum(int(sum(len(set_row.get("reps") or []) for set_row in item.get("set_plan", []))) for item in serialized_exercises),
+            timed_intervals=sum(
+                int(sum(
+                    1
+                    for set_row in item.get("set_plan", [])
+                    for rep in list(set_row.get("reps") or [])
+                    if str(rep.get("mode") or "") == ExerciseMode.time.value
+                ))
+                for item in serialized_exercises
+            ),
+            timed_intervals_seconds=sum(
+                int(sum(
+                    int(rep.get("duration_seconds") or 0)
+                    for set_row in item.get("set_plan", [])
+                    for rep in list(set_row.get("reps") or [])
+                    if str(rep.get("mode") or "") == ExerciseMode.time.value
+                ))
+                for item in serialized_exercises
+            ),
+            rest_between_sets_seconds=sum(int(item.get("rest_between_sets_seconds", 0) or 0) for item in serialized_exercises),
         ),
+        "set_plan": wm["sets_payload"],
+        "steps": wm["sets_payload"],
         "sets": set_summaries,
     }
 
@@ -629,11 +832,44 @@ async def discover_workout_details(template_id: PydanticObjectId):
 async def _discover_similar_workouts(exercise_id: PydanticObjectId, payload: SimilarExerciseIn):
     source = await Exercise.get(exercise_id)
     if not source or source.status != "active":
+        logger.info(
+            "Similar workouts rejected: exercise_id=%s reason=source_not_found",
+            str(exercise_id),
+        )
         raise HTTPException(status_code=404, detail="Source exercise not found")
 
     source_mode = getattr(source, "mode", None)
-    source_worktype = payload.workouttype.value
-    source_level = payload.level
+    source_worktypes = WorkoutType.normalize_many(getattr(source, "workout_type", None) or [])
+    source_worktype = source_worktypes[0].value if source_worktypes else None
+    requested_worktype_raw = str(getattr(payload, "workouttype", None) or "").strip()
+    generic_worktype_tokens = {"", "workout", "training", "session", "exercise"}
+    if requested_worktype_raw and requested_worktype_raw.lower() not in generic_worktype_tokens:
+        try:
+            normalized_worktype, _ = _normalize_discover_worktype(requested_worktype_raw)
+            source_worktype = normalized_worktype.value
+        except ValueError as exc:
+            logger.info(
+                "Similar workouts rejected: exercise_id=%s reason=unsupported_worktype raw_workouttype=%s",
+                str(exercise_id),
+                requested_worktype_raw,
+            )
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    source_level = payload.level or getattr(source, "difficulty", None)
+    if source_level is None:
+        raise HTTPException(status_code=400, detail="Unable to resolve source exercise difficulty")
+    normalized_reps = int(getattr(payload, "reps", 1) or 1)
+    normalized_duration = getattr(payload, "target_duration_seconds", None)
+    logger.info(
+        "Similar workouts normalized: exercise_id=%s level=%s workoutType=%s requestedWorkoutType=%s reps=%s targetDurationSeconds=%s source_mode=%s",
+        str(exercise_id),
+        str(getattr(source_level, "value", source_level)),
+        source_worktype,
+        requested_worktype_raw or None,
+        normalized_reps,
+        normalized_duration,
+        str(getattr(source_mode, "value", source_mode) or ""),
+    )
 
     filters: list[Any] = [
         Exercise.status == "active",
@@ -641,10 +877,11 @@ async def _discover_similar_workouts(exercise_id: PydanticObjectId, payload: Sim
         {"_id": {"$ne": source.id}},
     ]
 
-    filters.append({"workout_type": source_worktype})
+    if source_worktype:
+        filters.append({"workout_type": source_worktype})
     if source_mode:
         filters.append(Exercise.mode == source_mode)
-    items = await Exercise.find(*filters).sort("-created_at").limit(int(payload.reps)).to_list()
+    items = await Exercise.find(*filters).sort("-created_at").limit(normalized_reps).to_list()
 
     out_items: list[dict[str, Any]] = []
     for ex in items:
@@ -665,5 +902,7 @@ async def _discover_similar_workouts(exercise_id: PydanticObjectId, payload: Sim
     return out_items
 
 @router.post("/discover/workouts/similar")
-async def discover_similar_workouts_by_body(payload: SimilarExerciseIn):
-    return await _discover_similar_workouts(payload.exercise_id, payload)
+async def discover_similar_workouts_by_body(payload: dict[str, Any]):
+    logger.info("Similar workouts raw payload: %s", payload)
+    normalized = SimilarExerciseIn.from_raw_payload(payload)
+    return await _discover_similar_workouts(normalized.exercise_id, normalized)

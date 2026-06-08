@@ -21,7 +21,7 @@ class ProfileUpdateIn(BaseModel):
     weight_kg: Optional[float] = Field(default=None, ge=20, le=300)
     target_weight_kg: Optional[float] = Field(default=None, ge=20, le=300)
     activity_level: Optional[ActivityLevel] = None
-
+    training_rest_seconds: Optional[int] = Field(default=None, ge=10, le=300)
     goals: Optional[List[Goal]] = Field(default=None, max_length=3)
     preferences: Optional[List[Preference]] = None
     equipment: Optional[List[Equipment]] = None
@@ -29,6 +29,9 @@ class ProfileUpdateIn(BaseModel):
 
     schedule: Optional[UserScheduleIn] = None
     photo_url: Optional[str] = None
+    onboarding_required_completed: Optional[bool] = None
+    onboarding_version: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    last_onboarding_step: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("equipment", mode="before")
     @classmethod

@@ -12,7 +12,7 @@ import math
 from copy import deepcopy
 
 from api.auth.config import get_current_user
-from models import UserWorkout, WorkoutRun, Exercise, UserAchievement
+from models import UserWorkout, WorkoutRun, Exercise, UserAchievement, User
 from models.enums import ExerciseMode
 from utils.fitness_metrics import run_effective_seconds
 from models.workouts import Feedback  # âœ… enum
@@ -394,6 +394,7 @@ def _pick_workout_title_from_exercise(exercise: Exercise) -> str:
 
 
 async def _create_user_workout_from_exercise(exercise: Exercise, user_id: PydanticObjectId) -> UserWorkout:
+    user = await User.get(user_id)
     mode = getattr(exercise, "mode", ExerciseMode.reps)
     defaults = getattr(exercise, "defaults", None)
     media = getattr(exercise, "media", None)
@@ -403,7 +404,7 @@ async def _create_user_workout_from_exercise(exercise: Exercise, user_id: Pydant
     duration = getattr(defaults, "duration_seconds", None)
     if duration is None:
         duration = int(getattr(media, "duration_seconds", 0) or 0) or None
-    rest_seconds_after = int(getattr(defaults, "rest_seconds_after", 45) or 45)
+    rest_seconds_after = int(getattr(user, "training_rest_seconds", 0) or getattr(defaults, "rest_seconds_after", 45) or 45)
 
     step: dict = {
         "order": 1,

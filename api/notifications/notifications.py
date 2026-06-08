@@ -2,22 +2,34 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from api.auth.config import get_current_user
-from api.notifications.service import clamp_limit, create_notification_history, list_notification_history, unread_count_for_user
+from api.notifications.service import (
+    clamp_limit,
+    create_notification_history,
+    list_notification_history,
+    new_count_for_user,
+    patch_all_notification_states,
+    patch_notification_state,
+    unread_count_for_user,
+)
 from models.users import User
 from schemas.notifications import (
+    NotificationCountOut,
     NotificationHistoryCreateIn,
     NotificationHistoryItemOut,
     NotificationHistoryListOut,
     NotificationHistoryPaginationOut,
+    NotificationStatePatchIn,
     ReminderSettingsIn,
     ReminderSettingsOut,
 )
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
+logger = logging.getLogger("uvicorn.error")
 
 
 def _require_auth(user: Optional[User]) -> User:
@@ -26,23 +38,8 @@ def _require_auth(user: Optional[User]) -> User:
     return user
 
 
-def _to_out(item) -> NotificationHistoryItemOut:
-    return NotificationHistoryItemOut(
-        id=str(item.id),
-        user_id=str(item.user_id),
-        type=item.type,
-        title=item.title,
-        subtitle=item.subtitle,
-        body=item.body,
-        source=item.source,
-        deep_link=item.deep_link,
-        image_url=item.image_url,
-        priority=item.priority,
-        meta=item.meta or {},
-        is_read=bool(item.is_read),
-        created_at=item.created_at,
-        updated_at=item.updated_at,
-    )
+def _to_out(item, language: str = "en") -> NotificationHistoryItemOut:
+    return NotificationHistoryItemOut.from_notification(item, language=language)
 
 
 def _reminder_settings_out(user: User) -> ReminderSettingsOut:
@@ -62,16 +59,18 @@ def _reminder_settings_out(user: User) -> ReminderSettingsOut:
 
 
 @router.post("/history", response_model=NotificationHistoryItemOut, status_code=201)
+@router.post("", response_model=NotificationHistoryItemOut, status_code=201)
 async def create_history_item(
     payload: NotificationHistoryCreateIn,
     current_user: User = Depends(get_current_user),
 ):
     user = _require_auth(current_user)
     item = await create_notification_history(user_id=user.id, payload=payload)
-    return _to_out(item)
+    return _to_out(item, language=str(getattr(user, "language", "en") or "en"))
 
 
 @router.get("/history", response_model=NotificationHistoryListOut)
+@router.get("", response_model=NotificationHistoryListOut)
 async def get_history(
     limit: int = Query(default=20, ge=1, le=100),
     cursor: Optional[str] = Query(default=None),
@@ -88,15 +87,75 @@ async def get_history(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid cursor")
     unread_count = await unread_count_for_user(user.id)
+    new_count = await new_count_for_user(user.id)
     return NotificationHistoryListOut(
-        items=[_to_out(item) for item in items],
+        items=[_to_out(item, language=str(getattr(user, "language", "en") or "en")) for item in items],
         pagination=NotificationHistoryPaginationOut(
             limit=safe_limit,
             next_cursor=next_cursor,
             has_more=has_more,
         ),
         unread_count=unread_count,
+        new_count=new_count,
     )
+
+
+@router.get("/count", response_model=NotificationCountOut)
+async def get_notification_counts(current_user: User = Depends(get_current_user)):
+    user = _require_auth(current_user)
+    return NotificationCountOut(
+        unread_count=await unread_count_for_user(user.id),
+        new_count=await new_count_for_user(user.id),
+    )
+
+
+@router.patch("/read-all")
+async def mark_all_notifications_read(current_user: User = Depends(get_current_user)):
+    user = _require_auth(current_user)
+    updated = await patch_all_notification_states(user_id=user.id, read=True)
+    logger.info("Notifications read-all: user_id=%s updated=%s", str(user.id), updated)
+    return {
+        "updated": updated,
+        "counts": {
+            "unread_count": await unread_count_for_user(user.id),
+            "new_count": await new_count_for_user(user.id),
+        },
+    }
+
+
+@router.patch("/seen-all")
+async def mark_all_notifications_seen(current_user: User = Depends(get_current_user)):
+    user = _require_auth(current_user)
+    updated = await patch_all_notification_states(user_id=user.id, seen=True)
+    logger.info("Notifications seen-all: user_id=%s updated=%s", str(user.id), updated)
+    return {
+        "updated": updated,
+        "counts": {
+            "unread_count": await unread_count_for_user(user.id),
+            "new_count": await new_count_for_user(user.id),
+        },
+    }
+
+
+@router.patch("/history/{notification_id}", response_model=NotificationHistoryItemOut)
+async def patch_notification(
+    notification_id: str,
+    payload: NotificationStatePatchIn,
+    current_user: User = Depends(get_current_user),
+):
+    user = _require_auth(current_user)
+    try:
+        item = await patch_notification_state(
+            user_id=user.id,
+            notification_id=notification_id,
+            delivered=payload.delivered,
+            seen=payload.seen,
+            read=payload.read,
+            dismissed=payload.dismissed,
+        )
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    return _to_out(item, language=str(getattr(user, "language", "en") or "en"))
 
 
 @router.get("/reminders", response_model=ReminderSettingsOut)

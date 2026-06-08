@@ -85,6 +85,11 @@ class User(BaseDoc):
     training_rest_seconds: int = Field(default=60, ge=10, le=600)
     timezone: str = "UTC"
     profile: Optional[UserProfile] = None
+    onboarding_required: bool = True
+    onboarding_required_completed: bool = False
+    onboarding_required_completed_at: Optional[datetime] = None
+    onboarding_version: Optional[str] = None
+    last_onboarding_step: Optional[str] = None
     reminder_settings: ReminderSettings = Field(default_factory=ReminderSettings)
     flags: UserFlags = Field(default_factory=UserFlags)
     stats: UserStats = Field(default_factory=UserStats)

@@ -28,7 +28,6 @@ def parse_exercise_video_filename(file_name: str) -> ExerciseVideoMeta:
     stem = Path(str(file_name or "").strip()).stem
     match = _VIDEO_NAME_RE.match(stem)
     if not match:
-        logger.warning("Unrecognized exercise video filename format: %s", file_name)
         return {"video_mode": None, "repetitions": None, "duration_seconds": None}
 
     value = match.group("value")
@@ -40,18 +39,52 @@ def parse_exercise_video_filename(file_name: str) -> ExerciseVideoMeta:
             return {"video_mode": None, "repetitions": None, "duration_seconds": None}
         return {"video_mode": "reps", "repetitions": int(value), "duration_seconds": None}
 
-    return {"video_mode": "seconds", "repetitions": None, "duration_seconds": float(value)}
+    return {"video_mode": "time", "repetitions": None, "duration_seconds": float(value)}
 
 
 def parse_exercise_video_from_url(video_url: Optional[str]) -> ExerciseVideoMeta:
     if not video_url:
+        logger.info(
+            "Exercise video metadata: video_url=%s local_path=%s file_exists=%s video_mode=%s repetitions=%s duration_seconds=%s reason=%s",
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            "empty_url",
+        )
         return {"video_mode": None, "repetitions": None, "duration_seconds": None}
+
+    local_path = resolve_local_media_path(video_url)
+    file_exists = bool(local_path and local_path.exists() and local_path.is_file())
     try:
         file_name = Path(urlparse(video_url).path).name
     except Exception:
         logger.warning("Failed to parse video URL: %s", video_url)
+        logger.info(
+            "Exercise video metadata: video_url=%s local_path=%s file_exists=%s video_mode=%s repetitions=%s duration_seconds=%s reason=%s",
+            video_url,
+            str(local_path) if local_path else None,
+            file_exists,
+            None,
+            None,
+            None,
+            "url_parse_failed",
+        )
         return {"video_mode": None, "repetitions": None, "duration_seconds": None}
-    return parse_exercise_video_filename(file_name)
+    meta = parse_exercise_video_filename(file_name)
+    logger.info(
+        "Exercise video metadata: video_url=%s local_path=%s file_exists=%s video_mode=%s repetitions=%s duration_seconds=%s reason=%s",
+        video_url,
+        str(local_path) if local_path else None,
+        file_exists,
+        meta.get("video_mode"),
+        meta.get("repetitions"),
+        meta.get("duration_seconds"),
+        "parsed" if meta.get("video_mode") else "filename_unrecognized",
+    )
+    return meta
 
 
 def resolve_local_media_path(media_url: Optional[str]) -> Optional[Path]:

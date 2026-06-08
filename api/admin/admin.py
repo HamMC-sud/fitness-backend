@@ -156,6 +156,16 @@ def _safe_path_segment(raw: str) -> str:
     return cleaned or "exercise"
 
 
+def _normalize_exercise_media_file_name(slot: str, file: UploadFile) -> str:
+    if slot == "video":
+        normalized_name = _normalize_desired_name(file.filename, file)
+        if normalized_name:
+            return normalized_name
+
+    ext = _guess_ext(file.content_type, file.filename)
+    return f"{slot}{ext}"
+
+
 def _uploaded_exercise_media_url(request: Request, folder: str, file_name: str) -> str:
     base = str(request.base_url).rstrip("/")
     return f"{base}/upload_exercises/{folder}/{file_name}"
@@ -175,12 +185,11 @@ async def save_exercise_media_file(
     if len(data) > max_bytes:
         raise HTTPException(status_code=400, detail=f"{slot} file exceeds size limit")
 
-    ext = _guess_ext(file.content_type, file.filename)
     folder = _safe_path_segment(exercise_folder)
     out_dir = EXERCISE_UPLOAD_DIR / folder
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    file_name = f"{slot}{ext}"
+    file_name = _normalize_exercise_media_file_name(slot, file)
     out_path = out_dir / file_name
     if out_path.exists() and not overwrite_existing:
         raise HTTPException(

@@ -1,15 +1,21 @@
 import os
 import logging
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI , WebSocket, WebSocketDisconnect
+from fastapi import FastAPI , Request, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exception_handlers import http_exception_handler
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.staticfiles import StaticFiles
 from beanie import init_beanie
 
 from models import db, client, ALL_MODELS
 from api.api_router import api_router
+from utils.api_i18n import augment_payload, localize_detail
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,79 @@ app.add_middleware(
 
 app.mount("/statics", StaticFiles(directory="statics"), name="statics")
 app.mount("/upload_exercises", StaticFiles(directory="upload_exercises"), name="upload_exercises")
+
+
+def _should_skip_i18n(path: str) -> bool:
+    return path.startswith("/docs") or path.startswith("/redoc") or path.startswith("/openapi")
+
+
+async def _rebuild_json_response(response: Response, request: Request) -> Response:
+    if _should_skip_i18n(request.url.path):
+        return response
+
+    content_type = response.headers.get("content-type", "")
+    if "application/json" not in content_type:
+        return response
+
+    body = getattr(response, "body", None)
+    if body is None:
+        body = b""
+        body_iterator = getattr(response, "body_iterator", None)
+        if body_iterator is None:
+            return response
+        async for chunk in body_iterator:
+            body += chunk
+
+    if not body:
+        return Response(
+            content=body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+            background=response.background,
+        )
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return Response(
+            content=body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+            background=response.background,
+        )
+
+    localized = augment_payload(payload, response.status_code)
+    headers = dict(response.headers)
+    headers.pop("content-length", None)
+
+    return Response(
+        content=json.dumps(localized, ensure_ascii=False),
+        status_code=response.status_code,
+        headers=headers,
+        media_type="application/json",
+        background=response.background,
+    )
+
+
+@app.middleware("http")
+async def add_bilingual_responses(request: Request, call_next):
+    response = await call_next(request)
+    return await _rebuild_json_response(response, request)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def localized_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    response = await http_exception_handler(request, exc)
+    return await _rebuild_json_response(response, request)
+
+
+@app.exception_handler(RequestValidationError)
+async def localized_validation_exception_handler(request: Request, exc: RequestValidationError):
+    payload = augment_payload({"detail": exc.errors(), "detail_i18n": localize_detail(exc.errors())}, 422)
+    return JSONResponse(status_code=422, content=payload)
+
 
 app.include_router(api_router)
 
