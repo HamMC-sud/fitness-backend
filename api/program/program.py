@@ -57,6 +57,65 @@ _DISCOVER_WORKTYPE_ALIASES: dict[str, tuple[WorkoutType, Optional[Equipment]]] =
     "arms": (WorkoutType.strength, None),
 }
 
+_DISCOVER_CATEGORY_CANONICAL: dict[str, str] = {
+    "core_abs": "core",
+    "core_and_abs": "core",
+    "abs": "core",
+}
+
+_DISCOVER_CATEGORY_MUSCLE_GROUPS: dict[str, list[str]] = {
+    "legs_glutes": [
+        "quads",
+        "quadriceps",
+        "glutes",
+        "hamstrings",
+        "calves",
+        "hips",
+        "adductors",
+        "abductors",
+    ],
+    "upper_body": [
+        "chest",
+        "back",
+        "shoulders",
+        "biceps",
+        "triceps",
+        "forearms",
+        "upper_back",
+        "lower_back",
+        "lats",
+        "traps",
+        "rear_delts",
+        "front_delts",
+        "side_delts",
+    ],
+    "arms": [
+        "biceps",
+        "triceps",
+        "forearms",
+    ],
+    "core": [
+        "core",
+        "abs",
+        "abs_core",
+        "obliques",
+    ],
+}
+
+_DISCOVER_CATEGORY_EQUIPMENT_ALIASES: dict[str, list[str]] = {
+    "bodyweight": [
+        "home",
+        "bodyweight",
+        "no_equipment",
+        "No equipment",
+        "no equipment",
+    ],
+    "dumbbells": [
+        "dumbbells",
+        "Dumbbells",
+    ],
+}
+
 
 def _normalize_discover_worktype(value: str) -> tuple[WorkoutType, Optional[Equipment]]:
     raw_input = str(value or "").strip()
@@ -82,6 +141,138 @@ def _normalize_discover_worktype(value: str) -> tuple[WorkoutType, Optional[Equi
     if mapped is None:
         raise ValueError(f"Unsupported worktype: {value}")
     return mapped
+
+
+def _normalize_discover_category(value: str) -> tuple[str, WorkoutType, Optional[Equipment]]:
+    raw_input = str(value or "").strip()
+    if not raw_input:
+        raise ValueError("empty worktype")
+
+    raw = re.sub(r"(?<!^)(?=[A-Z])", "_", raw_input).lower()
+    token = (
+        raw.replace("-", "_")
+        .replace(" ", "_")
+        .replace("&", "_")
+        .replace("/", "_")
+    )
+    token = "_".join(part for part in token.split("_") if part)
+
+    workout_type, implied_equipment = _normalize_discover_worktype(value)
+    canonical = _DISCOVER_CATEGORY_CANONICAL.get(token, token or workout_type.value)
+    return canonical, workout_type, implied_equipment
+
+
+def _workout_type_filter(worktype: Optional[Any]) -> Optional[dict[str, Any]]:
+    if worktype is None:
+        return None
+
+    raw = getattr(worktype, "value", worktype)
+    token = str(raw or "").strip().lower()
+    if not token:
+        return None
+
+    if token in {"cardio", "hiit", "cardio_hiit"}:
+        return {"workout_type": {"$in": ["cardio", "hiit"]}}
+
+    return {"workout_type": token}
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    out: list[str] = []
+    for item in items:
+        value = str(item or "").strip()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _build_discovery_filter_parts(
+    requested_category: str,
+    equipment: Optional[Equipment] = None,
+) -> dict[str, Any]:
+    category_token, workout_type, implied_equipment = _normalize_discover_category(requested_category)
+    worktype_token = (
+        category_token
+        if category_token in {"cardio", "hiit", "cardio_hiit"}
+        else workout_type.value
+    )
+    worktype_filter = _workout_type_filter(worktype_token)
+
+    extra_filters: list[dict[str, Any]] = []
+
+    muscle_group_values = _dedupe_keep_order(
+        list(_DISCOVER_CATEGORY_MUSCLE_GROUPS.get(category_token, []))
+    )
+    if muscle_group_values:
+        extra_filters.append({"muscle_groups": {"$in": muscle_group_values}})
+
+    equipment_values: list[str] = []
+    if equipment is not None:
+        equipment_values = equipment_db_aliases(equipment)
+    elif category_token in _DISCOVER_CATEGORY_EQUIPMENT_ALIASES:
+        equipment_values = list(_DISCOVER_CATEGORY_EQUIPMENT_ALIASES[category_token])
+    elif implied_equipment is not None:
+        equipment_values = equipment_db_aliases(implied_equipment)
+
+    equipment_values = _dedupe_keep_order(equipment_values)
+    if equipment_values:
+        extra_filters.append({"equipment": {"$in": equipment_values}})
+
+    return {
+        "requested_category": requested_category,
+        "canonical_category": category_token,
+        "resolved_workout_type": workout_type,
+        "implied_equipment": implied_equipment,
+        "worktype_filter": worktype_filter,
+        "extra_filters": extra_filters,
+    }
+
+
+def _source_muscle_similarity_filter(source: Exercise) -> Optional[dict[str, Any]]:
+    raw_groups = list(getattr(source, "muscle_groups", None) or [])
+
+    groups: list[str] = []
+    for group in raw_groups:
+        value = str(group or "").strip()
+        if not value:
+            continue
+        groups.append(value)
+
+    ignored_generic_groups = {
+        "core",
+        "abs",
+        "abs_core",
+    }
+
+    groups = [group for group in groups if group not in ignored_generic_groups]
+    groups = _dedupe_keep_order(groups)
+    if not groups:
+        return None
+
+    return {
+        "muscle_groups": {
+            "$in": groups,
+        }
+    }
+
+
+def build_discovery_filters(
+    requested_category: str,
+    level: Optional[Difficulty] = None,
+    equipment: Optional[Equipment] = None,
+    status: str = "active",
+) -> dict[str, Any]:
+    parts = _build_discovery_filter_parts(requested_category, equipment=equipment)
+    filters: list[Any] = [Exercise.status == status]
+    if parts["worktype_filter"] is not None:
+        filters.append(parts["worktype_filter"])
+    if level is not None:
+        filters.append(Exercise.difficulty == level)
+    filters.extend(parts["extra_filters"])
+    return {
+        **parts,
+        "filters": filters,
+    }
 
 
 class SimilarExerciseIn(BaseModel):
@@ -540,8 +731,13 @@ async def discover_worktype_details(
     current_user: Optional[User] = Depends(_get_optional_user),
 ):
     try:
-        wtype, implied_equipment = _normalize_discover_worktype(worktype)
-    except Exception:
+        discovery = build_discovery_filters(
+            requested_category=worktype,
+            level=level,
+            equipment=equipment,
+            status=status,
+        )
+    except ValueError:
         supported = sorted(_DISCOVER_WORKTYPE_ALIASES.keys())
         raise HTTPException(
             status_code=400,
@@ -551,15 +747,18 @@ async def discover_worktype_details(
                 "supported_labels": supported,
             },
         )
-    effective_equipment = equipment or implied_equipment
+    wtype = discovery["resolved_workout_type"]
+    worktype_filter = discovery["worktype_filter"]
+    extra_filters = discovery["extra_filters"]
 
-    filters: list[Any] = [Exercise.status == status, {"workout_type": wtype.value}]
-    if level:
-        filters.append(Exercise.difficulty == level)
-    if effective_equipment:
-        filters.append({"equipment": {"$in": equipment_db_aliases(effective_equipment)}})
-
-    exercises = await Exercise.find(*filters).sort("-created_at").to_list()
+    exercises = await Exercise.find(*discovery["filters"]).sort("-created_at").to_list()
+    logger.info(
+        "Workout discovery query: requested_workout_type=%s effective_workout_type_filter=%s extra_filters=%s result_count=%s",
+        worktype,
+        worktype_filter,
+        extra_filters,
+        len(exercises),
+    )
     if not exercises:
         return {
             "worktype": wtype.value,
@@ -686,6 +885,7 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
         if getattr(ex, "workout_type", None)
         else None
     )
+    source_muscle_filter = _source_muscle_similarity_filter(ex)
 
     companion_filters: list[Any] = [
         Exercise.status == "active",
@@ -695,10 +895,21 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
         companion_filters.append(Exercise.difficulty == source_level)
     if source_mode:
         companion_filters.append(Exercise.mode == source_mode)
-    if source_worktype:
-        companion_filters.append({"workout_type": source_worktype})
+    companion_worktype_filter = _workout_type_filter(source_worktype)
+    if companion_worktype_filter:
+        companion_filters.append(companion_worktype_filter)
+    if source_muscle_filter:
+        companion_filters.append(source_muscle_filter)
 
     companion_rows = await Exercise.find(*companion_filters).sort("-created_at").limit(2).to_list()
+    logger.info(
+        "Workout details companion query: exercise_id=%s code=%s worktype_filter=%s source_muscle_filter=%s companion_count=%s",
+        str(ex.id),
+        str(getattr(ex, "code", None) or ""),
+        companion_worktype_filter,
+        source_muscle_filter,
+        len(companion_rows),
+    )
     compound_exercises = [ex, *companion_rows]
     rest_override = int(getattr(current_user, "training_rest_seconds", 0) or 0) or None
     serialized_exercises = [_serialize_workout_exercise(item, rest_seconds_override=rest_override) for item in compound_exercises]
@@ -829,8 +1040,12 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
     }
 
 
-async def _discover_similar_workouts(exercise_id: PydanticObjectId, payload: SimilarExerciseIn):
+async def _discover_similar_workouts(
+    exercise_id: PydanticObjectId,
+    payload: SimilarExerciseIn,
+):
     source = await Exercise.get(exercise_id)
+
     if not source or source.status != "active":
         logger.info(
             "Similar workouts rejected: exercise_id=%s reason=source_not_found",
@@ -839,14 +1054,32 @@ async def _discover_similar_workouts(exercise_id: PydanticObjectId, payload: Sim
         raise HTTPException(status_code=404, detail="Source exercise not found")
 
     source_mode = getattr(source, "mode", None)
-    source_worktypes = WorkoutType.normalize_many(getattr(source, "workout_type", None) or [])
+    source_muscle_filter = _source_muscle_similarity_filter(source)
+
+    source_worktypes = WorkoutType.normalize_many(
+        getattr(source, "workout_type", None) or []
+    )
     source_worktype = source_worktypes[0].value if source_worktypes else None
-    requested_worktype_raw = str(getattr(payload, "workouttype", None) or "").strip()
-    generic_worktype_tokens = {"", "workout", "training", "session", "exercise"}
+
+    requested_worktype_raw = str(
+        getattr(payload, "workouttype", None) or ""
+    ).strip()
+
+    generic_worktype_tokens = {
+        "",
+        "workout",
+        "training",
+        "session",
+        "exercise",
+    }
+
+    extra_filters: list[dict[str, Any]] = []
     if requested_worktype_raw and requested_worktype_raw.lower() not in generic_worktype_tokens:
         try:
-            normalized_worktype, _ = _normalize_discover_worktype(requested_worktype_raw)
-            source_worktype = normalized_worktype.value
+            discovery_parts = _build_discovery_filter_parts(requested_worktype_raw)
+            source_worktype = discovery_parts["resolved_workout_type"].value
+            extra_filters = list(discovery_parts["extra_filters"])
+            worktype_filter = discovery_parts["worktype_filter"]
         except ValueError as exc:
             logger.info(
                 "Similar workouts rejected: exercise_id=%s reason=unsupported_worktype raw_workouttype=%s",
@@ -854,50 +1087,165 @@ async def _discover_similar_workouts(exercise_id: PydanticObjectId, payload: Sim
                 requested_worktype_raw,
             )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+    else:
+        worktype_filter = _workout_type_filter(source_worktype)
 
     source_level = payload.level or getattr(source, "difficulty", None)
+
     if source_level is None:
-        raise HTTPException(status_code=400, detail="Unable to resolve source exercise difficulty")
-    normalized_reps = int(getattr(payload, "reps", 1) or 1)
+        raise HTTPException(
+            status_code=400,
+            detail="Unable to resolve source exercise difficulty",
+        )
+    limit = max(1, min(int(getattr(payload, "reps", 3) or 3), 12))
+
     normalized_duration = getattr(payload, "target_duration_seconds", None)
+
     logger.info(
-        "Similar workouts normalized: exercise_id=%s level=%s workoutType=%s requestedWorkoutType=%s reps=%s targetDurationSeconds=%s source_mode=%s",
+        "Similar workouts normalized: exercise_id=%s level=%s workoutType=%s requestedWorkoutType=%s limit=%s targetDurationSeconds=%s source_mode=%s",
         str(exercise_id),
         str(getattr(source_level, "value", source_level)),
         source_worktype,
         requested_worktype_raw or None,
-        normalized_reps,
+        limit,
         normalized_duration,
         str(getattr(source_mode, "value", source_mode) or ""),
     )
+    logger.info(
+        "Similar workouts source filters: exercise_id=%s source_code=%s source_muscle_filter=%s category_extra_filters=%s",
+        str(exercise_id),
+        str(getattr(source, "code", None) or ""),
+        source_muscle_filter,
+        extra_filters,
+    )
 
-    filters: list[Any] = [
+    base_filters: list[Any] = [
         Exercise.status == "active",
-        Exercise.difficulty == source_level,
         {"_id": {"$ne": source.id}},
     ]
 
-    if source_worktype:
-        filters.append({"workout_type": source_worktype})
+    query_steps: list[tuple[str, list[Any]]] = []
+
+    strict_filters = [*base_filters, Exercise.difficulty == source_level]
+
+    if worktype_filter:
+        strict_filters.append(worktype_filter)
+    strict_filters.extend(extra_filters)
+    if source_muscle_filter:
+        strict_filters.append(source_muscle_filter)
+
     if source_mode:
-        filters.append(Exercise.mode == source_mode)
-    items = await Exercise.find(*filters).sort("-created_at").limit(normalized_reps).to_list()
+        strict_filters.append(Exercise.mode == source_mode)
+
+    query_steps.append(("strict_level_worktype_mode", strict_filters))
+
+    same_worktype_mode = [*base_filters]
+
+    if worktype_filter:
+        same_worktype_mode.append(worktype_filter)
+    same_worktype_mode.extend(extra_filters)
+    if source_muscle_filter:
+        same_worktype_mode.append(source_muscle_filter)
+
+    if source_mode:
+        same_worktype_mode.append(Exercise.mode == source_mode)
+
+    query_steps.append(("same_worktype_mode", same_worktype_mode))
+
+    if worktype_filter:
+        same_worktype = [*base_filters, worktype_filter, *extra_filters]
+        if source_muscle_filter:
+            same_worktype.append(source_muscle_filter)
+        query_steps.append(("same_worktype", same_worktype))
+
+    if source_muscle_filter:
+        same_source_muscles = [*base_filters, source_muscle_filter]
+        query_steps.append(("same_source_muscles", same_source_muscles))
+
+    if source_mode:
+        same_mode = [*base_filters, Exercise.mode == source_mode]
+        query_steps.append(("same_mode", same_mode))
+
+    query_steps.append(("any_active", base_filters))
+
+    items: list[Exercise] = []
+    used_step = ""
+
+    for step_name, step_filters in query_steps:
+        items = (
+            await Exercise.find(*step_filters)
+            .sort("-created_at")
+            .limit(limit)
+            .to_list()
+        )
+
+        logger.info(
+            "Similar workouts query: exercise_id=%s step=%s requested_workout_type=%s effective_workout_type_filter=%s extra_filters=%s result_count=%s",
+            str(exercise_id),
+            step_name,
+            requested_worktype_raw or source_worktype,
+            worktype_filter,
+            extra_filters,
+            len(items),
+        )
+
+        if items:
+            used_step = step_name
+            break
 
     out_items: list[dict[str, Any]] = []
+
     for ex in items:
         media = getattr(ex, "media", None)
-        duration_seconds = int(getattr(media, "duration_seconds", 0) or 0) if media else 0
+
+        duration_seconds = (
+            int(getattr(media, "duration_seconds", 0) or 0)
+            if media
+            else 0
+        )
+
         if duration_seconds <= 0:
-            duration_seconds = int(getattr(getattr(ex, "defaults", None), "duration_seconds", 0) or 0)
+            duration_seconds = int(
+                getattr(getattr(ex, "defaults", None), "duration_seconds", 0) or 0
+            )
+
         out_items.append(
             {
+                "exercise_id": str(ex.id),
+                "exercise_code": getattr(ex, "code", None),
                 "video_url": ensure_existing_media_url(
                     getattr(media, "video_url", None) if media else None,
                     kind="video",
                 ),
+                "thumbnail_url": ensure_existing_media_url(
+                    getattr(media, "thumbnail_url", None) if media else None,
+                    kind="thumbnail",
+                ),
                 "duration_seconds": duration_seconds,
+                "workout_type": (
+                    str(ex.workout_type[0].value if hasattr(ex.workout_type[0], "value") else ex.workout_type[0])
+                    if getattr(ex, "workout_type", None)
+                    else None
+                ),
+                "level": str(
+                    ex.difficulty.value
+                    if hasattr(ex.difficulty, "value")
+                    else ex.difficulty
+                ),
+                "mode": str(
+                    ex.mode.value
+                    if hasattr(ex.mode, "value")
+                    else ex.mode
+                ),
             }
         )
+
+    logger.info(
+        "Similar workouts response: exercise_id=%s used_step=%s returned_count=%s",
+        str(exercise_id),
+        used_step,
+        len(out_items),
+    )
 
     return out_items
 
