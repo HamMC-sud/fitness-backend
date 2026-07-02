@@ -60,7 +60,7 @@ router = APIRouter(tags=["subscription"])
 
 SUBSCRIPTION_DURATIONS = {
     "0760188330": 30,
-    "0760188340": 180,
+    "0760188340": 90,
     "0760188350": 365,
 }
 
@@ -529,7 +529,7 @@ async def activate_premium_by_product(payload: PremiumActivateByProductIn, curre
 
     plan_code_by_days = {
         30: "plan_30d",
-        180: "plan_180d",
+        90: "plan_90d",
         365: "plan_365d",
     }
     plan_code = plan_code_by_days.get(int(duration_days), f"plan_{int(duration_days)}d")

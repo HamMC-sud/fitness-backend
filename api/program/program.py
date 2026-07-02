@@ -670,6 +670,92 @@ def _derive_exercise_workout_metrics(ex: Exercise) -> dict[str, Any]:
     }
 
 
+def _build_round_robin_workout_set_plan(
+    source_exercise: Exercise,
+    serialized_exercises: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    exercise_sequence = list(serialized_exercises or [])
+    if not exercise_sequence:
+        return []
+
+    sequence_codes = [str(item.get("exercise_code") or item.get("code") or "") for item in exercise_sequence]
+    logger.info(
+        "Workout details exercise sequence: source=%s sequence=%s",
+        str(getattr(source_exercise, "code", None) or ""),
+        sequence_codes,
+    )
+
+    set_plan: list[dict[str, Any]] = []
+    max_sets = max(int(len(item.get("set_plan", []) or [])) for item in exercise_sequence)
+    global_set_no = 1
+
+    for round_idx in range(max_sets):
+        for serialized_selected in exercise_sequence:
+            exercise_set_plan = list(serialized_selected.get("set_plan", []) or [])
+            if round_idx >= len(exercise_set_plan):
+                continue
+
+            set_row = dict(exercise_set_plan[round_idx])
+            selected_video_url = serialized_selected.get("video_url")
+            logger.info(
+                "Workout details set exercise selected: set_no=%s exercise_code=%s video_url=%s",
+                global_set_no,
+                str(serialized_selected.get("exercise_code") or ""),
+                selected_video_url,
+            )
+
+            set_payload = dict(set_row)
+            set_payload.update(
+                {
+                    "set_no": global_set_no,
+                    "exercise_id": serialized_selected.get("exercise_id"),
+                    "exercise_code": serialized_selected.get("exercise_code"),
+                    "code": serialized_selected.get("exercise_code"),
+                    "name": serialized_selected.get("name"),
+                    "title": serialized_selected.get("name"),
+                    "video_url": selected_video_url,
+                    "thumbnail_url": serialized_selected.get("thumbnail_url"),
+                    "video_mode": serialized_selected.get("mode"),
+                    "repetitions": sum(
+                        int(rep.get("target_reps", rep.get("target")) or 0)
+                        for rep in list(set_row.get("reps", []) or [])
+                    ) or None,
+                    "estimated_duration_seconds": sum(
+                        int(rep.get("target_duration_seconds", rep.get("duration_seconds")) or 0)
+                        for rep in list(set_row.get("reps", []) or [])
+                    ) or None,
+                }
+            )
+
+            reps_payload: list[dict[str, Any]] = []
+            for rep in list(set_row.get("reps", []) or []):
+                rep_payload = dict(rep)
+                rep_payload.update(
+                    {
+                        "exercise_id": serialized_selected.get("exercise_id"),
+                        "exercise_code": serialized_selected.get("exercise_code"),
+                        "code": serialized_selected.get("exercise_code"),
+                        "name": serialized_selected.get("name"),
+                        "title": serialized_selected.get("name"),
+                        "video_url": selected_video_url,
+                        "thumbnail_url": serialized_selected.get("thumbnail_url"),
+                        "video_mode": serialized_selected.get("mode"),
+                        "repetitions": rep.get("target_reps", rep.get("target")),
+                        "estimated_duration_seconds": rep.get(
+                            "target_duration_seconds",
+                            rep.get("duration_seconds"),
+                        ),
+                    }
+                )
+                reps_payload.append(rep_payload)
+
+            set_payload["reps"] = reps_payload
+            set_plan.append(set_payload)
+            global_set_no += 1
+
+    return set_plan
+
+
 def _serialize_workout_exercise(ex: Exercise, rest_seconds_override: Optional[int] = None) -> dict[str, Any]:
     wm = _derive_exercise_workout_metrics(ex)
     sets_payload = apply_uniform_rest_seconds(wm["sets_payload"], rest_seconds_override)
@@ -913,6 +999,7 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
     compound_exercises = [ex, *companion_rows]
     rest_override = int(getattr(current_user, "training_rest_seconds", 0) or 0) or None
     serialized_exercises = [_serialize_workout_exercise(item, rest_seconds_override=rest_override) for item in compound_exercises]
+    workout_set_plan = _build_round_robin_workout_set_plan(ex, serialized_exercises)
 
     total_sets = sum(int(item.get("total_sets", 0) or 0) for item in serialized_exercises)
     total_reps = sum(int(item.get("total_reps", 0) or 0) for item in serialized_exercises)
@@ -922,7 +1009,7 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
     if getattr(ex, "calories_per_minute", None):
         calories = float(ex.calories_per_minute or 0) * (duration_seconds / 60.0)
 
-    set_summaries = wm["set_summaries"]
+    set_summaries = _build_set_summaries(workout_set_plan)
     ai_tip = getattr(ex, "ai_technique", None)
     logger.info(
         "Workout details payload: exercise_id=%s code=%s mode=%s total_sets=%s total_reps=%s total_seconds=%s exercises_count=%s set_plan=%s",
@@ -933,7 +1020,7 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
         int(total_reps),
         int(duration_seconds),
         len(serialized_exercises),
-        wm["sets_payload"],
+        workout_set_plan,
     )
 
     return {
@@ -1034,8 +1121,8 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
             ),
             rest_between_sets_seconds=sum(int(item.get("rest_between_sets_seconds", 0) or 0) for item in serialized_exercises),
         ),
-        "set_plan": wm["sets_payload"],
-        "steps": wm["sets_payload"],
+        "set_plan": workout_set_plan,
+        "steps": workout_set_plan,
         "sets": set_summaries,
     }
 

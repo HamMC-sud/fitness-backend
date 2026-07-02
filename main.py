@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from beanie import init_beanie
 
 from models import db, client, ALL_MODELS
+from models.subscription import SubscriptionPlan
 from api.api_router import api_router
 from utils.api_i18n import augment_payload, localize_detail
 
@@ -37,12 +38,62 @@ def _log_static_mount_status() -> None:
         mp4_count,
     )
 
+
+async def _ensure_default_subscription_plans() -> None:
+    defaults = {
+        "plan_30d": {
+            "duration_days": 30,
+            "prices": {
+                "web": {"amount": 990, "currency": "RUB"},
+            },
+        },
+        "plan_90d": {
+            "duration_days": 90,
+            "prices": {
+                "web": {"amount": 2490, "currency": "RUB"},
+            },
+        },
+        "plan_365d": {
+            "duration_days": 365,
+            "prices": {
+                "web": {"amount": 7990, "currency": "RUB"},
+            },
+        },
+    }
+
+    for code, payload in defaults.items():
+        plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == code)
+        if plan:
+            changed = False
+            if int(getattr(plan, "duration_days", 0) or 0) != int(payload["duration_days"]):
+                plan.duration_days = int(payload["duration_days"])
+                changed = True
+            if getattr(plan, "status", "") != "active":
+                plan.status = "active"
+                changed = True
+            if not getattr(plan, "prices", None):
+                plan.prices = payload["prices"]
+                changed = True
+            if changed:
+                await plan.save()
+            continue
+
+        await SubscriptionPlan(
+            code=code,
+            duration_days=int(payload["duration_days"]),
+            prices=payload["prices"],
+            status="active",
+        ).insert()
+
+    logger.info("Default subscription plans ensured: %s", ", ".join(defaults.keys()))
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_beanie(
         database=db,
         document_models=ALL_MODELS,
     )
+    await _ensure_default_subscription_plans()
     _log_static_mount_status()
     yield
     client.close()
@@ -132,7 +183,26 @@ async def localized_http_exception_handler(request: Request, exc: StarletteHTTPE
 
 @app.exception_handler(RequestValidationError)
 async def localized_validation_exception_handler(request: Request, exc: RequestValidationError):
-    payload = augment_payload({"detail": exc.errors(), "detail_i18n": localize_detail(exc.errors())}, 422)
+    errors = []
+
+    for error in exc.errors():
+        clean_error = {
+            "type": error.get("type"),
+            "loc": error.get("loc"),
+            "msg": error.get("msg"),
+            "input": error.get("input"),
+        }
+
+        errors.append(clean_error)
+
+    payload = augment_payload(
+        {
+            "detail": errors,
+            "detail_i18n": localize_detail(errors),
+        },
+        422,
+    )
+
     return JSONResponse(status_code=422, content=payload)
 
 
@@ -140,7 +210,7 @@ app.include_router(api_router)
 
 @app.get("/healthcheck", status_code=200)
 async def healthcheck():
-    return {"status": "ok"} 
+    return {"status": "ok"}
 
 
 class ConnectionManager:

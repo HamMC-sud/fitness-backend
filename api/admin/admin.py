@@ -4,6 +4,7 @@ import inspect
 import csv
 import io
 import json
+import logging
 import re
 import uuid
 import secrets
@@ -84,10 +85,12 @@ from schemas.subscription import (
     SubscriptionPlanCreateIn,
     SubscriptionPlanOut,
 )
+from services.video_transcoding_service import VideoTranscodingService
 from utils.exercise_video_parser import parse_exercise_video_filename, parse_exercise_video_from_url
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 admin_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/admin/login", auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
@@ -117,6 +120,7 @@ ALLOWED_MEDIA_EXTS = {
     ".png",
     ".webp",
 }
+video_transcoding_service = VideoTranscodingService()
 
 
 def normalize_asset_type(value: str) -> str:
@@ -198,6 +202,12 @@ async def save_exercise_media_file(
         )
 
     out_path.write_bytes(data)
+    if slot == "video" and out_path.suffix.lower() == ".mp4":
+        try:
+            video_transcoding_service.replace_video_with_safe_version(out_path)
+        except Exception:
+            logger.exception("Exercise video transcoding failed for %s", out_path)
+
     return _uploaded_exercise_media_url(request, folder, file_name), file_name
 
 
