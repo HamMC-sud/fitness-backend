@@ -13,7 +13,7 @@ from api.auth.config import (
     now_utc,
     verify_code,
 )
-from models import User, VerificationCode
+from models import SocialAccount, User, VerificationCode
 from schemas.register import RegisterCompleteIn, RegisterStartIn, RegisterVerifyIn
 from utils.email_sender import send_verification_email
 from utils.profile_image import normalize_profile_photo_value
@@ -145,10 +145,6 @@ async def verify_and_register(payload: RegisterVerifyIn):
 async def complete_registration(payload: RegisterCompleteIn, request: Request):
     email = payload.email.lower().strip()
 
-    existing_user = await User.find_one(User.email == email)
-    if existing_user:
-        raise HTTPException(status_code=409, detail="User already exists")
-
     record = await VerificationCode.find_one(VerificationCode.email == email)
     if not record:
         raise HTTPException(status_code=400, detail="Email verification not found. Start registration again.")
@@ -158,14 +154,23 @@ async def complete_registration(payload: RegisterCompleteIn, request: Request):
         await record.delete()
         raise HTTPException(status_code=400, detail="Registration session expired. Start registration again.")
 
+    if record.social_provider:
+        effective_email = (record.social_email or "").lower().strip() or None
+    else:
+        effective_email = (record.email or "").lower().strip() or None
+    if effective_email:
+        existing_user = await User.find_one(User.email == effective_email)
+        if existing_user:
+            raise HTTPException(status_code=409, detail="User already exists")
+
     profile = payload.profile.model_copy(deep=True)
     if profile.photo_url:
         profile.photo_url = normalize_profile_photo_value(profile.photo_url)
 
     password_hash_value = None if record.password_hash in SOCIAL_PASSWORD_SENTINELS else record.password_hash
     user = User(
-        email=record.email,
-        email_verified=True,
+        email=effective_email,
+        email_verified=bool(effective_email),
         password_hash=password_hash_value,
         profile=profile,
     )
@@ -177,6 +182,17 @@ async def complete_registration(payload: RegisterCompleteIn, request: Request):
     except Exception:
         logger.exception("Failed to create user during registration completion for %s", email)
         raise HTTPException(status_code=500, detail="Failed to create user")
+
+    if record.social_provider and record.social_provider_user_id:
+        try:
+            await SocialAccount(
+                provider=record.social_provider,
+                provider_user_id=record.social_provider_user_id,
+                user_id=user.id,
+                email=effective_email,
+            ).insert()
+        except DuplicateKeyError:
+            raise HTTPException(status_code=409, detail="Social account already linked")
 
     await record.delete()
     tokens = await _issue_tokens_for_user(user, request)

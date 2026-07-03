@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from beanie import Document
-from pydantic import EmailStr, Field
+from pydantic import Field
 from pymongo import IndexModel, ASCENDING
 
 def now_utc() -> datetime:
@@ -15,6 +15,9 @@ def now_utc() -> datetime:
 class VerificationCode(Document):
     email: str
     password_hash: str
+    social_provider: Optional[str] = None
+    social_provider_user_id: Optional[str] = None
+    social_email: Optional[str] = None
 
     code_hash: str
     attempts: int = 0

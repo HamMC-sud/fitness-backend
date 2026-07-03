@@ -6,6 +6,7 @@ from models.enums import Region, Language
 
 class VkSocialIn(BaseModel):
     access_token: str
+    id_token: str
     email: Optional[EmailStr] = None
     region: Region = Region.RU
     language: Language = Language.ru
