@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 import secrets
 import string
@@ -57,12 +58,49 @@ from schemas.subscription import (
 )
 
 router = APIRouter(tags=["subscription"])
+logger = logging.getLogger("uvicorn.error")
 
 SUBSCRIPTION_DURATIONS = {
     "0760188330": 30,
     "0760188340": 90,
     "0760188350": 365,
 }
+
+
+def _mask_email(email: Optional[str]) -> Optional[str]:
+    raw = str(email or "").strip().lower()
+    if not raw or "@" not in raw:
+        return None
+    local, domain = raw.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[:1] + "*"
+    else:
+        masked_local = local[:2] + "*" * max(1, len(local) - 2)
+    return f"{masked_local}@{domain}"
+
+
+def _tail(value: Optional[str], size: int = 6) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return raw[-size:]
+
+
+def _order_log_context(order: Optional[LandingYooKassaOrder]) -> Dict[str, Any]:
+    if not order:
+        return {}
+    return {
+        "order_uid": getattr(order, "order_uid", None),
+        "payment_id_tail": _tail(getattr(order, "yookassa_payment_id", None)),
+        "payment_status": getattr(order, "yookassa_status", None),
+        "plan_code": getattr(order, "plan_code", None),
+        "tariff": getattr(order, "tariff", None),
+        "email_masked": _mask_email(getattr(order, "email", None)),
+        "promo": getattr(order, "promocode", None),
+        "linked_user_id": str(getattr(order, "linked_user_id", None)) if getattr(order, "linked_user_id", None) else None,
+        "activated_at": getattr(order, "activated_at", None),
+        "activation_error": getattr(order, "activation_error", None),
+    }
 
 
 def utcnow() -> datetime:
@@ -166,6 +204,15 @@ async def upsert_subscription(
 ) -> Subscription:
     now = utcnow()
     existing = await Subscription.find_one(Subscription.user_id == user_id)
+    logger.info(
+        "Subscription upsert started: user_id=%s plan_code=%s source=%s add_days=%s tx_id=%s has_existing=%s",
+        str(user_id),
+        plan_code,
+        source.value if hasattr(source, "value") else str(source),
+        int(add_days),
+        str(tx_id) if tx_id else None,
+        bool(existing),
+    )
 
     base = now
     started_at = now
@@ -192,6 +239,13 @@ async def upsert_subscription(
         existing.last_transaction_id = tx_id
         existing.status = SubscriptionStatus.active
         await existing.save()
+        logger.info(
+            "Subscription upsert updated existing: subscription_id=%s user_id=%s expires_at=%s grace_until=%s",
+            str(existing.id),
+            str(user_id),
+            existing.expires_at,
+            existing.grace_until,
+        )
 
         user = await User.get(user_id)
         if user:
@@ -212,6 +266,13 @@ async def upsert_subscription(
         last_transaction_id=tx_id,
     )
     await sub.insert()
+    logger.info(
+        "Subscription upsert created new: subscription_id=%s user_id=%s expires_at=%s grace_until=%s",
+        str(sub.id),
+        str(user_id),
+        sub.expires_at,
+        sub.grace_until,
+    )
 
     user = await User.get(user_id)
     if user:
@@ -409,6 +470,47 @@ def _resolve_return_url(payload_return_url: Optional[str]) -> str:
     return return_url
 
 
+async def _get_yookassa_payment(
+    *,
+    shop_id: str,
+    secret_key: str,
+    payment_id: str,
+) -> Dict[str, Any]:
+    logger.info("YooKassa get payment request: payment_id_tail=%s", _tail(payment_id))
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                f"https://api.yookassa.ru/v3/payments/{payment_id}",
+                auth=(shop_id, secret_key),
+            )
+    except httpx.HTTPError:
+        logger.exception("YooKassa get payment transport error: payment_id_tail=%s", _tail(payment_id))
+        raise HTTPException(status_code=502, detail="Cannot reach YooKassa")
+
+    if response.status_code >= 400:
+        logger.warning(
+            "YooKassa get payment rejected: status_code=%s payment_id_tail=%s body=%s",
+            response.status_code,
+            _tail(payment_id),
+            response.text[:1000],
+        )
+        raise HTTPException(status_code=502, detail="YooKassa rejected payment status request")
+
+    try:
+        data = response.json()
+    except ValueError:
+        logger.warning("YooKassa get payment invalid JSON response: payment_id_tail=%s", _tail(payment_id))
+        raise HTTPException(status_code=502, detail="Invalid YooKassa response")
+
+    logger.info(
+        "YooKassa get payment success: payment_id_tail=%s status=%s paid=%s",
+        _tail(payment_id),
+        str(data.get("status") or "").strip() or None,
+        bool(data.get("paid")),
+    )
+    return data
+
+
 async def _resolve_promocode_discount(promocode: Optional[str]) -> Tuple[Optional[str], int]:
     code = normalize_code(promocode or "")
     if not code:
@@ -439,6 +541,17 @@ async def _create_yookassa_payment(
     description: str,
     metadata: Dict[str, str],
 ) -> Dict[str, Any]:
+    logger.info(
+        "YooKassa create payment request: amount=%s currency=%s return_url=%s description=%s order_uid=%s tariff=%s email_masked=%s promo=%s",
+        _format_money(amount),
+        currency,
+        return_url,
+        description,
+        metadata.get("order_uid"),
+        metadata.get("tariff"),
+        _mask_email(metadata.get("email")),
+        metadata.get("promo") or None,
+    )
     payload = {
         "amount": {
             "value": _format_money(amount),
@@ -464,6 +577,12 @@ async def _create_yookassa_payment(
                 auth=(shop_id, secret_key),
             )
     except httpx.HTTPError:
+        logger.exception(
+            "YooKassa create payment transport error: order_uid=%s tariff=%s email_masked=%s",
+            metadata.get("order_uid"),
+            metadata.get("tariff"),
+            _mask_email(metadata.get("email")),
+        )
         raise HTTPException(status_code=502, detail="Cannot reach YooKassa")
 
     if response.status_code >= 400:
@@ -475,14 +594,132 @@ async def _create_yookassa_payment(
                 detail = f"{detail}: {message}"
         except Exception:
             pass
+        logger.warning(
+            "YooKassa create payment rejected: status_code=%s detail=%s order_uid=%s tariff=%s email_masked=%s body=%s",
+            response.status_code,
+            detail,
+            metadata.get("order_uid"),
+            metadata.get("tariff"),
+            _mask_email(metadata.get("email")),
+            response.text[:1000],
+        )
         raise HTTPException(status_code=502, detail=detail)
 
     try:
         data = response.json()
     except ValueError:
+        logger.warning(
+            "YooKassa create payment invalid JSON response: order_uid=%s tariff=%s email_masked=%s",
+            metadata.get("order_uid"),
+            metadata.get("tariff"),
+            _mask_email(metadata.get("email")),
+        )
         raise HTTPException(status_code=502, detail="Invalid YooKassa response")
 
+    logger.info(
+        "YooKassa create payment success: order_uid=%s payment_id_tail=%s status=%s confirmation_url_present=%s",
+        metadata.get("order_uid"),
+        _tail(str(data.get("id") or "")),
+        str(data.get("status") or "").strip() or None,
+        bool((data.get("confirmation") or {}).get("confirmation_url")),
+    )
     return data
+
+
+async def _activate_yookassa_succeeded_order(
+    *,
+    order: LandingYooKassaOrder,
+    payment_status: str,
+    payment_obj: Dict[str, Any],
+    event: str,
+) -> None:
+    if order.activated_at is not None and order.linked_user_id is not None:
+        logger.info("YooKassa activation skipped: already activated %s", _order_log_context(order))
+        return
+
+    user = await User.find_one(User.email == str(order.email).lower().strip())
+    if not user:
+        order.activation_error = "User with this email is not found"
+        await order.save()
+        logger.warning("YooKassa activation failed: user_not_found %s", _order_log_context(order))
+        return
+
+    plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == order.plan_code, SubscriptionPlan.status == "active")
+    if not plan:
+        order.activation_error = "Plan not found or inactive"
+        await order.save()
+        logger.warning("YooKassa activation failed: plan_not_found %s", _order_log_context(order))
+        return
+
+    provider_tx_id = str(order.yookassa_payment_id).strip()
+    tx = await SubscriptionTransaction.find_one(
+        {"source": SubscriptionSource.web.value, "store.provider_tx_id": provider_tx_id}
+    )
+    if not tx:
+        logger.info(
+            "YooKassa activation creating transaction: order_uid=%s payment_id_tail=%s user_id=%s plan_code=%s amount=%s currency=%s",
+            order.order_uid,
+            _tail(provider_tx_id),
+            str(user.id),
+            plan.code,
+            order.amount,
+            order.currency,
+        )
+        tx = SubscriptionTransaction(
+            user_id=user.id,
+            source=SubscriptionSource.web,
+            plan_code=plan.code,
+            amount=order.amount,
+            currency=order.currency,
+            store={
+                "status": "verified",
+                "verified_at": utcnow().isoformat(),
+                "provider": "yookassa",
+                "provider_tx_id": provider_tx_id,
+                "event": event,
+                "payload": payment_obj,
+            },
+            promo={
+                "code": order.promocode,
+                "discount_percent": order.discount_percent,
+            },
+        )
+        await tx.insert()
+    else:
+        logger.info(
+            "YooKassa activation reusing existing transaction: order_uid=%s payment_id_tail=%s tx_id=%s",
+            order.order_uid,
+            _tail(provider_tx_id),
+            str(tx.id),
+        )
+
+    sub = await upsert_subscription(
+        user_id=user.id,
+        plan_code=plan.code,
+        source=SubscriptionSource.web,
+        add_days=int(plan.duration_days),
+        tx_id=tx.id,
+    )
+    logger.info(
+        "YooKassa activation subscription upserted: order_uid=%s payment_id_tail=%s subscription_id=%s user_id=%s expires_at=%s",
+        order.order_uid,
+        _tail(provider_tx_id),
+        str(sub.id),
+        str(user.id),
+        sub.expires_at,
+    )
+
+    order.linked_user_id = user.id
+    order.activated_at = utcnow()
+    order.activation_error = None
+    order.yookassa_status = payment_status or "succeeded"
+    order.metadata = {
+        **dict(order.metadata or {}),
+        "subscription_id": str(sub.id),
+        "user_id": str(user.id),
+    }
+    await order.save()
+    logger.info("YooKassa activation completed: %s", _order_log_context(order))
 
 
 async def create_plan(payload: SubscriptionPlanCreateIn, current_user=Depends(get_current_user)):
@@ -561,10 +798,24 @@ async def activate_premium_by_product(payload: PremiumActivateByProductIn, curre
 @router.post("/subscription/web/yookassa/init", response_model=LandingYooKassaInitOut)
 async def init_web_yookassa_payment(payload: LandingYooKassaInitIn):
     tariff = (payload.tariff or "").strip()
+    logger.info(
+        "YooKassa init requested: tariff=%s email_masked=%s promo=%s return_url_present=%s fio_present=%s",
+        tariff,
+        _mask_email(payload.email),
+        normalize_code(payload.promocode or "") or None,
+        bool((payload.return_url or "").strip()),
+        bool((payload.fio or "").strip()),
+    )
     plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == tariff, SubscriptionPlan.status == "active")
     if not plan:
         available = await SubscriptionPlan.find(SubscriptionPlan.status == "active").to_list()
         available_codes = [p.code for p in available]
+        logger.warning(
+            "YooKassa init failed: tariff_not_found requested_tariff=%s available_tariffs=%s email_masked=%s",
+            tariff,
+            available_codes,
+            _mask_email(payload.email),
+        )
         raise HTTPException(
             status_code=404,
             detail={
@@ -584,6 +835,16 @@ async def init_web_yookassa_payment(payload: LandingYooKassaInitIn):
         )
         if amount <= Decimal("0"):
             amount = Decimal("0.01")
+    logger.info(
+        "YooKassa init pricing resolved: tariff=%s plan_code=%s base_amount=%s final_amount=%s currency=%s discount_percent=%s promo=%s",
+        tariff,
+        plan.code,
+        _format_money(base_amount),
+        _format_money(amount),
+        currency,
+        discount_percent,
+        promo_code,
+    )
 
     email_lc = str(payload.email).lower().strip()
     order_uid = uuid.uuid4().hex
@@ -609,6 +870,13 @@ async def init_web_yookassa_payment(payload: LandingYooKassaInitIn):
     payment_status = str(yookassa_data.get("status") or "").strip()
     confirmation_url = str((yookassa_data.get("confirmation") or {}).get("confirmation_url") or "").strip()
     if not payment_id or not confirmation_url:
+        logger.warning(
+            "YooKassa init failed: missing payment data order_uid=%s payment_id_tail=%s status=%s confirmation_url_present=%s",
+            order_uid,
+            _tail(payment_id),
+            payment_status or None,
+            bool(confirmation_url),
+        )
         raise HTTPException(status_code=502, detail="YooKassa response missing payment data")
 
     order = LandingYooKassaOrder(
@@ -633,6 +901,18 @@ async def init_web_yookassa_payment(payload: LandingYooKassaInitIn):
         payload=yookassa_data,
     )
     await order.insert()
+    logger.info(
+        "YooKassa init order stored: order_uid=%s payment_id_tail=%s status=%s plan_code=%s tariff=%s email_masked=%s promo=%s amount=%s currency=%s",
+        order_uid,
+        _tail(payment_id),
+        payment_status or "pending",
+        plan.code,
+        tariff,
+        _mask_email(email_lc),
+        promo_code,
+        float(amount),
+        currency,
+    )
 
     return LandingYooKassaInitOut(
         order_id=order_uid,
@@ -651,87 +931,56 @@ async def init_web_yookassa_payment(payload: LandingYooKassaInitIn):
 @router.post("/subscription/web/yookassa/webhook", response_model=YooKassaWebhookOut)
 async def yookassa_webhook(payload: Dict[str, Any], x_webhook_token: Optional[str] = Header(default=None)):
     if not webhook_token_ok(x_webhook_token):
+        logger.warning(
+            "YooKassa webhook rejected: invalid_token token_tail=%s payload_keys=%s",
+            _tail(x_webhook_token, size=4),
+            sorted(payload.keys()) if isinstance(payload, dict) else None,
+        )
         raise HTTPException(status_code=401, detail="Invalid webhook token")
 
     event = str(payload.get("event") or "").strip()
     payment_obj = payload.get("object") if isinstance(payload.get("object"), dict) else {}
     payment_id = str(payment_obj.get("id") or "").strip()
     payment_status = str(payment_obj.get("status") or "").strip().lower()
+    logger.info(
+        "YooKassa webhook received: event=%s payment_id_tail=%s payment_status=%s",
+        event or None,
+        _tail(payment_id),
+        payment_status or None,
+    )
 
     if not payment_id:
+        logger.warning("YooKassa webhook rejected: missing payment id event=%s", event or None)
         raise HTTPException(status_code=400, detail="Missing payment id")
 
     order = await LandingYooKassaOrder.find_one(LandingYooKassaOrder.yookassa_payment_id == payment_id)
     if not order:
+        logger.warning(
+            "YooKassa webhook ignored: order_not_found payment_id_tail=%s event=%s status=%s",
+            _tail(payment_id),
+            event or None,
+            payment_status or None,
+        )
         return YooKassaWebhookOut(ok=True)
 
+    logger.info("YooKassa webhook order matched: %s", _order_log_context(order))
     order.yookassa_status = payment_status or order.yookassa_status
     order.payload = payload
 
     if payment_status != "succeeded":
         await order.save()
-        return YooKassaWebhookOut(ok=True)
-
-    if order.activated_at is not None and order.linked_user_id is not None:
-        await order.save()
-        return YooKassaWebhookOut(ok=True)
-
-    user = await User.find_one(User.email == str(order.email).lower().strip())
-    if not user:
-        order.activation_error = "User with this email is not found"
-        await order.save()
-        return YooKassaWebhookOut(ok=True)
-
-    plan = await SubscriptionPlan.find_one(SubscriptionPlan.code == order.plan_code, SubscriptionPlan.status == "active")
-    if not plan:
-        order.activation_error = "Plan not found or inactive"
-        await order.save()
-        return YooKassaWebhookOut(ok=True)
-
-    provider_tx_id = payment_id
-    tx = await SubscriptionTransaction.find_one(
-        {"source": SubscriptionSource.web.value, "store.provider_tx_id": provider_tx_id}
-    )
-    if not tx:
-        tx = SubscriptionTransaction(
-            user_id=user.id,
-            source=SubscriptionSource.web,
-            plan_code=plan.code,
-            amount=order.amount,
-            currency=order.currency,
-            store={
-                "status": "verified",
-                "verified_at": utcnow().isoformat(),
-                "provider": "yookassa",
-                "provider_tx_id": provider_tx_id,
-                "event": event,
-                "payload": payment_obj,
-            },
-            promo={
-                "code": order.promocode,
-                "discount_percent": order.discount_percent,
-            },
+        logger.info(
+            "YooKassa webhook stored non-terminal/non-success status: %s",
+            _order_log_context(order),
         )
-        await tx.insert()
+        return YooKassaWebhookOut(ok=True)
 
-    sub = await upsert_subscription(
-        user_id=user.id,
-        plan_code=plan.code,
-        source=SubscriptionSource.web,
-        add_days=int(plan.duration_days),
-        tx_id=tx.id,
+    await _activate_yookassa_succeeded_order(
+        order=order,
+        payment_status=payment_status,
+        payment_obj=payment_obj,
+        event=event or "webhook",
     )
-
-    order.linked_user_id = user.id
-    order.activated_at = utcnow()
-    order.activation_error = None
-    order.yookassa_status = payment_status or "succeeded"
-    order.metadata = {
-        **dict(order.metadata or {}),
-        "subscription_id": str(sub.id),
-        "user_id": str(user.id),
-    }
-    await order.save()
     return YooKassaWebhookOut(ok=True)
 
 
@@ -739,11 +988,60 @@ async def yookassa_webhook(payload: Dict[str, Any], x_webhook_token: Optional[st
 async def yookassa_order_status(order_id: str):
     oid = (order_id or "").strip()
     if not oid:
+        logger.warning("YooKassa order status rejected: empty order_id")
         raise HTTPException(status_code=400, detail="order_id is required")
 
     order = await LandingYooKassaOrder.find_one(LandingYooKassaOrder.order_uid == oid)
     if not order:
+        logger.warning("YooKassa order status not found: order_uid=%s", oid)
         raise HTTPException(status_code=404, detail="Order not found")
+
+    if order.yookassa_payment_id and (order.yookassa_status or "").lower() in {"pending", "waiting_for_capture"}:
+        try:
+            shop_id, secret_key = _resolve_yookassa_credentials()
+            remote_payment = await _get_yookassa_payment(
+                shop_id=shop_id,
+                secret_key=secret_key,
+                payment_id=order.yookassa_payment_id,
+            )
+            remote_status = str(remote_payment.get("status") or "").strip().lower()
+            if remote_status and remote_status != (order.yookassa_status or "").lower():
+                logger.info(
+                    "YooKassa order status sync updated local status: order_uid=%s payment_id_tail=%s old_status=%s new_status=%s",
+                    order.order_uid,
+                    _tail(order.yookassa_payment_id),
+                    order.yookassa_status,
+                    remote_status,
+                )
+                order.yookassa_status = remote_status
+                order.payload = remote_payment
+                await order.save()
+
+            if remote_status == "succeeded":
+                await _activate_yookassa_succeeded_order(
+                    order=order,
+                    payment_status=remote_status,
+                    payment_obj=remote_payment,
+                    event="status_poll_sync",
+                )
+        except HTTPException as exc:
+            logger.warning(
+                "YooKassa order status sync failed: order_uid=%s payment_id_tail=%s status_code=%s detail=%s",
+                order.order_uid,
+                _tail(order.yookassa_payment_id),
+                exc.status_code,
+                exc.detail,
+            )
+
+    logger.info(
+        "YooKassa order status polled: order_uid=%s payment_id_tail=%s payment_status=%s activated=%s user_id=%s activation_error=%s",
+        order.order_uid,
+        _tail(order.yookassa_payment_id),
+        order.yookassa_status,
+        bool(order.activated_at and order.linked_user_id),
+        str(order.linked_user_id) if order.linked_user_id else None,
+        order.activation_error,
+    )
 
     return LandingYooKassaOrderStatusOut(
         order_id=order.order_uid,
