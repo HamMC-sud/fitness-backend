@@ -712,7 +712,10 @@ def _build_round_robin_workout_set_plan(
                     "exercise_code": serialized_selected.get("exercise_code"),
                     "code": serialized_selected.get("exercise_code"),
                     "name": serialized_selected.get("name"),
-                    "title": serialized_selected.get("name"),
+                    "title": serialized_selected.get("title"),
+                    "name_i18n": serialized_selected.get("name_i18n"),
+                    "description_i18n": serialized_selected.get("description_i18n"),
+                    "localization": serialized_selected.get("localization"),
                     "video_url": selected_video_url,
                     "thumbnail_url": serialized_selected.get("thumbnail_url"),
                     "video_mode": serialized_selected.get("mode"),
@@ -736,7 +739,10 @@ def _build_round_robin_workout_set_plan(
                         "exercise_code": serialized_selected.get("exercise_code"),
                         "code": serialized_selected.get("exercise_code"),
                         "name": serialized_selected.get("name"),
-                        "title": serialized_selected.get("name"),
+                        "title": serialized_selected.get("title"),
+                        "name_i18n": serialized_selected.get("name_i18n"),
+                        "description_i18n": serialized_selected.get("description_i18n"),
+                        "localization": serialized_selected.get("localization"),
                         "video_url": selected_video_url,
                         "thumbnail_url": serialized_selected.get("thumbnail_url"),
                         "video_mode": serialized_selected.get("mode"),
@@ -767,18 +773,52 @@ def _serialize_workout_exercise(ex: Exercise, rest_seconds_override: Optional[in
         if getattr(ex, "workout_type", None)
         else None
     )
+    title_i18n = {
+        "ru": _pick_i18n_text(getattr(ex, "name", None), "ru"),
+        "en": _pick_i18n_text(getattr(ex, "name", None), "en"),
+    }
+    description_i18n = {
+        "ru": _pick_i18n_text(getattr(ex, "description", None), "ru"),
+        "en": _pick_i18n_text(getattr(ex, "description", None), "en"),
+    }
+    instructions_payload = [
+        {
+            "step": int(getattr(item, "step", 0) or 0),
+            "title": {
+                "ru": _pick_i18n_text(getattr(item, "title", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "title", None), "en"),
+            },
+            "description": {
+                "ru": _pick_i18n_text(getattr(item, "description", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "description", None), "en"),
+            },
+        }
+        for item in list(getattr(ex, "instructions", None) or [])
+    ]
+    common_mistakes_payload = [
+        {
+            "title": {
+                "ru": _pick_i18n_text(getattr(item, "title", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "title", None), "en"),
+            },
+            "description": {
+                "ru": _pick_i18n_text(getattr(item, "description", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "description", None), "en"),
+            },
+        }
+        for item in list(getattr(ex, "common_mistakes", None) or [])
+    ]
     return {
         "exercise_id": str(ex.id),
         "exercise_code": getattr(ex, "code", None),
-        "name": _pick_i18n_text(getattr(ex, "name", None), "en"),
-        "name_i18n": {
-            "ru": _pick_i18n_text(getattr(ex, "name", None), "ru"),
-            "en": _pick_i18n_text(getattr(ex, "name", None), "en"),
-        },
-        "description": _pick_i18n_text(getattr(ex, "description", None), "en"),
-        "description_i18n": {
-            "ru": _pick_i18n_text(getattr(ex, "description", None), "ru"),
-            "en": _pick_i18n_text(getattr(ex, "description", None), "en"),
+        "name": title_i18n["en"],
+        "title": title_i18n,
+        "name_i18n": title_i18n,
+        "description": description_i18n["en"],
+        "description_i18n": description_i18n,
+        "localization": {
+            "title": title_i18n,
+            "description": description_i18n,
         },
         "mode": mode_value,
         "workout_type": worktype_value,
@@ -786,6 +826,8 @@ def _serialize_workout_exercise(ex: Exercise, rest_seconds_override: Optional[in
             "ru": _worktype_label(worktype_value, "ru"),
             "en": _worktype_label(worktype_value, "en"),
         },
+        "instructions": instructions_payload,
+        "common_mistakes": common_mistakes_payload,
         "level": str(ex.difficulty.value if hasattr(ex.difficulty, "value") else ex.difficulty),
         "thumbnail_url": ensure_existing_media_url(
             getattr(media, "thumbnail_url", None) if media else None,
@@ -962,43 +1004,9 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
     if ex.status != "active":
         raise HTTPException(status_code=404, detail="Workout template is inactive")
 
-    wm = _derive_exercise_workout_metrics(ex)
     media = getattr(ex, "media", None)
-    source_mode = getattr(ex, "mode", None)
-    source_level = getattr(ex, "difficulty", None)
-    source_worktype = (
-        str(ex.workout_type[0].value if hasattr(ex.workout_type[0], "value") else ex.workout_type[0])
-        if getattr(ex, "workout_type", None)
-        else None
-    )
-    source_muscle_filter = _source_muscle_similarity_filter(ex)
-
-    companion_filters: list[Any] = [
-        Exercise.status == "active",
-        {"_id": {"$ne": ex.id}},
-    ]
-    if source_level is not None:
-        companion_filters.append(Exercise.difficulty == source_level)
-    if source_mode:
-        companion_filters.append(Exercise.mode == source_mode)
-    companion_worktype_filter = _workout_type_filter(source_worktype)
-    if companion_worktype_filter:
-        companion_filters.append(companion_worktype_filter)
-    if source_muscle_filter:
-        companion_filters.append(source_muscle_filter)
-
-    companion_rows = await Exercise.find(*companion_filters).sort("-created_at").limit(2).to_list()
-    logger.info(
-        "Workout details companion query: exercise_id=%s code=%s worktype_filter=%s source_muscle_filter=%s companion_count=%s",
-        str(ex.id),
-        str(getattr(ex, "code", None) or ""),
-        companion_worktype_filter,
-        source_muscle_filter,
-        len(companion_rows),
-    )
-    compound_exercises = [ex, *companion_rows]
     rest_override = int(getattr(current_user, "training_rest_seconds", 0) or 0) or None
-    serialized_exercises = [_serialize_workout_exercise(item, rest_seconds_override=rest_override) for item in compound_exercises]
+    serialized_exercises = [_serialize_workout_exercise(ex, rest_seconds_override=rest_override)]
     workout_set_plan = _build_round_robin_workout_set_plan(ex, serialized_exercises)
 
     total_sets = sum(int(item.get("total_sets", 0) or 0) for item in serialized_exercises)
@@ -1011,6 +1019,34 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
 
     set_summaries = _build_set_summaries(workout_set_plan)
     ai_tip = getattr(ex, "ai_technique", None)
+    ai_mistakes = getattr(ex, "ai_mistakes", None)
+    instructions_payload = [
+        {
+            "step": int(getattr(item, "step", 0) or 0),
+            "title": {
+                "ru": _pick_i18n_text(getattr(item, "title", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "title", None), "en"),
+            },
+            "description": {
+                "ru": _pick_i18n_text(getattr(item, "description", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "description", None), "en"),
+            },
+        }
+        for item in list(getattr(ex, "instructions", None) or [])
+    ]
+    common_mistakes_payload = [
+        {
+            "title": {
+                "ru": _pick_i18n_text(getattr(item, "title", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "title", None), "en"),
+            },
+            "description": {
+                "ru": _pick_i18n_text(getattr(item, "description", None), "ru"),
+                "en": _pick_i18n_text(getattr(item, "description", None), "en"),
+            },
+        }
+        for item in list(getattr(ex, "common_mistakes", None) or [])
+    ]
     logger.info(
         "Workout details payload: exercise_id=%s code=%s mode=%s total_sets=%s total_reps=%s total_seconds=%s exercises_count=%s set_plan=%s",
         str(ex.id),
@@ -1044,6 +1080,12 @@ async def discover_workout_details(template_id: PydanticObjectId, current_user: 
             "ru": _pick_i18n_text(ai_tip, "ru"),
             "en": _pick_i18n_text(ai_tip, "en"),
         },
+        "ai_common_mistakes": {
+            "ru": _pick_i18n_text(ai_mistakes, "ru"),
+            "en": _pick_i18n_text(ai_mistakes, "en"),
+        },
+        "instructions": instructions_payload,
+        "common_mistakes": common_mistakes_payload,
         "worktype": (
             str(ex.workout_type[0].value if hasattr(ex.workout_type[0], "value") else ex.workout_type[0])
             if getattr(ex, "workout_type", None)
