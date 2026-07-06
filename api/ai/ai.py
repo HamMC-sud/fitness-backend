@@ -9,11 +9,13 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
-import httpx
 from beanie.odm.fields import PydanticObjectId
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.auth.config import get_current_user
+from api.ai.ai_chat_decision import get_ai_chat_decision, sanitize_decision_meta
+from api.ai.ai_request_validator import get_plan_generation_access
+from api.ai.yandex_client import yandex_chat_completion, yandex_completion
 from api.ai.request_understanding import (
     apply_understanding_to_meta,
     detect_plan_intent,
@@ -66,16 +68,6 @@ from schemas.ai import (
 router = APIRouter(tags=["ai"])
 logger = logging.getLogger("uvicorn.error")
 
-YC_API_KEY_SECRET = (os.getenv("YC_API_KEY_SECRET") or os.getenv("YANDEX_API_KEY") or "").strip()
-YC_FOLDER_ID = (os.getenv("YC_FOLDER_ID") or os.getenv("YANDEX_FOLDER_ID") or "").strip()
-YC_GPT_MODEL_URI = (os.getenv("YC_GPT_MODEL_URI") or os.getenv("YANDEX_GPT_MODEL_URI") or "").strip()
-YC_COMPLETION_URL = (
-    os.getenv("YC_COMPLETION_URL")
-    or os.getenv("YANDEX_COMPLETION_URL")
-    or "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
-).strip()
-
-
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -98,6 +90,15 @@ def _as_str(v: Any) -> str:
     if hasattr(v, "value"):
         return str(getattr(v, "value"))
     return str(v)
+
+
+def _short_text_preview(text: str, limit: int = 160) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip())[:limit]
+
+
+def _contains_any(text: str, markers: list[str]) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in markers)
 
 
 def _as_str_list(v: Any) -> list[str]:
@@ -300,7 +301,7 @@ def _localized_safety_messages(language: str) -> list[str]:
 def _localized_workout_title(goal_label: str, language: str) -> str:
     if _is_russian_language(language):
         return f"Тренировка: {goal_label}"
-    return f"AI {goal_label} session"
+    return f"{goal_label} workout"
 
 
 def _pick_i18n_value(i18n_obj: Any, language: str) -> str:
@@ -310,11 +311,51 @@ def _pick_i18n_value(i18n_obj: Any, language: str) -> str:
     return str(value or "").strip()
 
 
+def _display_goal_label(goal: str, language: str) -> str:
+    token = str(goal or "").strip().lower()
+    if _is_russian_language(language):
+        return _localized_goal_label(token, language)
+    return {
+        "lose_weight": "Weight loss",
+        "build_muscle": "Muscle gain",
+        "get_fitter": "General fitness",
+        "endurance": "Endurance",
+        "flexibility": "Flexibility",
+        "strength": "Strength",
+        "cardio": "Cardio",
+        "hiit": "HIIT",
+        "stretching": "Stretching",
+        "yoga": "Yoga",
+    }.get(token, "General fitness")
+
+
+def _humanize_ai_label(value: Any, *, language: str, fallback: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return fallback
+
+    text = raw.replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"^(?:ai\s+)+", "", text, flags=re.IGNORECASE).strip(" :_-")
+    lowered = text.lower()
+    if lowered in {"session", "workout", "workout session", "training"}:
+        return fallback
+
+    if not _has_cyrillic(text):
+        preserve = {"HIIT", "EMOM", "AMRAP", "TABATA"}
+        text = " ".join(
+            part.upper() if part.upper() in preserve else part.capitalize()
+            for part in text.split()
+        ).strip()
+
+    return text or fallback
+
+
 def _localized_workout_title_i18n(focus_value: str) -> Dict[str, str]:
     focus = str(focus_value or "get_fitter").strip().lower() or "get_fitter"
     return {
-        "en": _localized_workout_title(_localized_goal_label(focus, "en"), "en"),
-        "ru": _localized_workout_title(_localized_goal_label(focus, "ru"), "ru"),
+        "en": _localized_workout_title(_display_goal_label(focus, "en"), "en"),
+        "ru": _localized_workout_title(_display_goal_label(focus, "ru"), "ru"),
     }
 
 
@@ -354,7 +395,7 @@ def _localized_display_workout_title(workout_template: Any, language: str) -> st
     existing_title = str(wt.get("title") or "").strip()
     if _should_replace_with_localized_title(existing_title, language):
         return fallback
-    return existing_title or fallback
+    return _humanize_ai_label(existing_title, language=language, fallback=fallback)
 
 
 def _normalize_plan_day_language(day_obj: dict[str, Any], language: str) -> dict[str, Any]:
@@ -651,6 +692,9 @@ def _normalize_ai_exercise_contract(
     normalized["rest_between_sets_seconds"] = int(metrics["rest_between_sets_seconds"])
     normalized["rest_seconds_after_exercise"] = int(metrics["rest_seconds_after_exercise"])
     normalized["duration_min"] = int(metrics["total_minutes"])
+    fallback_name = "Упражнение" if _is_russian_language(str(normalized.get("language") or "")) else "Exercise"
+    normalized["name"] = _humanize_ai_label(normalized.get("name"), language=str(normalized.get("language") or ""), fallback=fallback_name)
+    normalized["title_text"] = normalized["name"]
     return normalized
 
 
@@ -777,13 +821,19 @@ def _localize_exercise_payload(
     exercise_by_code: dict[str, Exercise],
 ) -> Dict[str, Any]:
     row = _enrich_saved_plan_exercise_media(item, language)
+    row["language"] = language
     exercise_id = str(row.get("exercise_id") or "").strip()
     exercise_code = str(row.get("exercise_code") or "").strip()
     ex_obj = exercise_by_id.get(exercise_id) or exercise_by_code.get(exercise_code)
     if not ex_obj:
         saved_name = str(row.get("name") or "").strip()
         title_map = row.get("title") if isinstance(row.get("title"), dict) else {}
-        row["name"] = _pick_i18n_value(title_map, language) or saved_name
+        fallback_name = "Упражнение" if _is_russian_language(language) else "Exercise"
+        row["name"] = _humanize_ai_label(
+            _pick_i18n_value(title_map, language) or saved_name,
+            language=language,
+            fallback=fallback_name,
+        )
         row["title_text"] = row["name"]
         if isinstance(row.get("subtitle"), dict):
             row["subtitle_text"] = _pick_i18n_value(row.get("subtitle"), language)
@@ -799,7 +849,11 @@ def _localize_exercise_payload(
         "ru": _pick_i18n_text(getattr(ex_obj, "name", None), "ru", default=str(row.get("name") or "")),
         "en": _pick_i18n_text(getattr(ex_obj, "name", None), "en", default=str(row.get("name") or "")),
     }
-    row["name"] = _pick_i18n_text(getattr(ex_obj, "name", None), language, default=str(row.get("name") or "Exercise"))
+    row["name"] = _humanize_ai_label(
+        _pick_i18n_text(getattr(ex_obj, "name", None), language, default=str(row.get("name") or "Exercise")),
+        language=language,
+        fallback="Упражнение" if _is_russian_language(language) else "Exercise",
+    )
     row["title_text"] = row["name"]
     row["description_i18n"] = {
         "ru": _pick_i18n_text(getattr(ex_obj, "description", None), "ru"),
@@ -1583,103 +1637,6 @@ async def _ai_understand_plan_prompt(prompt_text: str, base_meta: Dict[str, Any]
     return out
 
 
-async def yandex_completion(
-    messages: list[dict[str, str]],
-    *,
-    temperature: float = 0.4,
-    max_tokens: int = 1400,
-) -> Optional[str]:
-    if not YC_API_KEY_SECRET:
-        logger.warning(
-            "Yandex completion skipped: missing YC_API_KEY_SECRET; endpoint=%s folder_id=%s model_uri=%s",
-            YC_COMPLETION_URL,
-            bool(YC_FOLDER_ID),
-            bool(YC_GPT_MODEL_URI),
-        )
-        return None
-
-    model_uri = YC_GPT_MODEL_URI or (f"gpt://{YC_FOLDER_ID}/yandexgpt/latest" if YC_FOLDER_ID else "")
-    if not model_uri:
-        logger.warning(
-            "Yandex completion skipped: model URI is empty; endpoint=%s YC_FOLDER_ID=%s YC_GPT_MODEL_URI=%s",
-            YC_COMPLETION_URL,
-            bool(YC_FOLDER_ID),
-            bool(YC_GPT_MODEL_URI),
-        )
-        return None
-
-    body = {
-        "modelUri": model_uri,
-        "completionOptions": {
-            "stream": False,
-            "temperature": temperature,
-            "maxTokens": max_tokens,
-        },
-        "messages": messages,
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(
-                YC_COMPLETION_URL,
-                headers={"Authorization": f"Api-Key {YC_API_KEY_SECRET}"},
-                json=body,
-            )
-    except httpx.TimeoutException as exc:
-        logger.error(
-            "Yandex completion timeout: endpoint=%s model_uri=%s error=%s",
-            YC_COMPLETION_URL,
-            model_uri,
-            str(exc),
-        )
-        return None
-    except httpx.ConnectError as exc:
-        logger.error(
-            "Yandex completion connection error: endpoint=%s model_uri=%s error=%s",
-            YC_COMPLETION_URL,
-            model_uri,
-            str(exc),
-        )
-        return None
-    except httpx.HTTPError as exc:
-        logger.error(
-            "Yandex completion HTTP error: endpoint=%s model_uri=%s error=%s",
-            YC_COMPLETION_URL,
-            model_uri,
-            str(exc),
-        )
-        return None
-
-    if r.status_code != 200:
-        response_preview = (r.text or "")[:500]
-        request_id = r.headers.get("x-request-id") or r.headers.get("x-request-id".title()) or r.headers.get("x-trace-id")
-        logger.warning(
-            "Yandex completion non-200 response: status=%s endpoint=%s model_uri=%s request_id=%s body=%s",
-            r.status_code,
-            YC_COMPLETION_URL,
-            model_uri,
-            request_id,
-            response_preview,
-        )
-        return None
-
-    try:
-        data = r.json()
-        return str(data["result"]["alternatives"][0]["message"]["text"]).strip()
-    except Exception as exc:
-        response_preview = (r.text or "")[:500]
-        request_id = r.headers.get("x-request-id") or r.headers.get("x-request-id".title()) or r.headers.get("x-trace-id")
-        logger.error(
-            "Yandex completion parse error: endpoint=%s model_uri=%s request_id=%s error=%s response=%s",
-            YC_COMPLETION_URL,
-            model_uri,
-            request_id,
-            str(exc),
-            response_preview,
-        )
-        return None
-
-
 async def _load_exercises_for_planning(
     injuries: set[str],
     equipment: set[str],
@@ -1748,10 +1705,9 @@ def _build_workout_template(
         selected_pool.extend(ex for ex in pool_shuffled if str(ex.id) in recent_ids)
     selected = selected_pool[:exercise_count] if len(selected_pool) >= exercise_count else selected_pool
     if not selected:
-        goal_label = goals[0] if goals else "get_fitter"
         focus_label = _localized_type_label(target_type, language)
         return {
-            "title": _localized_workout_title(_localized_goal_label(goal_label, language), language),
+            "title": _localized_workout_title(_display_goal_label(target_type, language), language),
             "title_i18n": _localized_workout_title_i18n(target_type),
             "duration_min": duration_min,
             "intensity": intensity,
@@ -1857,10 +1813,9 @@ def _build_workout_template(
         item["set_plan"] = set_plan
         exercise_items.append(item)
 
-    goal_label = goals[0] if goals else "get_fitter"
     focus_label = _localized_type_label(target_type, language)
     return {
-        "title": _localized_workout_title(_localized_goal_label(goal_label, language), language),
+        "title": _localized_workout_title(_display_goal_label(target_type, language), language),
         "title_i18n": _localized_workout_title_i18n(target_type),
         "duration_min": duration_min,
         "intensity": intensity,
@@ -2286,6 +2241,206 @@ async def has_monthly_reroll(user_id: PydanticObjectId) -> bool:
     ) is not None
 
 
+def _chat_generate_plan_label(language: str) -> str:
+    return "Сгенерировать план" if _is_russian_language(language) else "Generate plan"
+
+
+def _chat_plan_ready_text(language: str, *, regenerated: bool = False) -> str:
+    if _is_russian_language(language):
+        return "План обновлен и готов." if regenerated else "План готов."
+    return "Your plan has been updated." if regenerated else "Your plan is ready."
+
+
+def _chat_generate_button_text(language: str) -> str:
+    if _is_russian_language(language):
+        return "Могу собрать план по этому запросу. Нажми кнопку, и я его сгенерирую."
+    return "I can build a plan from this request. Tap the button and I'll generate it."
+
+
+def _combine_history_for_plan_prompt(history: list[dict[str, str]], text: str, limit: int = 6) -> str:
+    parts = [str((item or {}).get("text") or "").strip() for item in (history[-limit:] if history else [])]
+    parts.append(str(text or "").strip())
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _combine_user_history_for_plan_prompt(history: list[dict[str, str]], text: str, limit: int = 6) -> str:
+    parts = [
+        str((item or {}).get("text") or "").strip()
+        for item in (history[-limit:] if history else [])
+        if str((item or {}).get("role") or "").lower() == "user"
+    ]
+    parts.append(str(text or "").strip())
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _has_lose_weight_context(text: str) -> bool:
+    lowered = str(text or "").lower()
+    markers = [
+        "жир",
+        "живот",
+        "похуд",
+        "сжечь жир",
+        "сбросить вес",
+        "снижение веса",
+        "lose weight",
+        "weight loss",
+        "fat loss",
+        "burn fat",
+        "belly fat",
+        "slim down",
+        "pohud",
+        "zhir",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def _apply_safe_decision_meta_hints(meta: Dict[str, Any], decision_meta: Dict[str, Any], combined_user_text: str) -> Dict[str, Any]:
+    out = dict(meta or {})
+    safe_meta = sanitize_decision_meta(decision_meta or {})
+
+    if _has_lose_weight_context(combined_user_text):
+        goals = _normalize_goal_values(out.get("goals"))
+        if "lose_weight" not in goals:
+            goals.insert(0, "lose_weight")
+        out["goals"] = goals or ["lose_weight"]
+
+        body_focus = _as_str_list(out.get("body_focus"))
+        if "core" not in body_focus and _contains_any(combined_user_text, ["живот", "belly", "core", "пресс", "press"]):
+            body_focus.append("core")
+        if body_focus:
+            out["body_focus"] = body_focus
+
+    for key in ("equipment", "injuries", "location", "style", "level", "intensity", "body_focus"):
+        if safe_meta.get(key) and not out.get(key):
+            out[key] = safe_meta[key]
+
+    if safe_meta.get("goals"):
+        existing_goals = _normalize_goal_values(out.get("goals"))
+        hinted_goals = _normalize_goal_values(safe_meta.get("goals"))
+        merged_goals = list(existing_goals)
+        for goal in hinted_goals:
+            if goal not in merged_goals:
+                merged_goals.append(goal)
+        if merged_goals:
+            out["goals"] = merged_goals
+
+    return out
+
+
+async def _prepare_plan_generation_inputs(
+    *,
+    prompt_text: str,
+    base_meta: Dict[str, Any],
+) -> tuple[Dict[str, Any], int, bool]:
+    meta = dict(base_meta or {})
+    total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
+    enforce_rest_distribution = False
+
+    text = str(prompt_text or "").strip()
+    if not text:
+        return meta, total_days, enforce_rest_distribution
+
+    explicit_overrides = _extract_explicit_schedule_overrides(text)
+    ai_meta = await _ai_understand_plan_prompt(text, meta)
+    if ai_meta:
+        meta.update(ai_meta)
+        meta.update(explicit_overrides)
+        total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
+        enforce_rest_distribution = bool(meta.get("rest_days") is not None and meta.get("rest_days_strict", False))
+        return meta, total_days, enforce_rest_distribution
+
+    parse_meta = _meta_without_duration_overrides(meta)
+    understanding = parse_plan_request(text, parse_meta)
+    total_days = int(understanding.total_days)
+    meta = apply_understanding_to_meta(meta, understanding)
+    meta.update(explicit_overrides)
+    enforce_rest_distribution = has_explicit_rest_day_request(text, parse_meta)
+    return meta, total_days, enforce_rest_distribution
+
+
+async def _generate_plan_for_user(
+    current_user: Any,
+    *,
+    prompt_text: str,
+    base_meta: Dict[str, Any],
+    usage: Optional[AiUsageMonthly],
+    req_type: AiRequestType = AiRequestType.generate_plan,
+    version: int = 1,
+    reroll_of_plan_id: Optional[PydanticObjectId] = None,
+) -> tuple[AiPlan, AiRequest, Dict[str, Any], int]:
+    meta, total_days, enforce_rest_distribution = await _prepare_plan_generation_inputs(
+        prompt_text=prompt_text,
+        base_meta=base_meta,
+    )
+    req = await create_ai_request(
+        user_id=current_user.id,
+        req_type=req_type,
+        prompt_meta=meta,
+    )
+
+    days = await _try_generate_plan_with_yandex(current_user, meta, total_days=total_days)
+    if not days:
+        logger.warning(
+            "AI plan generation fallback to local builder: user_id=%s total_days=%s req_type=%s",
+            str(current_user.id),
+            int(total_days),
+            str(req_type.value if hasattr(req_type, "value") else req_type),
+        )
+        days = await build_plan_days(current_user, meta, total_days=total_days)
+    elif _plan_has_low_variety(days):
+        logger.warning(
+            "AI plan generation low-variety fallback: user_id=%s total_days=%s req_type=%s",
+            str(current_user.id),
+            int(total_days),
+            str(req_type.value if hasattr(req_type, "value") else req_type),
+        )
+        days = await build_plan_days(current_user, meta, total_days=total_days)
+
+    if enforce_rest_distribution and days and not validate_plan_distribution(
+        days,
+        total_days=int(meta.get("total_days", total_days)),
+        rest_days=meta.get("rest_days"),
+        strict=bool(meta.get("rest_days_strict", False)),
+    ):
+        days = await build_plan_days(current_user, meta, total_days=total_days)
+
+    if enforce_rest_distribution and days and not validate_plan_distribution(
+        days,
+        total_days=int(meta.get("total_days", total_days)),
+        rest_days=meta.get("rest_days"),
+        strict=bool(meta.get("rest_days_strict", False)),
+    ):
+        await fail_ai_request(
+            req,
+            "Generated plan does not match requested rest-day distribution.",
+            status_code=422,
+        )
+
+    if not days:
+        await fail_ai_request(
+            req,
+            "AI did not return a valid plan JSON. Plan was not created.",
+            status_code=503,
+        )
+
+    if usage is not None:
+        usage.used += 1
+        await usage.save()
+
+    await archive_active_plans(current_user.id)
+
+    plan = AiPlan(
+        user_id=current_user.id,
+        status="active",
+        created_from=meta,
+        days=days,
+        version=version,
+        reroll_of_plan_id=reroll_of_plan_id,
+    )
+    await plan.insert()
+    return plan, req, meta, total_days
+
+
 def _extract_plan_duration_days(text: str) -> int:
     """Parse requested duration in days from a user message. Defaults to 30."""
     lower = re.sub(r"\s+", " ", text.lower()).strip().replace("ё", "е")
@@ -2323,36 +2478,6 @@ def _extract_plan_duration_days(text: str) -> int:
         return 30
 
     return 30
-
-
-async def yandex_chat_completion(
-    text: str,
-    meta: Dict[str, Any],
-    history: Optional[list[dict[str, str]]] = None,
-) -> str:
-    if not YC_API_KEY_SECRET:
-        return "AI assistant is configured in stub mode. Add YC_API_KEY_SECRET or YANDEX_API_KEY to enable Yandex GPT."
-
-    model_uri = YC_GPT_MODEL_URI or (f"gpt://{YC_FOLDER_ID}/yandexgpt/latest" if YC_FOLDER_ID else "")
-    if not model_uri:
-        return "AI assistant is configured in stub mode. Add YC_FOLDER_ID/YANDEX_FOLDER_ID or YC_GPT_MODEL_URI/YANDEX_GPT_MODEL_URI for Yandex GPT."
-
-    sys_text = (
-        "You are a fitness assistant. Give safe, concise, actionable advice. "
-        "If user asks medical-risk topic, recommend consulting a professional."
-    )
-    if meta:
-        sys_text += f" Context meta: {json.dumps(meta, ensure_ascii=True)}"
-
-    messages: list[dict[str, str]] = [{"role": "system", "text": sys_text}]
-    if history:
-        messages.extend(history[-12:])
-    messages.append({"role": "user", "text": text})
-
-    res = await yandex_completion(messages, temperature=0.6, max_tokens=800)
-    if res:
-        return res
-    return "AI service is temporarily unavailable. Please try again."
 
 
 async def build_limits(user_id: PydanticObjectId) -> AiLimitsOut:
@@ -2460,91 +2585,18 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
         base_meta["workouts_per_week"] = int(payload.workouts_per_week)
 
     prompt_text = str(payload.text or "").strip()
-    enforce_rest_distribution = False
-    if prompt_text:
-        explicit_overrides = _extract_explicit_schedule_overrides(prompt_text)
-        ai_meta = await _ai_understand_plan_prompt(prompt_text, base_meta)
-        if ai_meta:
-            meta = dict(base_meta)
-            meta.update(ai_meta)
-            meta.update(explicit_overrides)
-            total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
-            enforce_rest_distribution = bool(meta.get("rest_days") is not None and meta.get("rest_days_strict", False))
-        else:
-            try:
-                parse_meta = _meta_without_duration_overrides(base_meta)
-                understanding = parse_plan_request(prompt_text, parse_meta)
-            except ValueError as e:
-                raise HTTPException(422, f"Plan request is inconsistent: {str(e)}")
-            meta = apply_understanding_to_meta(base_meta, understanding)
-            meta.update(explicit_overrides)
-            total_days = int(understanding.total_days)
-            enforce_rest_distribution = has_explicit_rest_day_request(prompt_text, parse_meta)
-    else:
-        meta = base_meta
-        total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
-
-    req = await create_ai_request(
-        user_id=current_user.id,
-        req_type=AiRequestType.generate_plan,
-        prompt_meta=meta,
-    )
-
-    days = await _try_generate_plan_with_yandex(current_user, meta, total_days=total_days)
-    if not days:
-        logger.warning(
-            "AI generate-plan fallback to local builder: user_id=%s total_days=%s",
-            str(current_user.id),
-            int(total_days),
+    try:
+        plan, req, meta, _ = await _generate_plan_for_user(
+            current_user,
+            prompt_text=prompt_text,
+            base_meta=base_meta,
+            usage=usage,
+            req_type=AiRequestType.generate_plan,
+            version=1,
+            reroll_of_plan_id=None,
         )
-        days = await build_plan_days(current_user, meta, total_days=total_days)
-    elif _plan_has_low_variety(days):
-        logger.warning(
-            "AI generate-plan low-variety fallback: user_id=%s total_days=%s reason=repetitive_exercises",
-            str(current_user.id),
-            int(total_days),
-        )
-        days = await build_plan_days(current_user, meta, total_days=total_days)
-    if enforce_rest_distribution and days and not validate_plan_distribution(
-        days,
-        total_days=int(meta.get("total_days", total_days)),
-        rest_days=meta.get("rest_days"),
-        strict=bool(meta.get("rest_days_strict", False)),
-    ):
-        days = await build_plan_days(current_user, meta, total_days=total_days)
-    if enforce_rest_distribution and days and not validate_plan_distribution(
-        days,
-        total_days=int(meta.get("total_days", total_days)),
-        rest_days=meta.get("rest_days"),
-        strict=bool(meta.get("rest_days_strict", False)),
-    ):
-        await fail_ai_request(
-            req,
-            "Generated plan does not match requested rest-day distribution.",
-            status_code=422,
-        )
-    if not days:
-        await fail_ai_request(
-            req,
-            "AI did not return a valid plan JSON. Plan was not created.",
-            status_code=503,
-        )
-
-    if usage is not None:
-        usage.used += 1
-        await usage.save()
-
-    await archive_active_plans(current_user.id)
-
-    plan = AiPlan(
-        user_id=current_user.id,
-        status="active",
-        created_from=meta,
-        days=days,
-        version=1,
-        reroll_of_plan_id=None,
-    )
-    await plan.insert()
+    except ValueError as e:
+        raise HTTPException(422, f"Plan request is inconsistent: {str(e)}")
 
     return AiGenerateOut(
         request_id=str(req.id),
@@ -2803,7 +2855,7 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
         str(current_user.id),
         str(payload.thread_id or ""),
         premium,
-        message_text[:2000],
+        _short_text_preview(message_text),
     )
 
     thread = None
@@ -2834,14 +2886,20 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
     await user_message.insert()
 
     action: Optional[Dict[str, Any]] = None
+    assistant_text = ""
+    decision = await get_ai_chat_decision(
+        text=payload.text,
+        history=history,
+        meta=payload.meta or {},
+        language=language,
+    )
+    combined_text = _combine_history_for_plan_prompt(history, payload.text)
+    combined_user_text = _combine_user_history_for_plan_prompt(history, payload.text)
     regen_intent = detect_plan_regeneration_intent(payload.text)
     plan_intent = detect_plan_intent(payload.text)
-    logger.info(
-        "AI chat intent: user_id=%s regen_intent=%s plan_intent=%s",
-        str(current_user.id),
-        bool(regen_intent),
-        bool(plan_intent),
-    )
+
+    if decision.fallback_used and regen_intent:
+        decision.type = "generate_plan_now"
 
     if regen_intent:
         active_plan = await get_active_plan(current_user.id)
@@ -2860,36 +2918,20 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
             total_days = len(active_plan.days or []) or 30
 
             if premium:
-                regen_req = await create_ai_request(
-                    user_id=current_user.id,
-                    req_type=AiRequestType.adjust,
-                    prompt_meta=prompt_meta,
-                )
                 try:
-                    days = await _try_generate_plan_with_yandex(current_user, prompt_meta, total_days=total_days)
-                    if not days:
-                        await fail_ai_request(
-                            regen_req,
-                            "AI did not return a valid regenerated plan JSON. Regeneration was not created.",
-                            status_code=503,
-                        )
-
-                    await archive_active_plans(current_user.id)
-                    regenerated_plan = AiPlan(
-                        user_id=current_user.id,
-                        status="active",
-                        created_from=prompt_meta,
-                        days=days,
+                    regenerated_plan, _, _, _ = await _generate_plan_for_user(
+                        current_user,
+                        prompt_text=combined_user_text,
+                        base_meta=prompt_meta,
+                        usage=None,
+                        req_type=AiRequestType.adjust,
                         version=int(active_plan.version or 1) + 1,
                         reroll_of_plan_id=active_plan.id,
                     )
-                    await regenerated_plan.insert()
-
-                    assistant_text = "I regenerated your current plan with updated parameters."
+                    assistant_text = _chat_plan_ready_text(language, regenerated=True)
                     action = {
-                        "type": "plan_regenerated",
+                        "type": "plan_generated",
                         "plan_id": str(regenerated_plan.id),
-                        "base_plan_id": str(active_plan.id),
                         "total_days": total_days,
                     }
                 except HTTPException:
@@ -2904,36 +2946,20 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                         "Upgrade to Premium for unlimited plan adjustments."
                     )
                 else:
-                    reroll_req = await create_ai_request(
-                        user_id=current_user.id,
-                        req_type=AiRequestType.reroll,
-                        prompt_meta=prompt_meta,
-                    )
                     try:
-                        days = await _try_generate_plan_with_yandex(current_user, prompt_meta, total_days=total_days)
-                        if not days:
-                            await fail_ai_request(
-                                reroll_req,
-                                "AI did not return a valid reroll plan JSON. Reroll was not created.",
-                                status_code=503,
-                            )
-
-                        await archive_active_plans(current_user.id)
-                        rerolled_plan = AiPlan(
-                            user_id=current_user.id,
-                            status="active",
-                            created_from=prompt_meta,
-                            days=days,
+                        rerolled_plan, _, _, _ = await _generate_plan_for_user(
+                            current_user,
+                            prompt_text=combined_user_text,
+                            base_meta=prompt_meta,
+                            usage=None,
+                            req_type=AiRequestType.reroll,
                             version=int(active_plan.version or 1) + 1,
                             reroll_of_plan_id=active_plan.id,
                         )
-                        await rerolled_plan.insert()
-
-                        assistant_text = "Your plan was rerolled with updated parameters."
+                        assistant_text = _chat_plan_ready_text(language, regenerated=True)
                         action = {
-                            "type": "plan_rerolled",
+                            "type": "plan_generated",
                             "plan_id": str(rerolled_plan.id),
-                            "base_plan_id": str(active_plan.id),
                             "total_days": total_days,
                         }
                     except HTTPException:
@@ -2941,28 +2967,41 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                     except Exception as e:
                         logger.exception("Plan reroll from chat failed: %s", e)
                         assistant_text = "Something went wrong rerolling your plan. Please try again."
-    elif detect_plan_intent(payload.text):
-        # Check generation limits
-        usage: Optional[AiUsageMonthly] = None
-        can_generate = True
+    elif decision.type == "show_generate_button":
+        try:
+            normalized_meta, total_days, _ = await _prepare_plan_generation_inputs(
+                prompt_text=combined_user_text,
+                base_meta=dict(payload.meta or {}),
+            )
+        except ValueError as e:
+            assistant_text = f"Plan request is inconsistent: {str(e)}"
+        else:
+            assistant_text = decision.assistant_text or _chat_generate_button_text(language)
+            normalized_meta = _apply_safe_decision_meta_hints(
+                normalized_meta,
+                decision.meta,
+                combined_user_text,
+            )
+            action = {
+                "type": "suggest_generate_plan",
+                "label": decision.label or _chat_generate_plan_label(language),
+                "meta": normalized_meta,
+                "total_days": int(total_days),
+            }
+    elif decision.type == "generate_plan_now" or (decision.fallback_used and plan_intent):
+        access = await get_plan_generation_access(
+            user_id=current_user.id,
+            is_premium=bool(premium),
+        )
+        usage = access.usage
 
-        if not premium:
-            period = period_yyyy_mm(utcnow())
-            usage = await get_or_create_usage(current_user.id, period)
-            can_generate = usage.used < (usage.base_limit + usage.extra_from_rewarded)
-
-        if not can_generate:
+        if not access.can_generate:
             logger.info(
                 "AI chat generation blocked: user_id=%s premium=%s used=%s limit=%s",
                 str(current_user.id),
                 bool(premium),
-                int(getattr(usage, "used", 0) or 0) if usage is not None else None,
-                (
-                    int(getattr(usage, "base_limit", 0) or 0)
-                    + int(getattr(usage, "extra_from_rewarded", 0) or 0)
-                )
-                if usage is not None
-                else None,
+                access.used,
+                access.limit,
             )
             assistant_text = (
                 "You've used all your plan generation credits for this month. "
@@ -2970,87 +3009,29 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
             )
         else:
             try:
-                base_meta = dict(payload.meta or {})
-                explicit_overrides = _extract_explicit_schedule_overrides(payload.text)
-                ai_meta = await _ai_understand_plan_prompt(payload.text, base_meta)
-                if ai_meta:
-                    meta = dict(base_meta)
-                    meta.update(ai_meta)
-                    meta.update(explicit_overrides)
-                    total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
-                    enforce_rest_distribution = bool(meta.get("rest_days") is not None and meta.get("rest_days_strict", False))
-                else:
-                    parse_meta = _meta_without_duration_overrides(base_meta)
-                    understanding = parse_plan_request(payload.text, parse_meta)
-                    total_days = int(understanding.total_days)
-                    meta = apply_understanding_to_meta(base_meta, understanding)
-                    meta.update(explicit_overrides)
-                    enforce_rest_distribution = has_explicit_rest_day_request(payload.text, parse_meta)
-                logger.info(
-                    "AI chat generation started: user_id=%s total_days=%s enforce_rest_distribution=%s",
-                    str(current_user.id),
-                    int(total_days),
-                    bool(enforce_rest_distribution),
+                generation_meta = dict(payload.meta or {})
+                generation_meta = _apply_safe_decision_meta_hints(
+                    generation_meta,
+                    decision.meta,
+                    combined_user_text,
                 )
-                gen_req = await create_ai_request(
-                    user_id=current_user.id,
+                plan, _, _, total_days = await _generate_plan_for_user(
+                    current_user,
+                    prompt_text=combined_user_text,
+                    base_meta=generation_meta,
+                    usage=usage,
                     req_type=AiRequestType.generate_plan,
-                    prompt_meta=meta,
+                    version=1,
+                    reroll_of_plan_id=None,
                 )
-                days = await _try_generate_plan_with_yandex(current_user, meta, total_days=total_days)
-                if not days:
-                    logger.warning(
-                        "AI chat generation fallback to local builder: user_id=%s total_days=%s",
-                        str(current_user.id),
-                        int(total_days),
-                    )
-                    days = await build_plan_days(current_user, meta, total_days=total_days)
-                if enforce_rest_distribution and days and not validate_plan_distribution(
-                    days,
-                    total_days=int(meta.get("total_days", total_days)),
-                    rest_days=meta.get("rest_days"),
-                    strict=bool(meta.get("rest_days_strict", False)),
-                ):
-                    # Keep generation dependent on structured data and force distribution consistency.
-                    days = await build_plan_days(current_user, meta, total_days=total_days)
-                if enforce_rest_distribution and days and not validate_plan_distribution(
-                    days,
-                    total_days=int(meta.get("total_days", total_days)),
-                    rest_days=meta.get("rest_days"),
-                    strict=bool(meta.get("rest_days_strict", False)),
-                ):
-                    await fail_ai_request(
-                        gen_req,
-                        "Generated plan does not match requested rest-day distribution.",
-                        status_code=422,
-                    )
-                if days:
-                    if usage is not None:
-                        usage.used += 1
-                        await usage.save()
-                    await archive_active_plans(current_user.id)
-                    plan = AiPlan(
-                        user_id=current_user.id,
-                        status="active",
-                        created_from=meta,
-                        days=days,
-                        version=1,
-                        reroll_of_plan_id=None,
-                    )
-                    await plan.insert()
-                    weeks = total_days // 7
-                    duration_label = f"{weeks} week{'s' if weeks != 1 else ''}" if total_days % 7 == 0 else f"{total_days} days"
-                    assistant_text = f"Your {duration_label} training plan is ready! Opening it now."
-                    action = {"type": "plan_generated", "plan_id": str(plan.id), "total_days": total_days}
-                    logger.info(
-                        "AI chat generation success: user_id=%s plan_id=%s total_days=%s",
-                        str(current_user.id),
-                        str(plan.id),
-                        int(total_days),
-                    )
-                else:
-                    logger.info("AI chat generation empty result: user_id=%s", str(current_user.id))
-                    assistant_text = "I couldn't generate a plan right now. Please try again in a moment."
+                assistant_text = _chat_plan_ready_text(language)
+                action = {"type": "plan_generated", "plan_id": str(plan.id), "total_days": int(total_days)}
+                logger.info(
+                    "AI chat generation success: user_id=%s plan_id=%s total_days=%s",
+                    str(current_user.id),
+                    str(plan.id),
+                    int(total_days),
+                )
             except HTTPException:
                 raise
             except ValueError as e:
@@ -3069,7 +3050,18 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                 req_type=AiRequestType.chat,
                 prompt_meta=payload.meta or {},
             )
-            assistant_text = await yandex_chat_completion(payload.text, payload.meta or {}, history=history)
+            assistant_text = decision.assistant_text or await yandex_chat_completion(payload.text, payload.meta or {}, history=history)
+
+    logger.info(
+        "AI chat decision: user_id=%s thread_id=%s decision_type=%s has_action=%s action_type=%s fallback_used=%s text=%s",
+        str(current_user.id),
+        str(thread.id),
+        decision.type,
+        bool(action),
+        str((action or {}).get("type") or ""),
+        bool(decision.fallback_used),
+        _short_text_preview(payload.text),
+    )
 
     assistant_message = AiChatMessage(
         thread_id=thread.id,
@@ -3754,13 +3746,24 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
         items.append(
             AiSwapOptionOut(
                 swap_id=f"swap_{i}",
-                title=str(template.get("title") or _localized_swap_title(language)),
+                title=_humanize_ai_label(
+                    template.get("title"),
+                    language=language,
+                    fallback=_localized_swap_title(language),
+                ),
                 duration_min=int(template.get("duration_min") or 35),
                 intensity=str(template.get("intensity") or "moderate"),
                 focus=str(template.get("focus") or focus),
                 focus_label=str(template.get("focus_label") or _localized_type_label(str(template.get("focus") or focus), language)),
                 type_label=str(template.get("type_label") or _localized_type_label("workout", language)),
-                workout_template=template,
+                workout_template={
+                    **template,
+                    "title": _humanize_ai_label(
+                        template.get("title"),
+                        language=language,
+                        fallback=_localized_swap_title(language),
+                    ),
+                },
             )
         )
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -64,6 +64,19 @@ class AiChatIn(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
+class AiChatActionOut(BaseModel):
+    type: Literal[
+        "suggest_generate_plan",
+        "plan_generated",
+    ]
+
+    label: Optional[str] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    plan_id: Optional[str] = None
+    total_days: Optional[int] = None
+
+
 class AiChatOut(BaseModel):
     thread_id: str
     user_message_id: str
@@ -71,7 +84,7 @@ class AiChatOut(BaseModel):
     assistant_text: str
     plan_message_id: Optional[str] = None
     plan_message_text: Optional[str] = None
-    action: Optional[Dict[str, Any]] = None
+    action: Optional[AiChatActionOut] = None
 
 
 class AiChatMessageOut(BaseModel):
@@ -118,6 +131,7 @@ class AiAdjustIn(BaseModel):
     note: Optional[str] = Field(default=None, max_length=2000)
     prompt_meta: Dict[str, Any] = Field(default_factory=dict)
 
+
 class AiAdjustOut(BaseModel):
     request_id: str
     plan: AiPlanOut
@@ -158,7 +172,7 @@ class AiPlanDayDetailOut(BaseModel):
 
 class AiPlanDayEditIn(BaseModel):
     duration_min: Optional[int] = Field(default=None, ge=1, le=120)
-    intensity: Optional[str] = None  # low|moderate|high or beginner|intermediate|advanced
+    intensity: Optional[str] = None
     mark_rest_day: Optional[bool] = None
     delete_session: Optional[bool] = None
     title: Optional[str] = Field(default=None, min_length=1, max_length=120)
