@@ -69,6 +69,7 @@ class WorkoutRun(BaseDoc):
     workout_ref_id: Optional[PydanticObjectId] = None
     program_id: Optional[PydanticObjectId] = None
     ai_plan_id: Optional[PydanticObjectId] = None
+    ai_plan_date: Optional[str] = None
 
     started_at: datetime
     completed_at: Optional[datetime] = None
@@ -88,6 +89,7 @@ class WorkoutRun(BaseDoc):
         indexes = [
             IndexModel([("user_id", ASCENDING), ("completed_at", DESCENDING)]),
             IndexModel([("user_id", ASCENDING), ("started_at", DESCENDING)]),
+            IndexModel([("user_id", ASCENDING), ("ai_plan_id", ASCENDING), ("ai_plan_date", ASCENDING), ("completed_at", DESCENDING)]),
         ]
 
 

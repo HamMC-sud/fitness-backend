@@ -12,7 +12,7 @@ import math
 from copy import deepcopy
 
 from api.auth.config import get_current_user
-from models import UserWorkout, WorkoutRun, Exercise, UserAchievement, User
+from models import AiPlan, UserWorkout, WorkoutRun, Exercise, UserAchievement, User
 from models.enums import ExerciseMode
 from utils.fitness_metrics import run_effective_seconds
 from models.workouts import Feedback  # âœ… enum
@@ -331,6 +331,29 @@ async def _get_open_run_for_workout(workout_id: PydanticObjectId, user_id: Pydan
             WorkoutRun.user_id == user_id,
             WorkoutRun.workout_ref_id == workout_id,
             WorkoutRun.completed_at == None,  # noqa: E711
+            WorkoutRun.ai_plan_id == None,  # noqa: E711
+            WorkoutRun.ai_plan_date == None,  # noqa: E711
+        )
+        .sort("-started_at")
+        .limit(1)
+        .to_list()
+    )
+    return runs[0] if runs else None
+
+
+async def _get_open_ai_run_for_workout(
+    workout_id: PydanticObjectId,
+    user_id: PydanticObjectId,
+    ai_plan_id: PydanticObjectId,
+    ai_plan_date: str,
+) -> Optional[WorkoutRun]:
+    runs = (
+        await WorkoutRun.find(
+            WorkoutRun.user_id == user_id,
+            WorkoutRun.workout_ref_id == workout_id,
+            WorkoutRun.completed_at == None,  # noqa: E711
+            WorkoutRun.ai_plan_id == ai_plan_id,
+            WorkoutRun.ai_plan_date == ai_plan_date,
         )
         .sort("-started_at")
         .limit(1)
@@ -357,11 +380,42 @@ async def _get_last_run_for_workout(workout_id: PydanticObjectId, user_id: Pydan
     return runs[0] if runs else None
 
 
-async def _resolve_run_and_workout_for_id(id_value: PydanticObjectId, user_id: PydanticObjectId) -> tuple[WorkoutRun, Optional[UserWorkout]]:
+async def _validate_ai_context(
+    user_id: PydanticObjectId,
+    ai_plan_id: Optional[str],
+    ai_plan_date: Optional[str],
+) -> tuple[Optional[PydanticObjectId], Optional[str]]:
+    raw_plan_id = str(ai_plan_id or "").strip()
+    raw_plan_date = str(ai_plan_date or "").strip()
+    if not raw_plan_id and not raw_plan_date:
+        return None, None
+    if not raw_plan_id or not raw_plan_date:
+        raise HTTPException(status_code=400, detail="ai_plan_id and ai_plan_date are required together")
+    try:
+        plan_obj_id = PydanticObjectId(raw_plan_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid ai_plan_id")
+    plan = await AiPlan.get(plan_obj_id)
+    if not plan or plan.user_id != user_id:
+        raise HTTPException(status_code=404, detail="AI plan not found")
+    if raw_plan_date not in {str(getattr(day, "date", "")) for day in (plan.days or [])}:
+        raise HTTPException(status_code=404, detail="AI plan day not found")
+    return plan_obj_id, raw_plan_date
+
+
+async def _resolve_run_and_workout_for_id(
+    id_value: PydanticObjectId,
+    user_id: PydanticObjectId,
+    *,
+    ai_plan_id: Optional[PydanticObjectId] = None,
+    ai_plan_date: Optional[str] = None,
+) -> tuple[WorkoutRun, Optional[UserWorkout]]:
     run = await WorkoutRun.get(id_value)
     if run:
         if run.user_id != user_id:
             raise HTTPException(status_code=403, detail="Forbidden")
+        if ai_plan_id is not None and (run.ai_plan_id != ai_plan_id or run.ai_plan_date != ai_plan_date):
+            raise HTTPException(status_code=404, detail="Workout run not found for AI day")
         workout = await UserWorkout.get(run.workout_ref_id) if run.workout_ref_id else None
         return run, workout
 
@@ -375,9 +429,17 @@ async def _resolve_run_and_workout_for_id(id_value: PydanticObjectId, user_id: P
             raise HTTPException(status_code=404, detail="Workout not found")
         workout = await _create_user_workout_from_exercise(exercise, user_id)
 
-    run = await _get_open_run_for_workout(workout.id, user_id)
+    if ai_plan_id is not None and ai_plan_date is not None:
+        run = await _get_open_ai_run_for_workout(workout.id, user_id, ai_plan_id, ai_plan_date)
+    else:
+        run = await _get_open_run_for_workout(workout.id, user_id)
     if not run:
-        run = await _create_run_for_workout(workout, user_id)
+        run = await _create_run_for_workout(
+            workout,
+            user_id,
+            ai_plan_id=ai_plan_id,
+            ai_plan_date=ai_plan_date,
+        )
     return run, workout
 
 
@@ -429,11 +491,19 @@ async def _create_user_workout_from_exercise(exercise: Exercise, user_id: Pydant
     return workout
 
 
-async def _create_run_for_workout(workout: UserWorkout, user_id: PydanticObjectId) -> WorkoutRun:
+async def _create_run_for_workout(
+    workout: UserWorkout,
+    user_id: PydanticObjectId,
+    *,
+    ai_plan_id: Optional[PydanticObjectId] = None,
+    ai_plan_date: Optional[str] = None,
+) -> WorkoutRun:
     run = WorkoutRun(
         user_id=user_id,
-        source="custom",
+        source="ai" if ai_plan_id is not None else "custom",
         workout_ref_id=workout.id,
+        ai_plan_id=ai_plan_id,
+        ai_plan_date=ai_plan_date,
         started_at=utcnow(),
         completed_at=None,
         exercise_results=[],
@@ -624,11 +694,30 @@ async def delete_workout(workout_id: PydanticObjectId, current_user=Depends(get_
 
 
 @router.post("/workouts/{workout_id}/start", response_model=WorkoutStartOut)
-async def start_workout(workout_id: PydanticObjectId, current_user=Depends(get_current_user)):
+async def start_workout(
+    workout_id: PydanticObjectId,
+    ai_plan_id: Optional[str] = None,
+    ai_plan_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    ai_plan_obj_id, ai_plan_date_value = await _validate_ai_context(current_user.id, ai_plan_id, ai_plan_date)
 
-    w = await _get_owned_workout_or_404(workout_id, current_user.id)
+    run: Optional[WorkoutRun] = None
+    if ai_plan_obj_id is not None and ai_plan_date_value is not None:
+        run, w = await _resolve_run_and_workout_for_id(
+            workout_id,
+            current_user.id,
+            ai_plan_id=ai_plan_obj_id,
+            ai_plan_date=ai_plan_date_value,
+        )
+        if w is None:
+            raise HTTPException(status_code=404, detail="Workout not found")
+        if run.completed_at is not None:
+            raise HTTPException(status_code=400, detail="AI day already completed")
+    else:
+        w = await _get_owned_workout_or_404(workout_id, current_user.id)
 
     last_completed_runs = (
         await WorkoutRun.find(
@@ -659,7 +748,13 @@ async def start_workout(workout_id: PydanticObjectId, current_user=Depends(get_c
 
     effective_adjustment = None if needs_intro else raw_adjustment
 
-    run = await _create_run_for_workout(w, current_user.id)
+    if run is None:
+        run = await _create_run_for_workout(
+            w,
+            current_user.id,
+            ai_plan_id=ai_plan_obj_id,
+            ai_plan_date=ai_plan_date_value,
+        )
 
     run.needs_intro = needs_intro
     run.load_adjustment = effective_adjustment
@@ -681,11 +776,23 @@ async def start_workout(workout_id: PydanticObjectId, current_user=Depends(get_c
 
 
 @router.post("/workouts/{id}/set-progress", response_model=WorkoutSetProgressOut, status_code=status.HTTP_200_OK)
-async def set_progress_workout(id: PydanticObjectId, payload: WorkoutSetProgressIn, current_user=Depends(get_current_user)):
+async def set_progress_workout(
+    id: PydanticObjectId,
+    payload: WorkoutSetProgressIn,
+    ai_plan_id: Optional[str] = None,
+    ai_plan_date: Optional[str] = None,
+    current_user=Depends(get_current_user),
+):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    ai_plan_obj_id, ai_plan_date_value = await _validate_ai_context(current_user.id, ai_plan_id, ai_plan_date)
 
-    run, workout = await _resolve_run_and_workout_for_id(id, current_user.id)
+    run, workout = await _resolve_run_and_workout_for_id(
+        id,
+        current_user.id,
+        ai_plan_id=ai_plan_obj_id,
+        ai_plan_date=ai_plan_date_value,
+    )
     if run.completed_at is not None:
         raise HTTPException(status_code=400, detail="Run already completed")
 
@@ -728,12 +835,20 @@ async def complete_workout(
     id: PydanticObjectId,
     payload: WorkoutCompleteIn,
     request: Request,
+    ai_plan_id: Optional[str] = None,
+    ai_plan_date: Optional[str] = None,
     current_user=Depends(get_current_user),
 ):
     if not current_user:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    ai_plan_obj_id, ai_plan_date_value = await _validate_ai_context(current_user.id, ai_plan_id, ai_plan_date)
 
-    run, workout = await _resolve_run_and_workout_for_id(id, current_user.id)
+    run, workout = await _resolve_run_and_workout_for_id(
+        id,
+        current_user.id,
+        ai_plan_id=ai_plan_obj_id,
+        ai_plan_date=ai_plan_date_value,
+    )
     _validate_complete_exercise_id(payload, workout)
     tz_name = _effective_tz_name(current_user, request)
     return await _complete_run(run, payload, current_user, tz_name=tz_name)

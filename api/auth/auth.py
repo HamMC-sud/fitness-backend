@@ -11,8 +11,8 @@ from fastapi.security import OAuth2PasswordRequestForm
 from api.auth.config import (
     _issue_tokens_for_user,
     create_access_token,
-    create_refresh_token,
     decode_token,
+    decode_token_strict,
     generate_numeric_code,
     get_current_user,
     hash_code,
@@ -99,8 +99,18 @@ async def login(payload: LoginIn, request: Request):
 @router.post("/refresh-token", response_model=TokenOut)
 @router.post("/refresh", response_model=TokenOut)
 async def refresh_token(payload: RefreshIn, request: Request):
-    decoded = decode_token(payload.refresh_token)
-    if not decoded or decoded.get("type") != "refresh":
+    raw_refresh_token = str(payload.refresh_token or "").strip()
+    if not raw_refresh_token:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    try:
+        decoded = decode_token_strict(raw_refresh_token)
+    except HTTPException as exc:
+        if exc.detail == "Token expired":
+            raise HTTPException(status_code=401, detail="Refresh token expired")
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    if decoded.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     jti = decoded.get("jti")
@@ -119,40 +129,28 @@ async def refresh_token(payload: RefreshIn, request: Request):
         user_id = PydanticObjectId(sub)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+    if session.user_id != user_id:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     user = await User.get(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
-    session.revoked_at = utcnow()
+    session.user_agent = request.headers.get("user-agent")
+    session.ip = request.client.host if request.client else None
     await session.save()
 
-    new_refresh = create_refresh_token(sub=sub)
-    new_decoded = decode_token(new_refresh)
-    if not new_decoded or new_decoded.get("type") != "refresh":
-        raise HTTPException(status_code=500, detail="Failed to create refresh token")
-
-    new_jti = new_decoded.get("jti")
-    new_exp = new_decoded.get("exp")
-    if not isinstance(new_jti, str) or not new_exp:
-        raise HTTPException(status_code=500, detail="Failed to create refresh token")
-
-    new_expires_at = datetime.fromtimestamp(int(new_exp), tz=timezone.utc).replace(tzinfo=None)
-    await AuthSession(
-        user_id=user.id,
-        refresh_token_hash=sha256(new_jti),
-        expires_at=new_expires_at,
-        user_agent=request.headers.get("user-agent"),
-        ip=request.client.host if request.client else None,
-    ).insert()
-
     new_access = create_access_token(sub=sub)
-    return TokenOut(access_token=new_access, refresh_token=new_refresh)
+    return TokenOut(access_token=new_access, refresh_token=raw_refresh_token)
 
 
 @router.post("/logout", status_code=200)
 async def logout(payload: LogoutIn):
-    decoded = decode_token(payload.refresh_token)
+    raw_refresh_token = str(payload.refresh_token or "").strip()
+    if not raw_refresh_token:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    decoded = decode_token(raw_refresh_token)
     if not decoded or decoded.get("type") != "refresh":
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 

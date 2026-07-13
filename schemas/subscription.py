@@ -26,6 +26,8 @@ class SubscriptionOut(BaseModel):
     grace_until: Optional[datetime] = None
     auto_renew: bool = True
     last_transaction_id: Optional[str] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
 
 
 class SubscriptionGetOut(BaseModel):

@@ -78,6 +78,12 @@ async def issue_tokens_for_user(user: User, request: Request) -> TokenOut:
         user_agent=request.headers.get("user-agent"),
         ip=request.client.host if request.client else None,
     ).insert()
+    logger.info(
+        "Auth session created: provider=%s user_id=%s refresh_expires_at=%s",
+        "social",
+        user_id_str,
+        expires_at.isoformat(),
+    )
 
     access = create_access_token(sub=user_id_str)
     return TokenOut(access_token=access, refresh_token=refresh)
@@ -104,6 +110,13 @@ def _debug_identifier(value: Any) -> str:
     if not raw:
         return ""
     return f"hash={sha256(raw)[:12]} tail={raw[-4:]}"
+
+
+def _hash_identifier(value: Any) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return sha256(raw)[:12]
 
 
 def _get_request_id(request: Request) -> str:
@@ -717,12 +730,33 @@ async def get_or_link_social_user(
     timezone: str,
     email_verified: bool,
 ) -> Optional[User]:
+    email_present = bool(str(email).strip()) if email is not None else False
+    logger.info(
+        "SocialAccount lookup started: provider=%s provider_user_id_hash=%s email_present=%s",
+        provider,
+        _hash_identifier(provider_user_id),
+        email_present,
+    )
     link = await SocialAccount.find_one(
         SocialAccount.provider == provider,
         SocialAccount.provider_user_id == provider_user_id,
     )
+    logger.info(
+        "SocialAccount lookup result: provider=%s provider_user_id_hash=%s link_found=%s linked_user_id=%s",
+        provider,
+        _hash_identifier(provider_user_id),
+        bool(link),
+        str(link.user_id) if link else None,
+    )
     if link:
         user = await User.get(link.user_id)
+        logger.info(
+            "Linked social user lookup result: provider=%s link_found=%s user_found=%s user_id=%s",
+            provider,
+            bool(link),
+            bool(user),
+            str(user.id) if user else None,
+        )
         if not user:
             await link.delete()
         else:
@@ -831,6 +865,13 @@ async def prepare_social_registration(
 async def vk_login(payload: VkSocialIn, request: Request):
     request_id = _get_request_id(request)
     logger.info(
+        "Social login started: provider=%s request_id=%s has_access_token=%s has_id_token=%s",
+        "vk",
+        request_id,
+        bool(payload.access_token),
+        bool(payload.id_token),
+    )
+    logger.info(
         "VK login started: request_id=%s has_access_token=%s has_id_token=%s payload_email_present=%s region=%s country=%s language=%s timezone=%s client_ip=%s user_agent=%s",
         request_id,
         bool(payload.access_token),
@@ -865,6 +906,15 @@ async def vk_login(payload: VkSocialIn, request: Request):
         )
         raise
 
+    resolved_email = identity["email"] or (str(payload.email).lower().strip() if payload.email else None)
+
+    logger.info(
+        "Social identity resolved: provider=%s request_id=%s provider_user_id_hash=%s email_present=%s",
+        "vk",
+        request_id,
+        _hash_identifier(identity.get("provider_user_id")),
+        bool(resolved_email),
+    )
     logger.info(
         "VK login identity resolved: request_id=%s provider_user_id=%s identity_email_present=%s payload_email_present=%s",
         request_id,
@@ -872,8 +922,6 @@ async def vk_login(payload: VkSocialIn, request: Request):
         bool(identity.get("email")),
         bool(payload.email),
     )
-
-    resolved_email = identity["email"] or (str(payload.email).lower().strip() if payload.email else None)
     user = await get_or_link_social_user(
         provider="vk",
         provider_user_id=identity["provider_user_id"] or "",
@@ -886,6 +934,11 @@ async def vk_login(payload: VkSocialIn, request: Request):
     )
     if user:
         logger.info(
+            "Social login tokens issued: provider=%s user_id=%s",
+            "vk",
+            str(user.id),
+        )
+        logger.info(
             "VK login existing user found: request_id=%s user_id=%s provider_user_id=%s",
             request_id,
             _debug_identifier(user.id),
@@ -897,6 +950,12 @@ async def vk_login(payload: VkSocialIn, request: Request):
         provider="vk",
         provider_user_id=identity["provider_user_id"] or "",
         email=resolved_email,
+    )
+    logger.info(
+        "Social login profile required: provider=%s provider_user_id_hash=%s registration_email=%s",
+        "vk",
+        _hash_identifier(identity.get("provider_user_id")),
+        registration_email,
     )
     logger.info(
         "VK login requires profile completion: request_id=%s provider_user_id=%s email_present=%s",
@@ -917,6 +976,14 @@ async def vk_login(payload: VkSocialIn, request: Request):
 
 @router.post("/auth/social/google", response_model=TokenOut)
 async def google_login(payload: GoogleSocialIn, request: Request):
+    request_id = _get_request_id(request)
+    logger.info(
+        "Social login started: provider=%s request_id=%s has_access_token=%s has_id_token=%s",
+        "google",
+        request_id,
+        None,
+        bool(payload.id_token),
+    )
     claims = await google_verify_id_token(payload.id_token)
     sub = claims.get("sub")
     email = claims.get("email")
@@ -924,6 +991,14 @@ async def google_login(payload: GoogleSocialIn, request: Request):
 
     if not sub:
         raise HTTPException(status_code=401, detail="Google token invalid")
+
+    logger.info(
+        "Social identity resolved: provider=%s request_id=%s provider_user_id_hash=%s email_present=%s",
+        "google",
+        request_id,
+        _hash_identifier(sub),
+        bool(email),
+    )
 
     user = await get_or_link_social_user(
         provider="google",
@@ -936,12 +1011,23 @@ async def google_login(payload: GoogleSocialIn, request: Request):
         email_verified=email_verified,
     )
     if user:
+        logger.info(
+            "Social login tokens issued: provider=%s user_id=%s",
+            "google",
+            str(user.id),
+        )
         return await issue_tokens_for_user(user, request)
 
     registration_email = await prepare_social_registration(
         provider="google",
         provider_user_id=str(sub),
         email=str(email).lower().strip() if email else None,
+    )
+    logger.info(
+        "Social login profile required: provider=%s provider_user_id_hash=%s registration_email=%s",
+        "google",
+        _hash_identifier(sub),
+        registration_email,
     )
     raise HTTPException(
         status_code=428,
@@ -956,12 +1042,28 @@ async def google_login(payload: GoogleSocialIn, request: Request):
 
 @router.post("/auth/social/apple", response_model=TokenOut)
 async def apple_login(payload: AppleSocialIn, request: Request):
+    request_id = _get_request_id(request)
+    logger.info(
+        "Social login started: provider=%s request_id=%s has_access_token=%s has_id_token=%s",
+        "apple",
+        request_id,
+        None,
+        bool(payload.id_token),
+    )
     claims = await apple_verify_id_token(payload.id_token)
     sub = claims.get("sub")
     email = claims.get("email") or (str(payload.email).lower() if payload.email else None)
 
     if not sub:
         raise HTTPException(status_code=401, detail="Apple token invalid")
+
+    logger.info(
+        "Social identity resolved: provider=%s request_id=%s provider_user_id_hash=%s email_present=%s",
+        "apple",
+        request_id,
+        _hash_identifier(sub),
+        bool(email),
+    )
 
     user = await get_or_link_social_user(
         provider="apple",
@@ -974,12 +1076,23 @@ async def apple_login(payload: AppleSocialIn, request: Request):
         email_verified=True if email else False,
     )
     if user:
+        logger.info(
+            "Social login tokens issued: provider=%s user_id=%s",
+            "apple",
+            str(user.id),
+        )
         return await issue_tokens_for_user(user, request)
 
     registration_email = await prepare_social_registration(
         provider="apple",
         provider_user_id=str(sub),
         email=str(email).lower().strip() if email else None,
+    )
+    logger.info(
+        "Social login profile required: provider=%s provider_user_id_hash=%s registration_email=%s",
+        "apple",
+        _hash_identifier(sub),
+        registration_email,
     )
     raise HTTPException(
         status_code=428,

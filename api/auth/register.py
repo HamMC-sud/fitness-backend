@@ -1,5 +1,6 @@
 import logging
 import os
+import hashlib
 from datetime import timedelta
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
@@ -26,6 +27,13 @@ CODE_LENGTH = int(os.getenv("CODE_LENGTH", "4"))
 MAX_ATTEMPTS = int(os.getenv("MAX_VERIFICATION_ATTEMPTS", "5"))
 REGISTRATION_COMPLETE_TTL_SECONDS = int(os.getenv("REGISTRATION_COMPLETE_TTL", "1800"))
 SOCIAL_PASSWORD_SENTINELS = {"__SOCIAL__", "**SOCIAL**"}
+
+
+def _hash_identifier(value: str | None) -> str | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
 async def _upsert_verification_code(
@@ -146,6 +154,11 @@ async def complete_registration(payload: RegisterCompleteIn, request: Request):
     email = payload.email.lower().strip()
 
     record = await VerificationCode.find_one(VerificationCode.email == email)
+    logger.info(
+        "Register complete started: email_key=%s record_found=%s",
+        email,
+        bool(record),
+    )
     if not record:
         raise HTTPException(status_code=400, detail="Email verification not found. Start registration again.")
     if not record.verified:
@@ -153,6 +166,12 @@ async def complete_registration(payload: RegisterCompleteIn, request: Request):
     if record.expires_at < now_utc():
         await record.delete()
         raise HTTPException(status_code=400, detail="Registration session expired. Start registration again.")
+    logger.info(
+        "Register complete social context: social_provider=%s provider_user_id_hash=%s social_email_present=%s",
+        record.social_provider,
+        _hash_identifier(record.social_provider_user_id),
+        bool(record.social_email),
+    )
 
     if record.social_provider:
         effective_email = (record.social_email or "").lower().strip() or None
@@ -177,6 +196,13 @@ async def complete_registration(payload: RegisterCompleteIn, request: Request):
 
     try:
         await user.insert()
+        logger.info(
+            "Register complete user created: email_key=%s user_created=%s user_id=%s effective_email=%s",
+            email,
+            True,
+            str(user.id),
+            effective_email,
+        )
     except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="User already exists")
     except Exception:
@@ -185,17 +211,35 @@ async def complete_registration(payload: RegisterCompleteIn, request: Request):
 
     if record.social_provider and record.social_provider_user_id:
         try:
+            logger.info(
+                "Register complete SocialAccount insert: provider=%s provider_user_id_hash=%s user_id=%s",
+                record.social_provider,
+                _hash_identifier(record.social_provider_user_id),
+                str(user.id),
+            )
             await SocialAccount(
                 provider=record.social_provider,
                 provider_user_id=record.social_provider_user_id,
                 user_id=user.id,
                 email=effective_email,
             ).insert()
+            logger.info(
+                "Register complete SocialAccount created: provider=%s provider_user_id_hash=%s user_id=%s",
+                record.social_provider,
+                _hash_identifier(record.social_provider_user_id),
+                str(user.id),
+            )
         except DuplicateKeyError:
             raise HTTPException(status_code=409, detail="Social account already linked")
 
     await record.delete()
     tokens = await _issue_tokens_for_user(user, request)
+    logger.info(
+        "Register complete tokens issued: user_id=%s social_provider=%s had_social_context=%s",
+        str(user.id),
+        record.social_provider,
+        bool(record.social_provider and record.social_provider_user_id),
+    )
     return {
         "status": "success",
         "access_token": tokens.access_token,

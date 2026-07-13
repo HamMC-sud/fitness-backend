@@ -192,6 +192,8 @@ def sub_to_out(sub: Subscription) -> SubscriptionOut:
         grace_until=sub.grace_until,
         auto_renew=sub.auto_renew,
         last_transaction_id=str(sub.last_transaction_id) if sub.last_transaction_id else None,
+        amount=getattr(sub, "amount", None),
+        currency=getattr(sub, "currency", None),
     )
 
 
@@ -213,6 +215,14 @@ async def upsert_subscription(
         str(tx_id) if tx_id else None,
         bool(existing),
     )
+
+    amount = None
+    currency = None
+    if tx_id:
+        tx = await SubscriptionTransaction.get(tx_id)
+        if tx:
+            amount = tx.amount
+            currency = tx.currency
 
     base = now
     started_at = now
@@ -238,6 +248,8 @@ async def upsert_subscription(
         existing.auto_renew = True
         existing.last_transaction_id = tx_id
         existing.status = SubscriptionStatus.active
+        existing.amount = amount
+        existing.currency = currency
         await existing.save()
         logger.info(
             "Subscription upsert updated existing: subscription_id=%s user_id=%s expires_at=%s grace_until=%s",
@@ -264,6 +276,8 @@ async def upsert_subscription(
         grace_until=grace_until,
         auto_renew=True,
         last_transaction_id=tx_id,
+        amount=amount,
+        currency=currency,
     )
     await sub.insert()
     logger.info(
@@ -1555,3 +1569,23 @@ async def promo_stats(
     promo_codes_total = int(await PromoCode.find().count())
     redemptions_total = int(await PromoRedemption.find().count())
     return PromoStatsOut(promo_codes_total=promo_codes_total, redemptions_total=redemptions_total)
+
+
+@router.get("/subscription", response_model=SubscriptionGetOut)
+async def get_subscription(current_user=Depends(get_current_user)):
+    require_auth(current_user)
+    sub = await Subscription.find_one(Subscription.user_id == current_user.id)
+    if not sub:
+        return SubscriptionGetOut(
+            subscription=None,
+            is_active=False,
+            in_grace=False,
+            expires_at=None,
+        )
+    status, is_active, in_grace = compute_subscription_status(sub)
+    return SubscriptionGetOut(
+        subscription=sub_to_out(sub),
+        is_active=is_active,
+        in_grace=in_grace,
+        expires_at=sub.expires_at,
+    )

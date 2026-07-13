@@ -19,6 +19,7 @@ class AiLimitsOut(BaseModel):
 
 class AiPlanDayOut(BaseModel):
     date: str
+    is_completed: bool = False
     type: str
     type_label: Optional[str] = None
     title: Optional[str] = None
@@ -140,6 +141,7 @@ class AiAdjustOut(BaseModel):
 class AiPlanDayCardOut(BaseModel):
     date: str
     weekday: str
+    is_completed: bool = False
     type: str
     type_label: Optional[str] = None
     title: str
@@ -162,6 +164,7 @@ class AiPlanWeeksOut(BaseModel):
 class AiPlanDayDetailOut(BaseModel):
     plan_id: str
     date: str
+    is_completed: bool = False
     type: str
     type_label: Optional[str] = None
     title: Optional[str] = None

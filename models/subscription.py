@@ -32,6 +32,8 @@ class Subscription(BaseDoc):
     grace_until: Optional[datetime] = None
     auto_renew: bool = True
     last_transaction_id: Optional[PydanticObjectId] = None
+    amount: Optional[float] = None
+    currency: Optional[str] = None
 
     class Settings:
         name = "subscriptions"

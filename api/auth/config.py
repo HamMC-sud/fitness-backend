@@ -2,11 +2,13 @@ import os
 import re
 import secrets
 import hashlib
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any, Dict
 
 import bcrypt
 import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError
 from beanie.odm.fields import PydanticObjectId
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
@@ -24,6 +26,7 @@ if not JWT_SECRET:
     raise RuntimeError("JWT_SECRET is missing in .env")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/token", auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 def utcnow() -> datetime:
@@ -85,6 +88,15 @@ def decode_token(token: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def decode_token_strict(token: str) -> Dict[str, Any]:
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
 def generate_numeric_code(length: int = 4) -> str:
     return "".join(secrets.choice("0123456789") for _ in range(length))
 
@@ -102,8 +114,11 @@ def verify_code(code: str, code_hash: str) -> bool:
 
 
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> User:
-    decoded = decode_token(token)
-    if not decoded or decoded.get("type") != "access":
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    decoded = decode_token_strict(token)
+    if decoded.get("type") != "access":
         raise HTTPException(status_code=401, detail="Invalid token")
 
     sub = decoded.get("sub")
@@ -144,6 +159,12 @@ async def _issue_tokens_for_user(user: User, request: Optional[Request]) -> Toke
         user_agent=(request.headers.get("user-agent") if request else None),
         ip=(request.client.host if (request and request.client) else None),
     ).insert()
+    logger.info(
+        "Auth session created: user_id=%s refresh_expires_at=%s has_request=%s",
+        user_id_str,
+        expires_at.isoformat(),
+        bool(request),
+    )
 
     access = create_access_token(sub=user_id_str)
     return TokenOut(access_token=access, refresh_token=refresh)
