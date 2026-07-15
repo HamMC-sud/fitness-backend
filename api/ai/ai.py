@@ -679,6 +679,7 @@ def _normalize_ai_exercise_contract(
         execution_mode,
         planned_target,
     )
+    set_plan = _compact_set_plan_for_execution_mode(set_plan, execution_mode)
     set_plan = apply_uniform_rest_seconds(set_plan, rest_seconds)
     metrics = summarize_sets_payload(set_plan, fallback_mode=mode_value)
 
@@ -1645,13 +1646,26 @@ def _nested_execution_targets(row: Dict[str, Any]) -> tuple[Optional[int], Optio
             rep_items = set_row.get("reps")
             if not isinstance(rep_items, list):
                 continue
+            nested_mode_value: Optional[str] = None
+            nested_reps_total = 0
+            nested_seconds_total = 0
             for rep_item in rep_items:
                 rep_row = dict(rep_item or {})
                 nested_mode = rep_row.get("mode")
                 nested_reps = _optional_int(rep_row.get("target_reps"), lo=1, hi=500)
                 nested_seconds = _optional_int(rep_row.get("target_duration_seconds"), lo=1, hi=3600)
-                if nested_mode not in (None, "") or nested_reps is not None or nested_seconds is not None:
-                    return nested_reps, nested_seconds, str(nested_mode or "") or None
+                if nested_mode_value is None and nested_mode not in (None, ""):
+                    nested_mode_value = str(nested_mode)
+                if nested_reps is not None:
+                    nested_reps_total += nested_reps
+                if nested_seconds is not None:
+                    nested_seconds_total += nested_seconds
+            if nested_mode_value is not None or nested_reps_total > 0 or nested_seconds_total > 0:
+                return (
+                    nested_reps_total if nested_reps_total > 0 else None,
+                    nested_seconds_total if nested_seconds_total > 0 else None,
+                    nested_mode_value,
+                )
     return None, None, None
 
 
@@ -1754,6 +1768,56 @@ def _normalize_set_plan_execution(
         ]
 
     return normalized_sets
+
+
+def _compact_set_plan_for_execution_mode(
+    set_plan: list[dict[str, Any]],
+    execution_mode: str,
+) -> list[dict[str, Any]]:
+    mode_value = "reps" if execution_mode == "repetitions" else "time"
+    compacted_sets: list[dict[str, Any]] = []
+
+    for set_index, set_item in enumerate(list(set_plan or []), start=1):
+        set_row = dict(set_item or {})
+        rep_items = list(set_row.get("reps") or [])
+        first_rep = dict(rep_items[0] or {}) if rep_items else {}
+
+        if execution_mode == "duration":
+            total_target = sum(
+                int(rep.get("target_duration_seconds") or 0)
+                for rep in rep_items
+                if _optional_int(rep.get("target_duration_seconds"), lo=1, hi=3600) is not None
+            )
+            compacted_rep = {
+                "rep_no": 1,
+                "mode": mode_value,
+                "target_reps": None,
+                "target_duration_seconds": total_target if total_target > 0 else None,
+            }
+        else:
+            total_target = sum(
+                int(rep.get("target_reps") or 0)
+                for rep in rep_items
+                if _optional_int(rep.get("target_reps"), lo=1, hi=500) is not None
+            )
+            compacted_rep = {
+                "rep_no": 1,
+                "mode": mode_value,
+                "target_reps": total_target if total_target > 0 else None,
+                "target_duration_seconds": None,
+            }
+
+        if first_rep.get("video_url"):
+            compacted_rep["video_url"] = first_rep.get("video_url")
+        if first_rep.get("thumbnail_url"):
+            compacted_rep["thumbnail_url"] = first_rep.get("thumbnail_url")
+
+        set_row["set_no"] = _coerce_int(set_row.get("set_no"), default=set_index, lo=1, hi=100)
+        set_row["mode"] = mode_value
+        set_row["reps"] = [compacted_rep]
+        compacted_sets.append(set_row)
+
+    return compacted_sets
 
 def _video_meta_fields(video_url: Optional[str]) -> dict[str, Any]:
     parsed = parse_exercise_video_from_url(video_url)
@@ -1914,6 +1978,17 @@ def _meta_without_duration_overrides(meta: Dict[str, Any]) -> Dict[str, Any]:
     cleaned = dict(meta or {})
     for key in ("total_days", "rest_days", "rest_days_strict", "workouts_per_week", "days_per_week"):
         cleaned.pop(key, None)
+    return cleaned
+
+
+def _strip_implicit_rest_constraints(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keep weekly scheduling hints, but drop exact rest-day constraints unless the
+    user explicitly asked for them in the current prompt.
+    """
+    cleaned = dict(meta or {})
+    cleaned.pop("rest_days", None)
+    cleaned["rest_days_strict"] = False
     return cleaned
 
 
@@ -3047,6 +3122,17 @@ def _chat_generate_button_text(language: str) -> str:
     return "I can build a plan from this request. Tap the button and I'll generate it."
 
 
+def _chat_plan_error_text(language: str, detail: Any = None) -> str:
+    message = str(detail or "").strip()
+    if not message:
+        return (
+            "Что-то пошло не так при генерации плана. Попробуйте ещё раз."
+            if _is_russian_language(language)
+            else "Something went wrong generating your plan. Please try again."
+        )
+    return message
+
+
 def _combine_history_for_plan_prompt(history: list[dict[str, str]], text: str, limit: int = 6) -> str:
     parts = [str((item or {}).get("text") or "").strip() for item in (history[-limit:] if history else [])]
     parts.append(str(text or "").strip())
@@ -3130,13 +3216,21 @@ async def _prepare_plan_generation_inputs(
     if not text:
         return meta, total_days, enforce_rest_distribution
 
+    explicit_rest_request = has_explicit_rest_day_request(text, meta)
+
     explicit_overrides = _extract_explicit_schedule_overrides(text)
     ai_meta = await _ai_understand_plan_prompt(text, meta)
     if ai_meta:
         meta.update(ai_meta)
         meta.update(explicit_overrides)
+        if not explicit_rest_request:
+            meta = _strip_implicit_rest_constraints(meta)
         total_days = _coerce_int(meta.get("total_days"), default=30, lo=1, hi=365)
-        enforce_rest_distribution = bool(meta.get("rest_days") is not None and meta.get("rest_days_strict", False))
+        enforce_rest_distribution = bool(
+            explicit_rest_request
+            and meta.get("rest_days") is not None
+            and meta.get("rest_days_strict", False)
+        )
         return meta, total_days, enforce_rest_distribution
 
     parse_meta = _meta_without_duration_overrides(meta)
@@ -3144,7 +3238,13 @@ async def _prepare_plan_generation_inputs(
     total_days = int(understanding.total_days)
     meta = apply_understanding_to_meta(meta, understanding)
     meta.update(explicit_overrides)
-    enforce_rest_distribution = has_explicit_rest_day_request(text, parse_meta)
+    if not explicit_rest_request:
+        meta = _strip_implicit_rest_constraints(meta)
+    enforce_rest_distribution = bool(
+        explicit_rest_request
+        and meta.get("rest_days") is not None
+        and meta.get("rest_days_strict", False)
+    )
     return meta, total_days, enforce_rest_distribution
 
 
@@ -3759,11 +3859,17 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                         "plan_id": str(regenerated_plan.id),
                         "total_days": total_days,
                     }
-                except HTTPException:
-                    raise
+                except HTTPException as exc:
+                    logger.warning(
+                        "Plan regeneration from chat returned HTTPException: user_id=%s status_code=%s detail=%s",
+                        str(current_user.id),
+                        int(exc.status_code),
+                        str(exc.detail),
+                    )
+                    assistant_text = _chat_plan_error_text(language, exc.detail)
                 except Exception as e:
                     logger.exception("Plan regeneration from chat failed: %s", e)
-                    assistant_text = "Something went wrong regenerating your plan. Please try again."
+                    assistant_text = _chat_plan_error_text(language)
             else:
                 if await has_monthly_reroll(current_user.id):
                     assistant_text = (
@@ -3787,11 +3893,17 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                             "plan_id": str(rerolled_plan.id),
                             "total_days": total_days,
                         }
-                    except HTTPException:
-                        raise
+                    except HTTPException as exc:
+                        logger.warning(
+                            "Plan reroll from chat returned HTTPException: user_id=%s status_code=%s detail=%s",
+                            str(current_user.id),
+                            int(exc.status_code),
+                            str(exc.detail),
+                        )
+                        assistant_text = _chat_plan_error_text(language, exc.detail)
                     except Exception as e:
                         logger.exception("Plan reroll from chat failed: %s", e)
-                        assistant_text = "Something went wrong rerolling your plan. Please try again."
+                        assistant_text = _chat_plan_error_text(language)
     elif decision.type == "show_generate_button":
         try:
             normalized_meta, total_days, _ = await _prepare_plan_generation_inputs(
@@ -3857,14 +3969,20 @@ async def ai_chat(payload: AiChatIn, current_user=Depends(get_current_user)):
                     str(plan.id),
                     int(total_days),
                 )
-            except HTTPException:
-                raise
+            except HTTPException as exc:
+                logger.warning(
+                    "AI chat generation returned HTTPException: user_id=%s status_code=%s detail=%s",
+                    str(current_user.id),
+                    int(exc.status_code),
+                    str(exc.detail),
+                )
+                assistant_text = _chat_plan_error_text(language, exc.detail)
             except ValueError as e:
                 logger.info("AI chat generation validation failed: user_id=%s error=%s", str(current_user.id), str(e))
                 assistant_text = f"Plan request is inconsistent: {str(e)}"
             except Exception as e:
                 logger.exception("Plan generation from chat failed: %s", e)
-                assistant_text = "Something went wrong generating your plan. Please try again."
+                assistant_text = _chat_plan_error_text(language)
     else:
         logger.info("AI chat no-plan intent branch: user_id=%s premium=%s", str(current_user.id), bool(premium))
         if not premium:

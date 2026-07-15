@@ -101,6 +101,22 @@ GENERATION_MARKERS = [
     "togda sgeneriruy",
 ]
 
+NON_EXECUTION_PLAN_MARKERS = [
+    "пример",
+    "example",
+    "sample",
+    "покажи",
+    "show",
+    "обсуд",
+    "discuss",
+    "идея",
+    "idea",
+    "вариант",
+    "option",
+    "какой план",
+    "what plan",
+]
+
 
 class AiChatDecision(BaseModel):
     assistant_text: str = ""
@@ -195,49 +211,31 @@ def _has_plan_or_generation_marker(text: str) -> bool:
 
 def _has_explicit_plan_generation_command(text: str) -> bool:
     lowered = str(text or "").lower().replace("ё", "е")
+    if _contains_any(lowered, NON_EXECUTION_PLAN_MARKERS):
+        return False
     if _contains_any(lowered, PERMISSION_MARKERS):
         return False
-    return _contains_any(
-        lowered,
-        [
-            "сгенерируй",
-            "составь",
-            "создай",
-            "сделай",
-            "generate",
-            "generate it",
-            "create plan",
-            "build plan",
-            "make plan",
-            "do it",
-            "sgeneriruy",
-            "sgenerirovat",
-            "sostav",
-            "sozday",
-            "sdelay",
-        ],
-    )
+    direct_command_patterns = [
+        r"\b(?:сгенерируй|составь|создай|сделай)\b.{0,40}\b(?:план|программ|трениров)\b",
+        r"\b(?:sgeneriruy|sgenerirovat|sostav|sozday|sdelay)\b.{0,40}\b(?:plan|programma|trenirov)\b",
+        r"\b(?:generate|create|build|make)\b.{0,40}\b(?:plan|program|workout|training plan)\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in direct_command_patterns)
 
 
 def _has_contextual_generation_command(text: str) -> bool:
     lowered = str(text or "").lower().replace("ё", "е")
+    if _contains_any(lowered, NON_EXECUTION_PLAN_MARKERS):
+        return False
     return _contains_any(
         lowered,
         [
             "тогда сгенерируй",
             "давай сгенерируй",
-            "сгенерируй",
-            "давай",
-            "сделай",
             "generate it",
             "do it",
             "then generate",
             "togda sgeneriruy",
-            "sgeneriruy",
-            "sgenerirovat",
-            "sostav",
-            "sozday",
-            "sdelay",
         ],
     )
 
