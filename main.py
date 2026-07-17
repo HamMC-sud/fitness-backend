@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import hashlib
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,8 +18,9 @@ from models import db, client, ALL_MODELS
 from models.subscription import SubscriptionPlan
 from api.api_router import api_router
 from utils.api_i18n import augment_payload, localize_detail
+from api.auth.config import JWT_ALGORITHM, ACCESS_MINUTES, REFRESH_MINUTES, JWT_SECRET
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 # Keep startup directories aligned with mounted static path (/statics -> statics/*).
 os.makedirs("statics", exist_ok=True)
@@ -92,6 +94,13 @@ async def lifespan(app: FastAPI):
     await init_beanie(
         database=db,
         document_models=ALL_MODELS,
+    )
+    logger.info(
+        "JWT config loaded: algorithm=%s access_minutes=%s refresh_minutes=%s secret_fingerprint=%s",
+        JWT_ALGORITHM,
+        ACCESS_MINUTES,
+        REFRESH_MINUTES,
+        hashlib.sha256(JWT_SECRET.encode("utf-8")).hexdigest()[:12] if JWT_SECRET else None,
     )
     await _ensure_default_subscription_plans()
     _log_static_mount_status()
