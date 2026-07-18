@@ -323,6 +323,13 @@ class SimilarExerciseIn(BaseModel):
             raise HTTPException(status_code=400, detail=f"Invalid similar workout payload: {str(exc)}") from exc
 
 
+class ExerciseCatalogPageIn(BaseModel):
+    page: int = Field(default=1, ge=1)
+    limit: int = Field(default=50, ge=1, le=50)
+    status: str = Field(default="active", min_length=1, max_length=32)
+    q: Optional[str] = Field(default=None, min_length=1, max_length=120)
+
+
 def equipment_db_aliases(equipment: Equipment) -> list[str]:
     if equipment == Equipment.home:
         return [
@@ -388,6 +395,51 @@ def _worktype_label(value: Optional[str], lang: str) -> str:
         "yoga": "Yoga",
         "mobility": "Mobility",
     }.get(token, token)
+
+
+def _serialize_exercise_catalog_item(ex: Exercise, *, lang: str, rest_seconds_override: Optional[int] = None) -> dict[str, Any]:
+    serialized = _serialize_workout_exercise(ex, rest_seconds_override=rest_seconds_override)
+    media = getattr(ex, "media", None)
+    workout_types = [_enum_value_str(item) for item in list(getattr(ex, "workout_type", None) or [])]
+    difficulty_value = str(getattr(getattr(ex, "difficulty", None), "value", getattr(ex, "difficulty", "")) or "")
+    return {
+        "id": str(ex.id),
+        "code": str(getattr(ex, "code", "") or ""),
+        "title": {
+            "ru": _pick_i18n_text(getattr(ex, "name", None), "ru"),
+            "en": _pick_i18n_text(getattr(ex, "name", None), "en"),
+        },
+        "description": {
+            "ru": _pick_i18n_text(getattr(ex, "description", None), "ru"),
+            "en": _pick_i18n_text(getattr(ex, "description", None), "en"),
+        },
+        "thumbnail_url": ensure_existing_media_url(
+            getattr(media, "thumbnail_url", None) if media else None,
+            kind="thumbnail",
+        ),
+        "video_url": ensure_existing_media_url(
+            getattr(media, "video_url", None) if media else None,
+            kind="video",
+        ),
+        "mode": _enum_value_str(getattr(ex, "mode", "")),
+        "difficulty": difficulty_value,
+        "difficulty_label": difficulty_value,
+        "workout_type": workout_types,
+        "workout_type_labels": {
+            "ru": [_worktype_label(item, "ru") for item in workout_types],
+            "en": [_worktype_label(item, "en") for item in workout_types],
+        },
+        "equipment": [_enum_value_str(item) for item in list(getattr(ex, "equipment", None) or [])],
+        "muscle_groups": list(getattr(ex, "muscle_groups", None) or []),
+        "movement_type": str(getattr(ex, "movement_type", "") or ""),
+        "contraindications": list(getattr(ex, "contraindications", None) or []),
+        "duration_seconds": int(serialized["total_seconds"]),
+        "duration_minutes": int(serialized["total_minutes"]),
+        "total_sets": int(serialized["total_sets"]),
+        "total_reps": int(serialized["total_reps"]),
+        "rest_seconds": int(serialized["rest_seconds"]),
+        "localized_title": _pick_i18n_text(getattr(ex, "name", None), lang),
+    }
 
 
 def _resolve_set_plan(ex: Exercise, step_duration_default: int) -> list[dict[str, Any]]:
@@ -993,6 +1045,49 @@ async def discover_worktype_details(
             "total_calories": round(sum_calories, 1),
         },
         "items": items,
+    }
+
+
+@router.get("/discover/exercises")
+async def discover_exercises_catalog(
+    page: int = 1,
+    limit: int = 50,
+    status: str = "active",
+    q: Optional[str] = None,
+    current_user: Optional[User] = Depends(_get_optional_user),
+):
+    params = ExerciseCatalogPageIn(page=page, limit=limit, status=status, q=q)
+    filters: list[Any] = [Exercise.status == params.status]
+    if params.q:
+        query = re.escape(params.q.strip())
+        filters.append({
+            "$or": [
+                {"code": {"$regex": query, "$options": "i"}},
+                {"name.ru": {"$regex": query, "$options": "i"}},
+                {"name.en": {"$regex": query, "$options": "i"}},
+            ]
+        })
+
+    total = await Exercise.find(*filters).count()
+    skip = (params.page - 1) * params.limit
+    exercises = await Exercise.find(*filters).sort("-created_at").skip(skip).limit(params.limit).to_list()
+    language = str(getattr(current_user, "language", "en") or "en")
+    rest_override = int(getattr(current_user, "training_rest_seconds", 0) or 0) or None
+
+    return {
+        "page": params.page,
+        "limit": params.limit,
+        "total": int(total),
+        "pages": max(1, (int(total) + params.limit - 1) // params.limit),
+        "has_next": skip + len(exercises) < int(total),
+        "items": [
+            _serialize_exercise_catalog_item(
+                ex,
+                lang=language,
+                rest_seconds_override=rest_override,
+            )
+            for ex in exercises
+        ],
     }
 
 

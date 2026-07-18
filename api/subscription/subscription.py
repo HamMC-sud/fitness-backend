@@ -197,6 +197,37 @@ def sub_to_out(sub: Subscription) -> SubscriptionOut:
     )
 
 
+def _fallback_subscription_from_user_flags(user: User) -> Optional[SubscriptionOut]:
+    if not user:
+        return None
+    premium_until = getattr(getattr(user, "flags", None), "premium_until", None)
+    is_premium = bool(getattr(getattr(user, "flags", None), "is_premium", False))
+    if not is_premium or not premium_until:
+        return None
+
+    exp = premium_until if premium_until.tzinfo is not None else premium_until.replace(tzinfo=timezone.utc)
+    if exp <= utcnow():
+        return None
+
+    started_at = getattr(user, "created_at", None) or utcnow()
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+
+    return SubscriptionOut(
+        id=f"flags:{user.id}",
+        status=SubscriptionStatus.active,
+        plan_code="premium",
+        source=SubscriptionSource.web,
+        started_at=started_at,
+        expires_at=exp,
+        grace_until=None,
+        auto_renew=True,
+        last_transaction_id=None,
+        amount=None,
+        currency="RUB",
+    )
+
+
 async def upsert_subscription(
     user_id: PydanticObjectId,
     plan_code: str,
@@ -1576,6 +1607,14 @@ async def get_subscription(current_user=Depends(get_current_user)):
     require_auth(current_user)
     sub = await Subscription.find_one(Subscription.user_id == current_user.id)
     if not sub:
+        fallback_sub = _fallback_subscription_from_user_flags(current_user)
+        if fallback_sub is not None:
+            return SubscriptionGetOut(
+                subscription=fallback_sub,
+                is_active=True,
+                in_grace=False,
+                expires_at=fallback_sub.expires_at,
+            )
         return SubscriptionGetOut(
             subscription=None,
             is_active=False,

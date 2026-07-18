@@ -37,7 +37,7 @@ from models import (
     Subscription,
     WorkoutRun,
 )
-from models.enums import AiRequestStatus, AiRequestType, Equipment, Injury, SubscriptionStatus
+from models.enums import AiRequestStatus, AiRequestType, Difficulty, Equipment, Injury, SubscriptionStatus
 from utils.exercise_video_parser import ensure_existing_media_url, parse_exercise_video_from_url, resolve_local_media_path
 from utils.workout_contract import apply_uniform_rest_seconds, summarize_sets_payload
 from schemas.ai import (
@@ -62,6 +62,7 @@ from schemas.ai import (
     AiApplySwapIn,
     AiExerciseSwapOptionOut,
     AiExerciseSwapOptionsOut,
+    AiExerciseSwapLookupIn,
     AiApplyExerciseSwapIn,
     RewardedGrantIn,
     RewardedGrantOut,
@@ -313,6 +314,63 @@ def _pick_i18n_value(i18n_obj: Any, language: str) -> str:
     return str(value or "").strip()
 
 
+def _resolve_plan_language(current_user: Any, plan: Optional[Any] = None) -> str:
+    user_language = _as_str(getattr(current_user, "language", "en")) or "en"
+    plan_language = ""
+    if plan is not None:
+        created_from = dict(getattr(plan, "created_from", None) or {})
+        plan_language = _as_str(created_from.get("language")) or ""
+
+    if plan_language and _is_russian_language(plan_language):
+        if not user_language or user_language.lower() == "en":
+            return plan_language
+    return user_language or plan_language or "en"
+
+
+def _build_plan_day_id(plan_id: str, day_iso: str) -> str:
+    return f"{plan_id}:{day_iso}"
+
+
+def _build_workout_id(plan_id: str, day_iso: str) -> str:
+    return f"workout:{plan_id}:{day_iso}"
+
+
+def _build_exercise_item_id(plan_id: str, day_iso: str, exercise_idx: int) -> str:
+    return f"exercise:{plan_id}:{day_iso}:{exercise_idx}"
+
+
+def _find_exercise_index_by_item_id(
+    workout_template: Dict[str, Any],
+    *,
+    plan_id: str,
+    day_iso: str,
+    exercise_item_id: str,
+) -> int:
+    exercises = list(workout_template.get("exercises") or [])
+    target = str(exercise_item_id or "").strip()
+    for idx, item in enumerate(exercises):
+        item_id = str((item or {}).get("exercise_item_id") or "").strip()
+        expected_item_id = _build_exercise_item_id(plan_id, day_iso, idx)
+        if target and target in {item_id, expected_item_id}:
+            return idx
+    return -1
+
+
+def _collect_expected_exercise_item_ids(
+    workout_template: Dict[str, Any],
+    *,
+    plan_id: str,
+    day_iso: str,
+) -> list[str]:
+    exercises = list(workout_template.get("exercises") or [])
+    out: list[str] = []
+    for idx, item in enumerate(exercises):
+        item_id = str((item or {}).get("exercise_item_id") or "").strip()
+        expected_item_id = _build_exercise_item_id(plan_id, day_iso, idx)
+        out.append(item_id or expected_item_id)
+    return out
+
+
 def _display_goal_label(goal: str, language: str) -> str:
     token = str(goal or "").strip().lower()
     if _is_russian_language(language):
@@ -340,7 +398,25 @@ def _humanize_ai_label(value: Any, *, language: str, fallback: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"^(?:ai\s+)+", "", text, flags=re.IGNORECASE).strip(" :_-")
     lowered = text.lower()
-    if lowered in {"session", "workout", "workout session", "training"}:
+    generic_tokens = {
+        "session",
+        "workout",
+        "workout session",
+        "training",
+        "strength workout",
+        "cardio workout",
+        "yoga workout",
+        "stretching workout",
+        "hiit workout",
+        "strength training",
+        "cardio training",
+        "yoga training",
+        "stretching training",
+        "hiit training",
+    }
+    if lowered in generic_tokens:
+        return fallback
+    if re.fullmatch(r"(strength|cardio|yoga|stretching|hiit|recovery|mobility)\s+(workout|training|session)", lowered):
         return fallback
 
     if not _has_cyrillic(text):
@@ -507,7 +583,7 @@ def _resolve_existing_exercise_mp4_url(
             prefix = _media_public_prefix_from_urls(preferred_url, thumbnail_url)
             resolved = f"{prefix}{public_path}" if prefix else public_path
             if not preferred_name or name != preferred_name:
-                logger.info(
+                logger.debug(
                     "AI plan video enrichment fallback: exercise_code=%s preferred=%s resolved=%s local_path=%s",
                     code,
                     preferred_name or None,
@@ -551,7 +627,7 @@ def _enrich_saved_plan_exercise_media(item: Any, language: str = "en") -> Dict[s
         row["video_url"] = video_url
         row.update(_video_meta_fields(video_url))
     resolved_video_path = resolve_local_media_path(row.get("video_url")) if row.get("video_url") else None
-    logger.info(
+    logger.debug(
         "AI plan video metadata: exercise_code=%s video_url=%s local_path=%s file_exists=%s parsed_video_mode=%s parsed_repetitions=%s parsed_duration_seconds=%s reason=%s",
         str(exercise_code or ""),
         row.get("video_url"),
@@ -615,7 +691,7 @@ def _normalize_workout_template_exercise_counts(
                     field_name,
                 )
         wt[field_name] = actual_count
-    logger.info(
+    logger.debug(
         "AI plan exercise count normalized: plan_id=%s day=%s returned_exercises_length=%s returned_count_field=%s",
         plan_id or "",
         day_iso or "",
@@ -705,6 +781,29 @@ def _normalize_ai_exercise_contract(
     normalized["title_text"] = normalized["name"]
     return _enforce_execution_contract(normalized)
 
+
+def _attach_plan_identifiers_to_workout_template(
+    workout_template: Dict[str, Any],
+    *,
+    plan_id: str,
+    day_iso: str,
+) -> Dict[str, Any]:
+    wt = dict(workout_template or {})
+    wt["plan_id"] = plan_id
+    wt["plan_day_id"] = _build_plan_day_id(plan_id, day_iso)
+    wt["workout_id"] = _build_workout_id(plan_id, day_iso)
+
+    exercises = wt.get("exercises")
+    if isinstance(exercises, list):
+        tagged: list[dict[str, Any]] = []
+        for idx, item in enumerate(exercises):
+            row = dict(item or {})
+            row["exercise_item_id"] = _build_exercise_item_id(plan_id, day_iso, idx)
+            row["exercise_index"] = idx
+            tagged.append(row)
+        wt["exercises"] = tagged
+    return wt
+
 def _log_ai_localization(
     *,
     user_id: str,
@@ -721,7 +820,7 @@ def _log_ai_localization(
     for raw_item, localized_item in zip(raw_exercises, localized_exercises):
         raw_row = dict(raw_item or {})
         localized_row = dict(localized_item or {})
-        logger.info(
+        logger.debug(
             "AI plan localization: user_id=%s language=%s plan_id=%s date=%s day_title=%s workout_title=%s exercise_code=%s localized_exercise_name=%s old_saved_name=%s focus_label=%s type_label=%s",
             user_id,
             language,
@@ -1070,6 +1169,12 @@ async def _workout_template_for_output(
     if not workout_template or str(day_type or "").lower() != "workout":
         return None
     wt = dict(workout_template)
+    if plan_id and day_iso:
+        wt = _attach_plan_identifiers_to_workout_template(
+            wt,
+            plan_id=plan_id,
+            day_iso=day_iso,
+        )
     wt["is_completed"] = bool(day_is_completed)
     focus_value = str(wt.get("focus") or "").strip().lower()
     if focus_value:
@@ -1174,15 +1279,29 @@ async def is_premium_user(user_id: PydanticObjectId) -> bool:
 
 async def _ensure_plan_adjustment_access(current_user: Any) -> None:
     """
-    Plan day editing/swapping is a Premium-only feature.
-    Free users can still use one monthly reroll via chat flow.
+    Premium users have unlimited plan adjustments.
+    Free users can make one plan adjustment per month.
     """
     if await is_premium_user(current_user.id):
         return
+    period = period_yyyy_mm(utcnow())
+    usage = await get_or_create_usage(current_user.id, period)
+    if int(getattr(usage, "plan_adjustments_used", 0) or 0) < 1:
+        return
     raise HTTPException(
         403,
-        "Plan adjustment is available on Premium. Free users have one monthly reroll via AI chat.",
+        "Free users can make one plan adjustment per month. Upgrade to Premium for unlimited plan changes.",
     )
+
+
+async def _consume_plan_adjustment_if_needed(current_user: Any) -> None:
+    if await is_premium_user(current_user.id):
+        return
+    period = period_yyyy_mm(utcnow())
+    usage = await get_or_create_usage(current_user.id, period)
+    current_used = int(getattr(usage, "plan_adjustments_used", 0) or 0)
+    usage.plan_adjustments_used = current_used + 1
+    await usage.save()
 
 
 async def get_or_create_usage(user_id: PydanticObjectId, period: str) -> AiUsageMonthly:
@@ -1385,6 +1504,30 @@ def _goal_to_types(goals: list[str], preferences: list[str]) -> list[str]:
     return out
 
 
+def _ordered_available_swap_focuses(exercises: list[Exercise]) -> list[str]:
+    ordered_focuses = ["strength", "cardio", "stretching", "yoga", "hiit"]
+    out: list[str] = []
+    for focus in ordered_focuses:
+        if _filter_exercises_for_focus(exercises, focus):
+            out.append(focus)
+    return out
+
+
+def _filter_exercises_by_difficulty(
+    exercises: list[Exercise],
+    difficulty: Optional[Difficulty],
+) -> list[Exercise]:
+    if difficulty is None:
+        return list(exercises or [])
+    target = str(getattr(difficulty, "value", difficulty) or "").strip().lower()
+    if not target:
+        return list(exercises or [])
+    return [
+        ex for ex in list(exercises or [])
+        if str(getattr(getattr(ex, "difficulty", None), "value", getattr(ex, "difficulty", "")) or "").strip().lower() == target
+    ]
+
+
 def _difficulty_to_intensity(diff: str) -> str:
     d = (diff or "").lower()
     if d == "advanced":
@@ -1407,6 +1550,75 @@ def _normalize_intensity(value: Optional[str]) -> Optional[str]:
         "high": "high",
     }
     return mapping.get(v)
+
+
+def _retune_workout_template_intensity(
+    workout_template: Dict[str, Any],
+    *,
+    intensity: str,
+    default_rest_seconds: int,
+) -> Dict[str, Any]:
+    wt = dict(workout_template or {})
+    normalized_intensity = _normalize_intensity(intensity)
+    if not normalized_intensity:
+        raise HTTPException(400, "Invalid intensity")
+
+    set_targets = {"low": 2, "moderate": 3, "high": 4}
+    rep_delta = {"low": -2, "moderate": 0, "high": 2}
+    duration_delta = {"low": -5, "moderate": 0, "high": 5}
+    rest_by_intensity = {
+        "low": max(30, int(default_rest_seconds) + 15),
+        "moderate": max(15, int(default_rest_seconds)),
+        "high": max(15, int(default_rest_seconds) - 15),
+    }
+
+    tuned_exercises: list[dict[str, Any]] = []
+    for item in list(wt.get("exercises") or []):
+        row = dict(item or {})
+        execution_mode = _resolve_execution_mode(row)
+        target_sets = _coerce_int(
+            row.get("sets_count", row.get("total_sets", row.get("sets"))),
+            default=set_targets[normalized_intensity],
+            lo=1,
+            hi=6,
+        )
+        target_sets = max(1, min(6, target_sets + (set_targets[normalized_intensity] - 3)))
+        target_rest = _coerce_int(
+            row.get("rest_seconds"),
+            default=rest_by_intensity[normalized_intensity],
+            lo=10,
+            hi=600,
+        )
+        target_rest = rest_by_intensity[normalized_intensity] if target_rest <= 0 else target_rest
+
+        row["sets"] = target_sets
+        row["sets_count"] = target_sets
+        row["rest_seconds"] = target_rest
+
+        current_target = _planned_target_from_row(row, execution_mode)
+        if execution_mode == "duration":
+            base_target = _coerce_int(current_target, default=30, lo=5, hi=3600)
+            row["duration_seconds"] = max(10, min(3600, base_target + duration_delta[normalized_intensity]))
+            row["repetitions"] = None
+            row["reps"] = None
+        else:
+            base_target = _coerce_int(current_target, default=12, lo=1, hi=500)
+            adjusted_reps = max(4, min(500, base_target + rep_delta[normalized_intensity]))
+            row["repetitions"] = adjusted_reps
+            row["reps"] = adjusted_reps
+            row["duration_seconds"] = None
+
+        tuned_exercises.append(
+            _normalize_ai_exercise_contract(
+                row,
+                rest_seconds_override=target_rest,
+            )
+        )
+
+    wt["intensity"] = normalized_intensity
+    wt["rest_seconds"] = rest_by_intensity[normalized_intensity]
+    wt["exercises"] = tuned_exercises
+    return wt
 
 
 def _merge_prompt_with_profile(current_user: Any, prompt_meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -3525,7 +3737,7 @@ async def ai_generate_plan(payload: AiGenerateIn, current_user=Depends(get_curre
 
     return AiGenerateOut(
         request_id=str(req.id),
-        plan=await plan_to_out(plan, _as_str(getattr(current_user, "language", "en")) or "en"),
+        plan=await plan_to_out(plan, _resolve_plan_language(current_user, plan)),
     )
 
 
@@ -3537,7 +3749,7 @@ async def get_current_plan(current_user=Depends(get_current_user)):
     plan = await get_active_plan(current_user.id)
     if not plan:
         raise HTTPException(404, "No active plan")
-    return await plan_to_out(plan, _as_str(getattr(current_user, "language", "en")) or "en")
+    return await plan_to_out(plan, _resolve_plan_language(current_user, plan))
 
 
 @router.delete("/ai/plan/{plan_id}", status_code=200)
@@ -3581,6 +3793,7 @@ async def delete_ai_plan_day(plan_id: str, date: str, current_user=Depends(get_c
     day_obj.workout_template = None
 
     plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
+    await _consume_plan_adjustment_if_needed(current_user)
     day_obj = plan.days[idx]
 
     return {
@@ -4103,6 +4316,30 @@ def _day_focus_label(day_obj: Any, language: str = "en") -> Optional[str]:
     return _localized_type_label(focus, language)
 
 
+def _day_title_i18n(day_obj: Any) -> Dict[str, str]:
+    return {
+        "ru": _day_title(day_obj, "ru"),
+        "en": _day_title(day_obj, "en"),
+    }
+
+
+def _day_type_label_i18n(day_obj: Any) -> Dict[str, str]:
+    return {
+        "ru": _day_type_label(day_obj, "ru"),
+        "en": _day_type_label(day_obj, "en"),
+    }
+
+
+def _day_focus_label_i18n(day_obj: Any) -> Dict[str, str]:
+    focus = _day_focus(day_obj)
+    if not focus:
+        return {}
+    return {
+        "ru": _day_focus_label(day_obj, "ru") or "",
+        "en": _day_focus_label(day_obj, "en") or "",
+    }
+
+
 def _day_to_dict(day_obj: Any) -> Dict[str, Any]:
     if hasattr(day_obj, "model_dump"):
         return day_obj.model_dump()
@@ -4397,7 +4634,7 @@ async def ai_plan_weeks(current_user=Depends(get_current_user)):
     plan = await get_active_plan(current_user.id)
     if not plan:
         raise HTTPException(404, "No active plan")
-    language = _as_str(getattr(current_user, "language", "en")) or "en"
+    language = _resolve_plan_language(current_user, plan)
     completed_dates = await _load_completed_ai_plan_dates(current_user.id, plan.id)
 
     weeks: list[AiPlanWeekOut] = []
@@ -4415,16 +4652,19 @@ async def ai_plan_weeks(current_user=Depends(get_current_user)):
                     is_completed=day_iso in completed_dates,
                     type=str(getattr(d, "type", "recovery")),
                     type_label=_day_type_label(d, language),
+                    type_label_i18n=_day_type_label_i18n(d),
                     title=_day_title(d, language),
+                    title_i18n=_day_title_i18n(d),
                     duration_min=_day_duration(d),
                     intensity=_day_intensity(d),
                     focus=_day_focus(d),
                     focus_label=_day_focus_label(d, language),
+                    focus_label_i18n=_day_focus_label_i18n(d),
                 )
             )
         weeks.append(AiPlanWeekOut(week_index=(w_idx // 7) + 1, days=cards))
 
-    logger.info(
+    logger.debug(
         "AI plan weeks localized: user_id=%s language=%s first_title=%s",
         str(current_user.id),
         language,
@@ -4448,7 +4688,7 @@ async def ai_plan_day(date: str, current_user=Depends(get_current_user)):
         raise HTTPException(404, "Day not found")
 
     day_obj = plan.days[idx]
-    language = _as_str(getattr(current_user, "language", "en")) or "en"
+    language = _resolve_plan_language(current_user, plan)
     exercise_ids, exercise_codes = _extract_exercise_refs_from_template(getattr(day_obj, "workout_template", None))
     exercise_by_id, exercise_by_code = await _load_exercise_lookup(exercise_ids, exercise_codes)
     day_is_completed = await _is_ai_plan_day_completed(
@@ -4479,7 +4719,7 @@ async def ai_plan_day(date: str, current_user=Depends(get_current_user)):
         focus_label=_day_focus_label(day_obj, language),
         workout_template=wt,
     )
-    logger.info(
+    logger.debug(
         "AI plan day localized: user_id=%s language=%s plan_id=%s date=%s title=%s type_label=%s focus_label=%s",
         str(current_user.id),
         language,
@@ -4561,7 +4801,11 @@ async def ai_plan_day_edit(
             norm = _normalize_intensity(patch["intensity"])
             if not norm:
                 raise HTTPException(400, "Invalid intensity")
-            wt["intensity"] = norm
+            wt = _retune_workout_template_intensity(
+                wt,
+                intensity=norm,
+                default_rest_seconds=int(getattr(current_user, "training_rest_seconds", 60) or 60),
+            )
         if "title" in patch and patch["title"]:
             wt["title"] = patch["title"].strip()
         if requested_focus:
@@ -4573,7 +4817,7 @@ async def ai_plan_day_edit(
     day_obj = plan.days[idx]
 
     final_type = str(getattr(day_obj, "type", "recovery"))
-    language = _as_str(getattr(current_user, "language", "en")) or "en"
+    language = _resolve_plan_language(current_user, plan)
     exercise_ids, exercise_codes = _extract_exercise_refs_from_template(getattr(day_obj, "workout_template", None))
     exercise_by_id, exercise_by_code = await _load_exercise_lookup(exercise_ids, exercise_codes)
     day_is_completed = await _is_ai_plan_day_completed(
@@ -4619,19 +4863,29 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
         raise HTTPException(404, "Day not found")
 
     day_obj = plan.days[idx]
-    safe_limit = max(1, min(int(limit), 6))
+    safe_limit = max(1, min(int(limit), 100))
     meta = dict(plan.created_from or {})
     inputs = _merge_prompt_with_profile(current_user, meta)
     target_types = _goal_to_types(_as_str_list(inputs.get("goals")), _as_str_list(inputs.get("preferences")))
     injuries = set(_as_str_list(inputs.get("injuries")))
     equipment = set(_as_str_list(inputs.get("equipment")))
-    language = _as_str(inputs.get("language") or getattr(current_user, "language", "en")) or "en"
-    exercises = await _load_exercises_for_planning(injuries=injuries, equipment=equipment, target_types=set(target_types))
+    language = _resolve_plan_language(current_user, plan)
+    inputs["language"] = language
+    exercises = await _load_exercises_for_planning(
+        injuries=injuries,
+        equipment=equipment,
+        target_types={"strength", "cardio", "stretching", "yoga", "hiit"},
+    )
 
     current_focus = _day_focus(day_obj) or ""
-    focuses = [t for t in target_types if t != current_focus]
+    preferred_focuses = [t for t in target_types if t != current_focus]
+    available_focuses = [t for t in _ordered_available_swap_focuses(exercises) if t != current_focus]
+    focuses: list[str] = []
+    for focus in [*preferred_focuses, *available_focuses]:
+        if focus and focus not in focuses:
+            focuses.append(focus)
     if not focuses:
-        focuses = target_types or ["strength", "cardio"]
+        focuses = available_focuses or ["strength", "cardio", "stretching", "yoga", "hiit"]
 
     items: list[AiSwapOptionOut] = []
     try:
@@ -4649,26 +4903,50 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
             target_types=[focus],
             rng_seed=f"swap:{current_user.id}:{date}:{i}",
         )
+        fallback_title = _localized_workout_title(
+            _display_goal_label(str(template.get("focus") or focus), language),
+            language,
+        )
+        focus_value = str(template.get("focus") or focus)
+        title_i18n = (
+            dict(template.get("title_i18n") or {})
+            if isinstance(template.get("title_i18n"), dict)
+            else _localized_workout_title_i18n(focus_value)
+        )
+        focus_label_i18n = {
+            "ru": _localized_type_label(focus_value, "ru"),
+            "en": _localized_type_label(focus_value, "en"),
+        }
+        type_label_i18n = {
+            "ru": _localized_type_label("workout", "ru"),
+            "en": _localized_type_label("workout", "en"),
+        }
+        localized_title = _humanize_ai_label(
+            _pick_i18n_value(title_i18n, language) or template.get("title"),
+            language=language,
+            fallback=fallback_title,
+        )
         items.append(
             AiSwapOptionOut(
                 swap_id=f"swap_{i}",
-                title=_humanize_ai_label(
-                    template.get("title"),
-                    language=language,
-                    fallback=_localized_swap_title(language),
-                ),
+                title=localized_title,
+                title_i18n=title_i18n,
                 duration_min=int(template.get("duration_min") or 35),
                 intensity=str(template.get("intensity") or "moderate"),
-                focus=str(template.get("focus") or focus),
-                focus_label=str(template.get("focus_label") or _localized_type_label(str(template.get("focus") or focus), language)),
-                type_label=str(template.get("type_label") or _localized_type_label("workout", language)),
+                focus=focus_value,
+                focus_label=str(focus_label_i18n.get("ru" if _is_russian_language(language) else "en") or ""),
+                focus_label_i18n=focus_label_i18n,
+                type_label=str(type_label_i18n.get("ru" if _is_russian_language(language) else "en") or ""),
+                type_label_i18n=type_label_i18n,
                 workout_template={
                     **template,
-                    "title": _humanize_ai_label(
-                        template.get("title"),
-                        language=language,
-                        fallback=_localized_swap_title(language),
-                    ),
+                    "title": localized_title,
+                    "title_i18n": title_i18n,
+                    "focus_label": str(focus_label_i18n.get("ru" if _is_russian_language(language) else "en") or ""),
+                    "focus_label_i18n": focus_label_i18n,
+                    "category_label": str(focus_label_i18n.get("ru" if _is_russian_language(language) else "en") or ""),
+                    "type_label": str(type_label_i18n.get("ru" if _is_russian_language(language) else "en") or ""),
+                    "type_label_i18n": type_label_i18n,
                 },
             )
         )
@@ -4680,6 +4958,7 @@ async def ai_plan_day_swaps(date: str, limit: int = 3, current_user=Depends(get_
 async def ai_plan_day_exercise_swaps(
     date: str,
     exercise_id: str,
+    difficulty: Optional[Difficulty] = None,
     limit: int = 5,
     current_user=Depends(get_current_user),
 ):
@@ -4722,6 +5001,7 @@ async def ai_plan_day_exercise_swaps(
         equipment=equipment,
         target_types=set(target_types),
     )
+    catalog = _filter_exercises_by_difficulty(catalog, difficulty)
     if day_focus:
         catalog = _filter_exercises_for_focus(catalog, day_focus)
 
@@ -4771,6 +5051,61 @@ async def ai_plan_day_exercise_swaps(
     )
 
 
+@router.post("/ai/plan/day/exercise-swaps", response_model=AiExerciseSwapOptionsOut)
+async def ai_plan_day_exercise_swaps_by_payload(
+    payload: AiExerciseSwapLookupIn,
+    current_user=Depends(get_current_user),
+):
+    if not current_user:
+        raise HTTPException(401, "Unauthorized")
+    await _ensure_plan_adjustment_access(current_user)
+
+    plan = await get_active_plan(current_user.id)
+    if not plan:
+        raise HTTPException(404, "No active plan")
+
+    if str(plan.id) != str(payload.plan_id):
+        raise HTTPException(404, "Plan not found")
+
+    idx = _find_day_index(plan, payload.date)
+    if idx < 0:
+        raise HTTPException(404, "Day not found")
+
+    day_obj = plan.days[idx]
+    if str(getattr(day_obj, "type", "recovery")) != "workout":
+        raise HTTPException(400, "Day is not a workout")
+
+    wt = dict(getattr(day_obj, "workout_template", None) or {})
+    expected_plan_day_id = _build_plan_day_id(str(plan.id), payload.date)
+    expected_workout_id = _build_workout_id(str(plan.id), payload.date)
+    if payload.plan_day_id != expected_plan_day_id:
+        raise HTTPException(404, "Plan day not found")
+    if payload.workout_id != expected_workout_id:
+        raise HTTPException(404, "Workout not found")
+
+    ex_idx = _find_exercise_index_by_item_id(
+        wt,
+        plan_id=str(plan.id),
+        day_iso=payload.date,
+        exercise_item_id=payload.exercise_item_id,
+    )
+    if ex_idx < 0:
+        raise HTTPException(404, "Exercise item not found")
+    matched_exercise_id = str((list(wt.get("exercises") or [])[ex_idx] or {}).get("exercise_id") or "").strip()
+    if not matched_exercise_id:
+        raise HTTPException(404, "Exercise not found in this day")
+
+    requested_difficulty = getattr(payload, "difficulty", None)
+
+    return await ai_plan_day_exercise_swaps(
+        date=payload.date,
+        exercise_id=matched_exercise_id,
+        difficulty=requested_difficulty,
+        limit=int(payload.limit),
+        current_user=current_user,
+    )
+
+
 @router.post("/ai/plan/day/exercise-swap", response_model=AiPlanDayDetailOut)
 async def ai_plan_day_apply_exercise_swap(
     date: str,
@@ -4799,15 +5134,63 @@ async def ai_plan_day_apply_exercise_swap(
     wt = dict(getattr(day_obj, "workout_template", None) or {})
     exercises = list(wt.get("exercises") or [])
     day_focus = str(wt.get("focus") or "").strip().lower()
-    ex_idx = _find_exercise_index_in_template(wt, payload.exercise_id)
-    if ex_idx < 0:
-        raise HTTPException(404, "Exercise not found in this day")
+    ex_idx = -1
+    if payload.exercise_item_id:
+        ex_idx = _find_exercise_index_by_item_id(
+            wt,
+            plan_id=str(plan.id),
+            day_iso=date,
+            exercise_item_id=payload.exercise_item_id,
+        )
+        if ex_idx < 0:
+            raise HTTPException(
+                404,
+                detail={
+                    "message": "Exercise item not found for requested day",
+                    "date": date,
+                    "exercise_item_id": payload.exercise_item_id,
+                    "expected_exercise_item_ids": _collect_expected_exercise_item_ids(
+                        wt,
+                        plan_id=str(plan.id),
+                        day_iso=date,
+                    ),
+                },
+            )
+    elif payload.exercise_id:
+        ex_idx = _find_exercise_index_in_template(wt, payload.exercise_id)
+        if ex_idx < 0:
+            raise HTTPException(
+                404,
+                detail={
+                    "message": "Exercise id not present in current workout day",
+                    "date": date,
+                    "exercise_id": payload.exercise_id,
+                    "expected_exercise_ids": [
+                        str((item or {}).get("exercise_id") or "").strip()
+                        for item in exercises
+                        if str((item or {}).get("exercise_id") or "").strip()
+                    ],
+                },
+            )
+    else:
+        raise HTTPException(400, "exercise_item_id or exercise_id is required")
+
+    current_exercise_id = str((exercises[ex_idx] or {}).get("exercise_id") or "").strip()
+    if not current_exercise_id:
+        raise HTTPException(
+            404,
+            detail={
+                "message": "Resolved workout item has no exercise_id",
+                "date": date,
+                "exercise_item_id": payload.exercise_item_id,
+            },
+        )
 
     replacement_item: Optional[Dict[str, Any]] = None
     if payload.swap_id:
         swaps = await ai_plan_day_exercise_swaps(
             date=date,
-            exercise_id=payload.exercise_id,
+            exercise_id=current_exercise_id,
             limit=10,
             current_user=current_user,
         )
@@ -4840,6 +5223,7 @@ async def ai_plan_day_apply_exercise_swap(
     day_obj.workout_template = wt
 
     plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
+    await _consume_plan_adjustment_if_needed(current_user)
     day_obj = plan.days[idx]
     language = _as_str(getattr(current_user, "language", "en")) or "en"
     exercise_ids, exercise_codes = _extract_exercise_refs_from_template(getattr(day_obj, "workout_template", None))
@@ -4905,6 +5289,7 @@ async def ai_plan_day_apply_swap(
     day_obj.type = "workout"
     day_obj.workout_template = dict(chosen.workout_template or {})
     plan = await _persist_plan_day(plan=plan, idx=idx, day_obj=day_obj, user_id=current_user.id)
+    await _consume_plan_adjustment_if_needed(current_user)
     day_obj = plan.days[idx]
     language = _as_str(getattr(current_user, "language", "en")) or "en"
     exercise_ids, exercise_codes = _extract_exercise_refs_from_template(getattr(day_obj, "workout_template", None))

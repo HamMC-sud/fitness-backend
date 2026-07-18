@@ -18,6 +18,7 @@ class AiUsageMonthly(BaseDoc):
     base_limit: int = 1
     extra_from_rewarded: int = 0
     used: int = 0
+    plan_adjustments_used: int = 0
 
     class Settings:
         name = "ai_usage_monthly"

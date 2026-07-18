@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
+from models.enums import Difficulty
 
 
 class AiLimitsOut(BaseModel):
@@ -144,11 +145,14 @@ class AiPlanDayCardOut(BaseModel):
     is_completed: bool = False
     type: str
     type_label: Optional[str] = None
+    type_label_i18n: Dict[str, str] = Field(default_factory=dict)
     title: str
+    title_i18n: Dict[str, str] = Field(default_factory=dict)
     duration_min: Optional[int] = None
     intensity: Optional[str] = None
     focus: Optional[str] = None
     focus_label: Optional[str] = None
+    focus_label_i18n: Dict[str, str] = Field(default_factory=dict)
 
 
 class AiPlanWeekOut(BaseModel):
@@ -185,11 +189,14 @@ class AiPlanDayEditIn(BaseModel):
 class AiSwapOptionOut(BaseModel):
     swap_id: str
     title: str
+    title_i18n: Dict[str, str] = Field(default_factory=dict)
     duration_min: int
     intensity: str
     focus: str
     focus_label: Optional[str] = None
+    focus_label_i18n: Dict[str, str] = Field(default_factory=dict)
     type_label: Optional[str] = None
+    type_label_i18n: Dict[str, str] = Field(default_factory=dict)
     workout_template: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -216,7 +223,18 @@ class AiExerciseSwapOptionsOut(BaseModel):
     items: List[AiExerciseSwapOptionOut] = Field(default_factory=list)
 
 
+class AiExerciseSwapLookupIn(BaseModel):
+    plan_id: str = Field(min_length=1, max_length=64)
+    plan_day_id: str = Field(min_length=1, max_length=128)
+    workout_id: str = Field(min_length=1, max_length=128)
+    exercise_item_id: str = Field(min_length=1, max_length=128)
+    date: str = Field(min_length=1, max_length=32)
+    difficulty: Optional[Difficulty] = None
+    limit: int = Field(default=5, ge=1, le=100)
+
+
 class AiApplyExerciseSwapIn(BaseModel):
-    exercise_id: str = Field(min_length=1, max_length=64)
+    exercise_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    exercise_item_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     swap_id: Optional[str] = Field(default=None, min_length=1, max_length=64)
     new_exercise_id: Optional[str] = Field(default=None, min_length=1, max_length=64)

@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from api.auth.config import get_current_user
 from models import Subscription, User, UserProfile
-from api.subscription.subscription import sub_to_out
+from api.subscription.subscription import sub_to_out, _fallback_subscription_from_user_flags
 from schemas.profile import ProfileUpdateIn
 from utils.profile_image import normalize_profile_photo_value
 
@@ -47,7 +47,11 @@ async def _profile_response(user: User) -> Dict[str, Any]:
     )
 
     subscription = await Subscription.find_one(Subscription.user_id == user.id)
-    data["subscription"] = sub_to_out(subscription).model_dump() if subscription else None
+    if subscription:
+        data["subscription"] = sub_to_out(subscription).model_dump()
+    else:
+        fallback_subscription = _fallback_subscription_from_user_flags(user)
+        data["subscription"] = fallback_subscription.model_dump() if fallback_subscription else None
 
     logger.info(
         "Profile response build finished: user_id=%s is_fully_ready=%s has_subscription=%s subscription_status=%s",
